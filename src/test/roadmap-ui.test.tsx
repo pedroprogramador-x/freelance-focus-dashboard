@@ -54,9 +54,9 @@ describe('alteração da data inicial no roadmap', () => {
     expect(dateInput).toHaveFocus()
     expect(applyButton).toBeDisabled()
 
-    fireEvent.change(dateInput, { target: { value: '' } })
+    fireEvent.input(dateInput, { target: { value: '' } })
     expect(applyButton).toBeDisabled()
-    fireEvent.change(dateInput, { target: { value: '2026-08-10' } })
+    fireEvent.input(dateInput, { target: { value: '2026-08-10' } })
     expect(applyButton).toBeEnabled()
     fireEvent.click(applyButton)
 
@@ -88,7 +88,7 @@ describe('alteração da data inicial no roadmap', () => {
     saveData(createDefaultData('2026-08-04'))
     renderRoadmap()
     fireEvent.click(screen.getByRole('button', { name: 'Alterar data de início' }))
-    fireEvent.change(screen.getByLabelText('Nova data de início'), { target: { value: '2026-08-20' } })
+    fireEvent.input(screen.getByLabelText('Nova data de início'), { target: { value: '2026-08-20' } })
     fireEvent.click(screen.getByRole('button', { name: 'Cancelar' }))
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     expect(screen.getByText(/Início atual:/)).toHaveTextContent('4 de agosto de 2026')
