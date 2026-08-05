@@ -1,14 +1,15 @@
 import { X } from 'lucide-react'
-import { useEffect, useRef, type ReactNode } from 'react'
+import { useEffect, useRef, type ReactNode, type RefObject } from 'react'
 
-export function Modal({ title, onClose, children, size = 'normal' }: { title: string; onClose: () => void; children: ReactNode; size?: 'normal' | 'large' }) {
+export function Modal({ title, onClose, children, size = 'normal', initialFocusRef }: { title: string; onClose: () => void; children: ReactNode; size?: 'normal' | 'large'; initialFocusRef?: RefObject<HTMLElement> }) {
   const modalRef = useRef<HTMLElement>(null)
   useEffect(() => {
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
     const previousOverflow = document.body.style.overflow
     const focusableSelector = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'
     const focusable = () => Array.from(modalRef.current?.querySelectorAll<HTMLElement>(focusableSelector) ?? []).filter((element) => !element.hidden)
-    focusable()[0]?.focus()
+    const initialFocus = initialFocusRef?.current ?? focusable()[0]
+    initialFocus?.focus()
     document.body.style.overflow = 'hidden'
 
     const handleKey = (event: KeyboardEvent) => {
@@ -27,7 +28,7 @@ export function Modal({ title, onClose, children, size = 'normal' }: { title: st
       document.body.style.overflow = previousOverflow
       previousFocus?.focus()
     }
-  }, [onClose])
+  }, [initialFocusRef, onClose])
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }} role="presentation">
     <section ref={modalRef} className={`modal ${size === 'large' ? 'modal-large' : ''}`} role="dialog" aria-modal="true" aria-labelledby="modal-title">
       <header className="modal-header"><h2 id="modal-title">{title}</h2><button className="icon-button" onClick={onClose} aria-label="Fechar"><X size={20} /></button></header>
