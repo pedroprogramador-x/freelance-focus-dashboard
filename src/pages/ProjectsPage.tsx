@@ -6,7 +6,8 @@ import { useApp } from '../context/AppContext'
 import type { Currency, PaymentStatus, Project, ProjectStatus, Proposal } from '../types'
 import { projectMetrics } from '../utils/calculations'
 import { toDateInput } from '../data/roadmap'
-import { hasValidEntityReferences } from '../data/domain'
+import { hasValidEntityReferences, projectRelatedDataCounts } from '../data/domain'
+import { ProjectDetail } from './ProjectDetail'
 
 const statuses: ProjectStatus[] = ['Planejamento', 'Em desenvolvimento', 'Aguardando cliente', 'Em revisão', 'Entregue', 'Pausado', 'Cancelado']
 const paymentStatuses: PaymentStatus[] = ['Pendente', 'Parcial', 'Pago']
@@ -15,6 +16,12 @@ const timestamp = () => new Date().toISOString()
 const money = (value: number, currency: Currency) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency }).format(value)
 const emptyProject = (clientId: string): Project => ({ id: crypto.randomUUID(), clientId, proposalId: null, name: '', description: '', status: 'Planejamento', startDate: null, deadline: null, completedAt: null, amount: 0, currency: 'BRL', platformFeePercent: null, exchangeRateToBrl: null, estimatedHours: 0, workedHours: 0, repositoryUrl: '', productionUrl: '', paymentStatus: 'Pendente', amountReceived: 0, notes: '', createdAt: timestamp(), updatedAt: timestamp() })
 const projectFromProposal = (proposal: Proposal): Project => ({ ...emptyProject(proposal.clientId), proposalId: proposal.id, name: proposal.title, description: proposal.description, amount: proposal.amount, currency: proposal.currency, platformFeePercent: proposal.platformData?.platformFeePercent ?? null, estimatedHours: proposal.estimatedHours })
+const relatedDeleteMessage = (project: Project, plannings: number, tasks: number) => {
+  if (!plannings && !tasks) return `Os dados de “${project.name}” serão removidos.`
+  const planningLabel = `${plannings} ${plannings === 1 ? 'planejamento técnico' : 'planejamentos técnicos'}`
+  const taskLabel = `${tasks} ${tasks === 1 ? 'tarefa' : 'tarefas'}`
+  return `Além do projeto “${project.name}”, serão excluídos explicitamente ${planningLabel} e ${taskLabel}. Esta ação não pode ser desfeita.`
+}
 
 function ProjectForm({ initial, onClose }: { initial: Project; onClose: () => void }) {
   const { data, upsert, notify } = useApp()
@@ -60,10 +67,11 @@ function ProjectForm({ initial, onClose }: { initial: Project; onClose: () => vo
   </form>
 }
 
-export function ProjectsPage({ navigate, proposalForProjectId, onProposalHandled }: { navigate: (page: PageId) => void; proposalForProjectId?: string | null; onProposalHandled?: () => void }) {
-  const { data, remove, notify } = useApp()
+export function ProjectsPage({ navigate, proposalForProjectId, onProposalHandled, onPlanningDirtyChange }: { navigate: (page: PageId) => void; proposalForProjectId?: string | null; onProposalHandled?: () => void; onPlanningDirtyChange?: (dirty: boolean) => void }) {
+  const { data, remove, removeProjectWithRelated, notify } = useApp()
   const [editing, setEditing] = useState<Project | null>(null)
   const [deleting, setDeleting] = useState<Project | null>(null)
+  const [selectedId, setSelectedId] = useState<string | null>(null)
   useEffect(() => {
     if (!proposalForProjectId) return
     const proposal = data.proposals.find((item) => item.id === proposalForProjectId && item.status === 'Aceita')
@@ -71,8 +79,21 @@ export function ProjectsPage({ navigate, proposalForProjectId, onProposalHandled
     onProposalHandled?.()
   }, [proposalForProjectId, data.proposals, data.projects, onProposalHandled])
   const metrics = projectMetrics(data.projects)
+  const selected = data.projects.find((item) => item.id === selectedId)
   const clientName = (id: string) => data.clients.find((client) => client.id === id)?.name ?? 'Cliente indisponível'
   const startCreate = () => data.clients.length ? setEditing(emptyProject(data.clients[0].id)) : navigate('clients')
+  const requestDelete = (project: Project) => {
+    const related = projectRelatedDataCounts(data, project.id)
+    if (data.settings.confirmBeforeDelete || related.plannings > 0 || related.tasks > 0) setDeleting(project)
+    else { remove('projects', project.id); if (selectedId === project.id) setSelectedId(null); notify('Projeto excluído.') }
+  }
+  const confirmDelete = (project: Project) => {
+    const related = projectRelatedDataCounts(data, project.id)
+    if (related.plannings || related.tasks) removeProjectWithRelated(project.id)
+    else remove('projects', project.id)
+    if (selectedId === project.id) setSelectedId(null)
+    notify('Projeto e dados relacionados excluídos.')
+  }
   const cards = [
     { label: 'Projetos ativos', value: metrics.active, icon: FolderKanban },
     { label: 'Contratado em BRL', value: money(metrics.contracted.BRL, 'BRL'), icon: CircleDollarSign },
@@ -81,12 +102,17 @@ export function ProjectsPage({ navigate, proposalForProjectId, onProposalHandled
     { label: 'Contratado em USD', value: money(metrics.contracted.USD, 'USD'), icon: TrendingUp },
     { label: 'Horas trabalhadas', value: `${metrics.hours.toFixed(1)}h`, icon: Clock3 },
   ]
+  if (selected) return <div>
+    <ProjectDetail project={selected} onBack={() => setSelectedId(null)} onEdit={() => setEditing(selected)} onDelete={() => requestDelete(selected)} onPlanningDirtyChange={onPlanningDirtyChange} />
+    {editing && <Modal title="Editar projeto" onClose={() => setEditing(null)} size="large"><ProjectForm initial={editing} onClose={() => setEditing(null)} /></Modal>}
+    {deleting && <ConfirmModal title="Excluir projeto?" message={(() => { const related = projectRelatedDataCounts(data, deleting.id); return relatedDeleteMessage(deleting, related.plannings, related.tasks) })()} danger onClose={() => setDeleting(null)} onConfirm={() => confirmDelete(deleting)} />}
+  </div>
   return <div>
     <section className="page-intro"><div><span className="kicker">Execução e recebimentos</span><h2>Projetos</h2><p>Controle entregas, horas, links e pagamentos por cliente.</p></div><button className="button primary" onClick={startCreate}><Plus size={17} /> Novo projeto</button></section>
     {!data.clients.length && <section className="empty-callout card"><Users size={24} /><div><strong>Cadastre um cliente antes do primeiro projeto</strong><p>Todo projeto precisa estar ligado a um cliente existente.</p></div><button className="button primary" onClick={() => navigate('clients')}>Ir para Clientes</button></section>}
     <section className="stats-grid project-stats">{cards.map(({ label, value, icon: Icon }) => <article className="stat-card" key={label}><div className="stat-icon green"><Icon size={19} /></div><div><span>{label}</span><strong>{value}</strong></div></article>)}</section>
-    {data.projects.length === 0 ? <div className="empty-state"><FolderKanban size={40} /><h3>Registre seu primeiro projeto</h3><p>Projetos substituem contratos e concentram execução, links e recebimentos.</p>{data.clients.length > 0 && <button className="button primary" onClick={startCreate}><Plus size={17} /> Adicionar projeto</button>}</div> : <div className="contract-grid">{data.projects.map((item) => <article className="card contract-card" key={item.id}><header><div><span>{clientName(item.clientId)}</span><h3>{item.name}</h3><p>{item.deadline ? `Prazo: ${item.deadline.split('-').reverse().join('/')}` : 'Sem prazo definido'}</p></div><span className={`status-pill project-${item.status.toLowerCase().replaceAll(' ', '-')}`}>{item.status}</span></header><div className="project-payment"><div><span>Valor</span><strong>{money(item.amount, item.currency)}</strong></div><div><span>Recebido</span><strong>{money(item.amountReceived, item.currency)}</strong></div><div><span>Pendente</span><strong>{money(item.amount - item.amountReceived, item.currency)}</strong></div></div><div className="project-links">{item.repositoryUrl && <a href={item.repositoryUrl} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Repositório</a>}{item.productionUrl && <a href={item.productionUrl} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Publicado</a>}</div><footer><button className="text-button" onClick={() => setEditing(item)}>Editar detalhes</button><button className="icon-button danger-icon" onClick={() => data.settings.confirmBeforeDelete ? setDeleting(item) : remove('projects', item.id)} aria-label="Excluir projeto"><Trash2 size={16} /></button></footer></article>)}</div>}
+    {data.projects.length === 0 ? <div className="empty-state"><FolderKanban size={40} /><h3>Registre seu primeiro projeto</h3><p>Projetos substituem contratos e concentram execução, links e recebimentos.</p>{data.clients.length > 0 && <button className="button primary" onClick={startCreate}><Plus size={17} /> Adicionar projeto</button>}</div> : <div className="contract-grid">{data.projects.map((item) => <article className="card contract-card" key={item.id}><header><div><span>{clientName(item.clientId)}</span><h3>{item.name}</h3><p>{item.deadline ? `Prazo: ${item.deadline.split('-').reverse().join('/')}` : 'Sem prazo definido'}</p></div><span className={`status-pill project-${item.status.toLowerCase().replaceAll(' ', '-')}`}>{item.status}</span></header><div className="project-payment"><div><span>Valor</span><strong>{money(item.amount, item.currency)}</strong></div><div><span>Recebido</span><strong>{money(item.amountReceived, item.currency)}</strong></div><div><span>Pendente</span><strong>{money(item.amount - item.amountReceived, item.currency)}</strong></div></div><div className="project-links">{item.repositoryUrl && <a href={item.repositoryUrl} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Repositório</a>}{item.productionUrl && <a href={item.productionUrl} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Publicado</a>}</div><footer><div className="project-card-actions"><button className="text-button" onClick={() => setSelectedId(item.id)}>Abrir projeto</button><button className="text-button" onClick={() => setEditing(item)}>Editar detalhes</button></div><button className="icon-button danger-icon" onClick={() => requestDelete(item)} aria-label="Excluir projeto"><Trash2 size={16} /></button></footer></article>)}</div>}
     {editing && <Modal title={data.projects.some((item) => item.id === editing.id) ? 'Editar projeto' : 'Novo projeto'} onClose={() => setEditing(null)} size="large"><ProjectForm initial={editing} onClose={() => setEditing(null)} /></Modal>}
-    {deleting && <ConfirmModal title="Excluir projeto?" message={`Os dados de “${deleting.name}” serão removidos.`} danger onClose={() => setDeleting(null)} onConfirm={() => { remove('projects', deleting.id); notify('Projeto excluído.') }} />}
+    {deleting && <ConfirmModal title="Excluir projeto?" message={(() => { const related = projectRelatedDataCounts(data, deleting.id); return relatedDeleteMessage(deleting, related.plannings, related.tasks) })()} danger onClose={() => setDeleting(null)} onConfirm={() => confirmDelete(deleting)} />}
   </div>
 }

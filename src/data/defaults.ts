@@ -9,8 +9,8 @@ export const DEFAULT_SERVICES: FreelanceService[] = [
 
 export function createDefaultData(startDate = toDateInput(new Date())): AppData {
   return {
-    schemaVersion: 2,
-    clients: [], proposals: [], projects: [], tasks: createRoadmap(startDate), services: DEFAULT_SERVICES.map((item) => ({ ...item })),
+    schemaVersion: 3,
+    clients: [], proposals: [], projects: [], projectPlannings: [], projectTasks: [], tasks: createRoadmap(startDate), services: DEFAULT_SERVICES.map((item) => ({ ...item })),
     settings: { userName: '', roadmapStartDate: startDate, weeklyGoalUsd: 200, weeklyHours: 10, primaryCurrency: 'USD', defaultExchangeRate: 5.5, theme: 'system', notificationsEnabled: true, confirmBeforeDelete: true },
     savedAt: new Date().toISOString(),
   }

@@ -1,4 +1,4 @@
-import type { Client, Currency, Project, Proposal, RoadmapTask } from '../types'
+import type { Client, Currency, Project, ProjectTask, Proposal, RoadmapTask } from '../types'
 import { toDateInput } from '../data/roadmap'
 
 export const isTaskOverdue = (task: RoadmapTask, today = new Date()) => {
@@ -43,6 +43,18 @@ export function projectMetrics(projects: Project[]) {
   const received = totalsByCurrency(valid, (item) => item.amountReceived, (item) => item.currency)
   const pending = { BRL: contracted.BRL - received.BRL, USD: contracted.USD - received.USD }
   return { active, contracted, received, pending, hours: valid.reduce((sum, item) => sum + item.workedHours, 0) }
+}
+
+export function projectExecutionMetrics(projects: Project[], projectTasks: ProjectTask[], today = new Date()) {
+  const start = toDateInput(today)
+  const endDate = new Date(today)
+  endDate.setDate(endDate.getDate() + 7)
+  const end = toDateInput(endDate)
+  return {
+    pendingTasks: projectTasks.filter((task) => task.status === 'Pendente').length,
+    blockedTasks: projectTasks.filter((task) => task.status === 'Bloqueado').length,
+    projectsNearDeadline: projects.filter((project) => !['Entregue', 'Cancelado'].includes(project.status) && project.deadline && project.deadline >= start && project.deadline <= end).length,
+  }
 }
 
 export function clientMetrics(clients: Client[]) {

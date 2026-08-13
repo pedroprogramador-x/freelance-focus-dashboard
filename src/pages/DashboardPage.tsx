@@ -1,7 +1,7 @@
-import { AlertTriangle, ArrowRight, BriefcaseBusiness, CalendarCheck, Check, CheckCircle2, CircleDollarSign, Clock3, Flame, FolderKanban, Play, RotateCw, Send, TrendingUp, Users } from 'lucide-react'
+import { AlertTriangle, ArrowRight, BriefcaseBusiness, CalendarCheck, CalendarClock, Check, CheckCircle2, CircleDollarSign, Clock3, Flame, FolderKanban, ListTodo, Play, RotateCw, Send, ShieldAlert, TrendingUp, Users } from 'lucide-react'
 import { useState } from 'react'
 import { useApp } from '../context/AppContext'
-import { calculateStreak, clientMetrics, isTaskOverdue, projectMetrics, proposalMetrics, taskMetrics } from '../utils/calculations'
+import { calculateStreak, clientMetrics, isTaskOverdue, projectExecutionMetrics, projectMetrics, proposalMetrics, taskMetrics } from '../utils/calculations'
 import { ProgressRing } from '../components/ProgressRing'
 import type { PageId } from '../components/Layout'
 import { toDateInput } from '../data/roadmap'
@@ -18,6 +18,7 @@ export function DashboardPage({ navigate }: { navigate: (page: PageId) => void }
   const tasks = taskMetrics(data.tasks, now)
   const proposals = proposalMetrics(data.proposals)
   const projects = projectMetrics(data.projects)
+  const execution = projectExecutionMetrics(data.projects, data.projectTasks, now)
   const clients = clientMetrics(data.clients)
   const todayTask = data.tasks.find((task) => (task.rescheduledDate ?? task.plannedDate) === todayIso && task.status !== 'Concluído') ?? data.tasks.find((task) => task.status !== 'Concluído') ?? data.tasks[89]
   const nextTasks = data.tasks.filter((task) => task.status !== 'Concluído').slice(0, 5)
@@ -33,6 +34,7 @@ export function DashboardPage({ navigate }: { navigate: (page: PageId) => void }
     if (overdue) items.push(`${overdue} tarefa${overdue > 1 ? 's' : ''} precisa${overdue > 1 ? 'm' : ''} de atenção.`)
     if (deadlines) items.push(`${deadlines} prazo${deadlines > 1 ? 's' : ''} de projeto próximo${deadlines > 1 ? 's' : ''}.`)
     if (followUps) items.push(`${followUps} proposta${followUps > 1 ? 's' : ''} aguardando acompanhamento.`)
+    if (execution.blockedTasks) items.push(`${execution.blockedTasks} tarefa${execution.blockedTasks > 1 ? 's' : ''} de projeto bloqueada${execution.blockedTasks > 1 ? 's' : ''}.`)
     return items
   })()
   const complete = () => {
@@ -48,6 +50,9 @@ export function DashboardPage({ navigate }: { navigate: (page: PageId) => void }
     { label: 'Valor contratado', value: `${brl.format(projects.contracted.BRL)} · ${usd.format(projects.contracted.USD)}`, icon: CircleDollarSign, tone: 'blue' },
     { label: 'Valor recebido', value: `${brl.format(projects.received.BRL)} · ${usd.format(projects.received.USD)}`, icon: TrendingUp, tone: 'green' },
     { label: 'Valor pendente', value: `${brl.format(projects.pending.BRL)} · ${usd.format(projects.pending.USD)}`, icon: CircleDollarSign, tone: 'amber' },
+    { label: 'Tarefas pendentes', value: execution.pendingTasks, icon: ListTodo, tone: 'amber' },
+    { label: 'Tarefas bloqueadas', value: execution.blockedTasks, icon: ShieldAlert, tone: 'red' },
+    { label: 'Projetos próximos do prazo', value: execution.projectsNearDeadline, icon: CalendarClock, tone: 'violet' },
   ]
   return <div className="dashboard-page">
     <section className="welcome-row"><div><p className="kicker">{new Intl.DateTimeFormat('pt-BR', { weekday: 'long', day: 'numeric', month: 'long' }).format(now)}</p><h2>{data.settings.userName ? `Olá, ${data.settings.userName}.` : 'Seu próximo passo está claro.'}</h2><p>Clientes, propostas, projetos e um plano de 90 dias no mesmo fluxo.</p></div><div className="streak"><Flame size={22} /><span><strong>{calculateStreak(data.tasks, now)} dias</strong> de sequência</span></div></section>

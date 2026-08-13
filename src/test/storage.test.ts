@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { createDefaultData } from '../data/defaults'
-import { exportBackup, isLocalDate, isValidAppData, LEGACY_STORAGE_KEY, loadData, migrateData, parseBackup, saveData, STORAGE_KEY } from '../services/storage'
+import { exportBackup, isLocalDate, isValidAppData, LEGACY_STORAGE_KEY, loadData, migrateData, parseBackup, saveData, STORAGE_KEY, type V2AppData } from '../services/storage'
 
 function createV1() {
   const current = createDefaultData('2026-03-01')
@@ -21,10 +21,14 @@ function createV1() {
   }
 }
 
-describe('persistência, migração e backup V2', () => {
+const asV2 = (data = migrateData(createV1())!): V2AppData => {
+  return { schemaVersion: 2, clients: data.clients, proposals: data.proposals, projects: data.projects, services: data.services, tasks: data.tasks, settings: data.settings, savedAt: data.savedAt }
+}
+
+describe('persistência, migração e backup V3', () => {
   beforeEach(() => localStorage.clear())
 
-  it('salva e carrega schema V2 usando a chave atual', () => {
+  it('salva e carrega schema V3 usando a chave atual', () => {
     const data = createDefaultData('2026-03-01')
     data.settings.userName = 'Pedro'
     saveData(data)
@@ -42,14 +46,16 @@ describe('persistência, migração e backup V2', () => {
     expect(loadData().tasks[0].id).toBe('task-01')
   })
 
-  it('migra V1 válido para V2 válido e preserva roadmap, settings e serviços', () => {
+  it('migra V1 para V2 e então V3, preservando roadmap, settings e serviços', () => {
     const legacy = createV1()
     const migrated = migrateData(legacy)
-    expect(migrated?.schemaVersion).toBe(2)
+    expect(migrated?.schemaVersion).toBe(3)
     expect(isValidAppData(migrated)).toBe(true)
     expect(migrated?.tasks).toEqual(legacy.tasks)
     expect(migrated?.settings).toEqual(legacy.settings)
     expect(migrated?.services).toEqual(legacy.services)
+    expect(migrated?.projectPlannings).toEqual([])
+    expect(migrated?.projectTasks).toEqual([])
   })
 
   it('deduplica somente nomes normalizados e liga propostas ao cliente estável', () => {
@@ -76,7 +82,7 @@ describe('persistência, migração e backup V2', () => {
   })
 
   it('repara uma V2 já migrada pela regra antiga sem afetar projetos nativos', () => {
-    const current = migrateData(createV1())!
+    const current = asV2()
     current.projects[0] = { ...current.projects[0], amount: 900, amountReceived: 900, paymentStatus: 'Pago', completedAt: '2026-03-25', platformFeePercent: undefined, exchangeRateToBrl: undefined }
     current.projects.push({ ...current.projects[0], id: 'native', notes: 'Projeto criado manualmente', amount: 90, amountReceived: 0, paymentStatus: 'Pendente', completedAt: null, platformFeePercent: undefined, exchangeRateToBrl: undefined })
     const repaired = migrateData(current)!
@@ -92,7 +98,7 @@ describe('persistência, migração e backup V2', () => {
     expect(migrateData(invalid)).toBeNull()
   })
 
-  it('valida valores e coerência de pagamento em V2', () => {
+  it('valida valores e coerência de pagamento em V3', () => {
     const invalid = createDefaultData('2026-03-01')
     invalid.clients.push({ id: 'client-1', name: 'Acme', companyName: '', contactName: '', phone: '', email: '', source: 'Outro', referredBy: '', status: 'Lead', notes: '', createdAt: '2026-03-01', updatedAt: '2026-03-01' })
     invalid.projects.push({ id: 'project-1', clientId: 'client-1', proposalId: null, name: 'API', description: '', status: 'Planejamento', startDate: null, deadline: null, completedAt: null, amount: 100, currency: 'BRL', estimatedHours: 0, workedHours: 0, repositoryUrl: '', productionUrl: '', paymentStatus: 'Parcial', amountReceived: 120, notes: '', createdAt: '2026-03-01', updatedAt: '2026-03-01' })
@@ -121,34 +127,41 @@ describe('persistência, migração e backup V2', () => {
     expect(isValidAppData(invalid)).toBe(false)
   })
 
-  it('exporta V2, importa V1 com migração e não altera estado ao rejeitar backup', () => {
+  it('exporta V3, importa V1 com migração e não altera estado ao rejeitar backup', () => {
     const current = createDefaultData('2026-03-01')
     const before = JSON.stringify(current)
-    expect(parseBackup(JSON.stringify(exportBackup(current))).schemaVersion).toBe(2)
+    expect(parseBackup(JSON.stringify(exportBackup(current))).schemaVersion).toBe(3)
     expect(parseBackup(JSON.stringify(createV1())).projects).toHaveLength(1)
-    expect(() => parseBackup('{"qualquer":true}')).toThrow('backup V1 ou V2 válido')
+    expect(() => parseBackup('{"qualquer":true}')).toThrow('backup V1, V2 ou V3 válido')
     expect(JSON.stringify(current)).toBe(before)
   })
 
   it('rejeita JSON inválido, schema desconhecido, arrays ausentes e tipos incorretos', () => {
     const current = createDefaultData('2026-03-01')
     expect(() => parseBackup('{')).toThrow('JSON válido')
-    expect(() => parseBackup(JSON.stringify({ ...current, schemaVersion: 99 }))).toThrow('backup V1 ou V2 válido')
+    expect(() => parseBackup(JSON.stringify({ ...current, schemaVersion: 99 }))).toThrow('backup V1, V2 ou V3 válido')
     const withoutClients: Partial<typeof current> = { ...current }
     delete withoutClients.clients
-    expect(() => parseBackup(JSON.stringify(withoutClients))).toThrow('backup V1 ou V2 válido')
-    expect(() => parseBackup(JSON.stringify({ ...current, projects: 'incorreto' }))).toThrow('backup V1 ou V2 válido')
+    expect(() => parseBackup(JSON.stringify(withoutClients))).toThrow('backup V1, V2 ou V3 válido')
+    const withoutProjectTasks: Partial<typeof current> = { ...current }
+    delete withoutProjectTasks.projectTasks
+    expect(() => parseBackup(JSON.stringify(withoutProjectTasks))).toThrow('backup V1, V2 ou V3 válido')
+    expect(() => parseBackup(JSON.stringify({ ...current, projects: 'incorreto' }))).toThrow('backup V1, V2 ou V3 válido')
   })
 
   it('rejeita referências quebradas de cliente, serviço e proposta', () => {
     const data = migrateData(createV1())!
+    const planning = { id: 'planning-1', projectId: 'missing', problem: '', objective: '', functionalRequirements: [], nonFunctionalRequirements: [], stack: [], architecture: '', technicalDecisions: [], risks: [], createdAt: '2026-03-01', updatedAt: '2026-03-01' }
+    const projectTask = { id: 'project-task-1', projectId: 'missing', title: 'Implementar', description: '', status: 'Pendente', priority: 'Alta', deadline: null, completedAt: null, createdAt: '2026-03-01', updatedAt: '2026-03-01' }
     const cases = [
       { ...data, proposals: data.proposals.map((item, index) => index ? item : { ...item, clientId: 'missing' }) },
       { ...data, proposals: data.proposals.map((item, index) => index ? item : { ...item, serviceId: 'missing' }) },
       { ...data, projects: data.projects.map((item) => ({ ...item, clientId: 'missing' })) },
       { ...data, projects: data.projects.map((item) => ({ ...item, proposalId: 'missing' })) },
+      { ...data, projectPlannings: [planning] },
+      { ...data, projectTasks: [projectTask] },
     ]
-    for (const invalid of cases) expect(() => parseBackup(JSON.stringify(invalid))).toThrow('backup V1 ou V2 válido')
+    for (const invalid of cases) expect(() => parseBackup(JSON.stringify(invalid))).toThrow('backup V1, V2 ou V3 válido')
   })
 
   it('deduplica acentos, caixa e espaços, sem unir nomes semanticamente diferentes', () => {

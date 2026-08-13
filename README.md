@@ -1,69 +1,84 @@
 # Freelance Focus Dashboard V2
 
-[![Deploy GitHub Pages](https://github.com/USUARIO/freelance-focus-dashboard/actions/workflows/deploy.yml/badge.svg)](https://github.com/USUARIO/freelance-focus-dashboard/actions/workflows/deploy.yml)
+[![Deploy GitHub Pages](https://github.com/pedroprogramador-x/freelance-focus-dashboard/actions/workflows/deploy.yml/badge.svg)](https://github.com/pedroprogramador-x/freelance-focus-dashboard/actions/workflows/deploy.yml)
 ![React](https://img.shields.io/badge/React-18-149eca?logo=react)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5-3178c6?logo=typescript)
 ![Vite](https://img.shields.io/badge/Vite-6-646cff?logo=vite)
 ![License MIT](https://img.shields.io/badge/license-MIT-0f766e)
 
-Aplicação web responsiva para organizar o fluxo comercial e a execução do trabalho freelance. A V2 conecta **Clientes → Propostas → Projetos** e preserva o Plano 90 Dias original, sem enviar dados para um servidor.
+Aplicação web responsiva para organizar o fluxo comercial e a execução do trabalho freelance. A V2 conecta **Clientes → Propostas → Projetos**, permite planejar tecnicamente cada projeto e preserva o Plano 90 Dias original. Todos os dados permanecem no navegador.
 
 ## Funcionalidades
 
 - clientes com contatos, empresa, origem, indicação, status, busca e visão financeira;
 - propostas em BRL ou USD relacionadas a clientes e, opcionalmente, a serviços;
-- suporte a Upwork, 99Freelas, indicação, contato direto e outras origens;
-- campos específicos de plataforma exibidos apenas quando relevantes;
-- projetos com prazo, status, horas, repositório, URL publicada e pagamentos;
-- dashboard com clientes, leads, propostas, projetos e valores por moeda;
+- criação explícita de projeto a partir de uma proposta aceita;
+- projetos com prazo, status, horas, links, pagamentos e página detalhada;
+- planejamento técnico por projeto com problema, objetivo, requisitos, stack, arquitetura, decisões e riscos;
+- tarefas de projeto com status, prioridade, prazo, filtros e progresso automático;
+- dashboard com indicadores comerciais e alertas simples de execução;
 - Plano 90 Dias com exatamente 90 tarefas em 13 semanas;
-- catálogo editável de serviços;
-- tema claro, escuro ou do sistema;
-- exportação, validação e importação de backups JSON V1 e V2;
-- persistência automática em `localStorage`;
-- layout acessível e responsivo para desktop e celular.
+- catálogo editável de serviços, tema claro/escuro e backup JSON;
+- persistência automática em `localStorage` e layout responsivo.
 
-## Schema V2
+## Schema V3
 
-O estado persistido usa `schemaVersion: 2` e contém:
+O produto continua sendo Freelance Focus V2. `schemaVersion: 3` representa apenas a versão do formato persistido.
 
 ```text
-clients      clientes e contatos
-proposals    oportunidades relacionadas por clientId
-projects     execução e pagamentos relacionados por clientId
-services     catálogo de serviços
-tasks        as 90 tarefas do plano
-settings     preferências locais
-savedAt      data do último salvamento
+clients             clientes e contatos
+proposals           oportunidades relacionadas por clientId
+projects            execução e pagamentos relacionados por clientId
+projectPlannings    planejamento técnico relacionado por projectId
+projectTasks        tarefas de execução relacionadas por projectId
+services            catálogo de serviços
+tasks               as 90 tarefas do Plano 90 Dias
+settings            preferências locais
+savedAt             data do último salvamento
 ```
 
-Propostas podem se relacionar a um serviço por `serviceId`. Projetos podem se relacionar opcionalmente a uma proposta por `proposalId`. Todos os relacionamentos são validados durante criação, edição, exclusão, carregamento e importação. Clientes, propostas e serviços com dependências não são excluídos; não existe exclusão em cascata silenciosa.
+Existe no máximo um `ProjectPlanning` por projeto. Cada planejamento mantém listas de requisitos funcionais e não funcionais, stack, arquitetura textual, decisões técnicas e riscos. Cada `ProjectTask` pertence a um projeto e usa os status `Pendente`, `Em andamento`, `Bloqueado` ou `Concluído`, com prioridade `Alta`, `Média` ou `Baixa`.
 
-`Project.amount` é o valor bruto contratado com o cliente, tanto para clientes locais quanto para plataformas. `amountReceived` é quanto desse recebível foi efetivamente recebido, na mesma moeda do projeto. A taxa da plataforma e a cotação histórica ficam em campos estruturados separados e não reduzem o valor contratado. Valores de projeto e recebimentos não aceitam números negativos. `amountReceived` não pode superar `amount`, e o status de pagamento deve concordar com o valor recebido: zero é pendente, um valor intermediário é parcial e o valor total positivo é pago. BRL e USD são totalizados separadamente; não há soma ou conversão implícita entre moedas.
+Ao concluir uma tarefa, `completedAt` recebe uma data local `YYYY-MM-DD`; ao retirar a conclusão, a data é removida. O progresso é sempre calculado por `tarefas concluídas / total de tarefas`. Quando não há tarefas, a interface informa isso sem exibir 100%.
 
-## Migração V1 → V2
+## Integridade e exclusões
 
-A atualização lê a chave anterior `freelance-focus:data:v1` quando não encontra dados V2 válidos.
+Relacionamentos são validados durante criação, edição, carregamento, migração e importação. O sistema rejeita planejamentos ou tarefas órfãs e dois planejamentos para o mesmo projeto.
 
-- nomes de clientes são normalizados somente para deduplicação conservadora: espaços externos são removidos, sequências de espaços viram um espaço, acentos são removidos por decomposição Unicode NFD e o texto passa para minúsculas em `pt-BR`; pontuação, ordem e demais caracteres são preservados;
-- o primeiro nome original é preservado para exibição;
-- IDs de clientes são determinísticos para o mesmo nome normalizado;
-- propostas antigas são ligadas ao cliente criado e passam a usar moeda USD explícita;
-- os status antigos são mapeados para o pipeline V2;
-- contratos são convertidos em projetos;
-- `Project.amount` recebe o valor bruto contratado; taxa da plataforma e cotação são preservadas também em campos estruturados, enquanto detalhes históricos e avaliação continuam nas notas;
-- todos os pagamentos migram como pendentes, inclusive contratos entregues, porque o V1 não registrava o recebimento financeiro;
-- o status `Entregue` é preservado, mas não cria uma data de conclusão que o V1 não possuía;
-- roadmap, configurações e serviços são preservados sem mudança de semântica;
-- dados V2 produzidos pela regra financeira anterior são reparados uma única vez a partir do bloco identificável da migração, sem alterar projetos nativos nem duplicar notas.
+Clientes, propostas e serviços com dependências continuam protegidos contra exclusões que criariam órfãos. Um projeto sem dados de execução respeita a configuração geral de confirmação. Um projeto com planejamento ou tarefas exige confirmação mesmo quando essa configuração está desativada; a mensagem informa as quantidades e a ação explícita remove projeto, planejamento e tarefas em uma única atualização. Não existe cascade delete silencioso.
 
-A chave V1 permanece como cópia de segurança local durante a migração; novos salvamentos são feitos em `freelance-focus:data:v2`.
+## Valores financeiros
 
-## Tecnologias
+`Project.amount` é o valor bruto contratado com o cliente. `amountReceived` é quanto desse recebível foi efetivamente recebido, na mesma moeda. Taxa da plataforma e cotação histórica ficam em campos estruturados separados. Valores não aceitam números negativos, o recebido não pode superar o contratado e o status deve corresponder a zero, valor parcial ou total positivo. BRL e USD são totalizados separadamente, sem conversão implícita.
+
+## Migrações
+
+### V2 → V3
+
+A migração preserva integralmente clientes, propostas, projetos, serviços, as 90 tarefas do roadmap, configurações, valores e relacionamentos. Ela apenas altera o número do schema e inicia `projectPlannings` e `projectTasks` vazios. Planejamentos são criados sob demanda quando o usuário os salva.
+
+O carregamento procura, nesta ordem, `freelance-focus:data:v3`, `freelance-focus:data:v2` e `freelance-focus:data:v1`. Novos salvamentos usam `freelance-focus:data:v3`.
+
+### V1 → V2 → V3
+
+A compatibilidade anterior foi mantida:
+
+- nomes de clientes são normalizados de forma conservadora para deduplicação: `trim`, espaços consecutivos reduzidos, decomposição Unicode NFD, remoção de acentos e minúsculas em `pt-BR`;
+- propostas e contratos antigos viram propostas e projetos relacionados;
+- o valor bruto contratado é preservado em `Project.amount`;
+- todos os pagamentos V1 migram como pendentes, pois `Entregue` não comprova recebimento;
+- roadmap, configurações e serviços são preservados;
+- depois da conversão V1 → V2, a mesma migração V2 → V3 adiciona as novas coleções vazias.
+
+A importação aceita backups V1, V2 e V3 válidos. Schema desconhecido, tipos incorretos, arrays ausentes, enums inválidos, datas impossíveis, IDs duplicados ou referências quebradas são rejeitados antes de substituir o estado atual.
+
+## Plano 90 Dias x tarefas de projeto
+
+`RoadmapTask` representa o programa pessoal de 90 dias e continua com 90 itens em 13 semanas, notas e reagendamento. `ProjectTask` representa uma ação de execução de um trabalho para cliente. Os dois tipos usam coleções, regras, progresso e telas independentes.
+
+## Tecnologias e estrutura
 
 React 18, TypeScript, Vite, CSS responsivo, Lucide React, Vitest, React Testing Library, ESLint e GitHub Actions.
-
-## Estrutura
 
 ```text
 src/
@@ -74,7 +89,7 @@ src/
 ├── services/     persistência, validação, migração e backup
 ├── styles/       sistema visual responsivo
 ├── test/         testes unitários, migração e interface
-├── types/        tipos de domínio V2
+├── types/        tipos de domínio
 └── utils/        cálculos e filtros
 ```
 
@@ -98,28 +113,21 @@ npm run dev
 
 ## GitHub Pages
 
-O Vite mantém `/freelance-focus-dashboard/` como `base` de produção. A navegação continua baseada em hash, evitando erros 404 no GitHub Pages. O workflow em `.github/workflows/deploy.yml` executa lint, testes e build antes do deploy.
+O Vite mantém `/freelance-focus-dashboard/` como `base` de produção. A navegação interna não depende de rotas do servidor. O workflow em `.github/workflows/deploy.yml` executa lint, testes e build antes do deploy.
 
-## Armazenamento, privacidade e backup
+## Armazenamento, privacidade e limitações
 
-Todos os dados continuam locais no `localStorage` do navegador. Não existe backend, banco de dados, autenticação, sincronização, analytics ou integração com APIs externas.
+Todos os dados ficam no `localStorage` do navegador. Não existe backend, banco de dados, autenticação, sincronização, analytics ou integração com APIs externas. Limpar os dados do navegador remove os registros locais; exporte backups regularmente.
 
-Os dados são específicos do navegador, dispositivo e perfil em uso. Limpar os dados do navegador remove os registros locais. Exporte backups JSON regularmente, principalmente antes de trocar de dispositivo ou navegador.
+Limitações desta fase:
 
-A importação aceita backups V2 válidos e migra backups V1 válidos. Arquivos inválidos são rejeitados sem substituir o estado atual.
-
-## Limitações atuais
-
-- não há sincronização entre dispositivos;
-- não há login nem controle de acesso;
-- não há backend, PostgreSQL ou armazenamento em nuvem;
-- tarefas de projeto e planos de manutenção ainda não fazem parte desta fase;
-- a cotação antiga fica estruturada e documentada nas notas da migração, mas a V2 não converte moedas automaticamente;
-- exclusões de cliente, proposta ou serviço são bloqueadas enquanto houver registros dependentes.
-
-## Fora de escopo desta fase
-
-IA, autenticação, backend, banco de dados, GitHub, WhatsApp, n8n, e-mail, cobrança, nota fiscal, PWA e aplicativo mobile permanecem como possibilidades futuras.
+- não há sincronização entre dispositivos, login ou controle de acesso;
+- arquitetura é apenas texto multilinha, sem diagrama ou geração automática;
+- tarefas usam lista e filtros, sem Kanban ou drag and drop;
+- decisões técnicas não são ADRs formais;
+- riscos não possuem probabilidade ou impacto;
+- não há dependências entre tarefas, anexos ou integração com repositórios;
+- não há manutenção, planos mensais, IA, financeiro avançado ou conversão automática de moedas.
 
 ## Licença
 

@@ -1,17 +1,20 @@
 import { createDefaultData } from '../data/defaults'
 import { normalizeClientName } from '../data/domain'
 import { createRoadmap } from '../data/roadmap'
-import type { AppData, Backup, Client, ClientSource, ClientStatus, Currency, FreelanceService, Project, ProjectStatus, Proposal, ProposalStatus, Settings } from '../types'
+import type { AppData, Backup, Client, ClientSource, ClientStatus, Currency, FreelanceService, Project, ProjectPlanning, ProjectStatus, ProjectTask, Proposal, ProposalStatus, RoadmapTask, Settings, TechnicalDecision, ProjectRisk } from '../types'
 
-export const STORAGE_KEY = 'freelance-focus:data:v2'
+export const STORAGE_KEY = 'freelance-focus:data:v3'
+export const V2_STORAGE_KEY = 'freelance-focus:data:v2'
 export const LEGACY_STORAGE_KEY = 'freelance-focus:data:v1'
+
+export type V2AppData = Omit<AppData, 'schemaVersion' | 'projectPlannings' | 'projectTasks'> & { schemaVersion: 2 }
 
 type LegacyPlatform = 'Upwork' | '99Freelas' | 'LinkedIn' | 'Indicação' | 'Outra'
 type LegacyProposalStatus = 'Salva' | 'Enviada' | 'Visualizada' | 'Entrevista' | 'Contratado' | 'Recusada' | 'Ignorada'
 type LegacyContractStatus = 'Em negociação' | 'Em andamento' | 'Entregue' | 'Pausado' | 'Cancelado'
 interface LegacyProposal { id: string; date: string; platform: LegacyPlatform; projectName: string; clientName: string; serviceType: string; budgetUsd: number; connects: number; url: string; status: LegacyProposalStatus; deadline: string; estimatedHours: number; estimatedHourlyRate: number; nextStep: string; notes: string; followUpDate: string }
 interface LegacyContract { id: string; project: string; client: string; platform: LegacyPlatform; service: string; startDate: string; deadline: string; grossUsd: number; platformFeePercent: number; exchangeRate: number; hoursWorked: number; status: LegacyContractStatus; rating: number | null; notes: string }
-interface LegacyAppData { schemaVersion: 1; tasks: AppData['tasks']; proposals: LegacyProposal[]; contracts: LegacyContract[]; services: FreelanceService[]; settings: Settings; savedAt: string }
+interface LegacyAppData { schemaVersion: 1; tasks: RoadmapTask[]; proposals: LegacyProposal[]; contracts: LegacyContract[]; services: FreelanceService[]; settings: Settings; savedAt: string }
 
 const taskStatuses = new Set(['Pendente', 'Em andamento', 'Concluído', 'Adiado'])
 const priorities = new Set(['Alta', 'Média', 'Baixa'])
@@ -22,6 +25,8 @@ const clientSources = new Set(['Indicação', 'WhatsApp', 'Instagram', 'Upwork',
 const clientStatuses = new Set(['Lead', 'Em negociação', 'Cliente ativo', 'Cliente inativo'])
 const proposalStatuses = new Set(['Rascunho', 'Enviada', 'Aguardando resposta', 'Aceita', 'Recusada', 'Expirada'])
 const projectStatuses = new Set(['Planejamento', 'Em desenvolvimento', 'Aguardando cliente', 'Em revisão', 'Entregue', 'Pausado', 'Cancelado'])
+const projectTaskStatuses = new Set(['Pendente', 'Em andamento', 'Bloqueado', 'Concluído'])
+const projectTaskPriorities = new Set(['Alta', 'Média', 'Baixa'])
 const paymentStatuses = new Set(['Pendente', 'Parcial', 'Pago'])
 const serviceStatuses = new Set(['Rascunho', 'Pronto', 'Publicado', 'Vendido'])
 const themes = new Set(['light', 'dark', 'system'])
@@ -101,6 +106,40 @@ function isService(value: unknown): value is FreelanceService {
     && isNonNegative(item.startingPriceUsd) && serviceStatuses.has(String(item.status))
 }
 
+function isTechnicalDecision(value: unknown): value is TechnicalDecision {
+  if (!hasId(value)) return false
+  const item = value as Record<string, unknown>
+  return isString(item.title) && !!item.title.trim() && isString(item.decision) && isString(item.reason)
+}
+
+function isProjectRisk(value: unknown): value is ProjectRisk {
+  if (!hasId(value)) return false
+  const item = value as Record<string, unknown>
+  return isString(item.description) && !!item.description.trim() && isString(item.mitigation)
+}
+
+const isNonEmptyStringArray = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => isString(item) && !!item.trim())
+
+export function isProjectPlanning(value: unknown): value is ProjectPlanning {
+  if (!hasId(value)) return false
+  const item = value as Record<string, unknown>
+  return isString(item.projectId) && !!item.projectId
+    && isString(item.problem) && isString(item.objective) && isString(item.architecture)
+    && isNonEmptyStringArray(item.functionalRequirements) && isNonEmptyStringArray(item.nonFunctionalRequirements) && isNonEmptyStringArray(item.stack)
+    && Array.isArray(item.technicalDecisions) && item.technicalDecisions.every(isTechnicalDecision) && uniqueIds(item.technicalDecisions)
+    && Array.isArray(item.risks) && item.risks.every(isProjectRisk) && uniqueIds(item.risks)
+    && isStoredDate(item.createdAt) && isStoredDate(item.updatedAt)
+}
+
+export function isProjectTask(value: unknown): value is ProjectTask {
+  if (!hasId(value)) return false
+  const item = value as Record<string, unknown>
+  const completionValid = item.status === 'Concluído' ? isLocalDate(item.completedAt) : item.completedAt === null
+  return isString(item.projectId) && !!item.projectId && isString(item.title) && !!item.title.trim() && isString(item.description)
+    && projectTaskStatuses.has(String(item.status)) && projectTaskPriorities.has(String(item.priority))
+    && isNullableLocalDate(item.deadline) && completionValid && isStoredDate(item.createdAt) && isStoredDate(item.updatedAt)
+}
+
 function isSettings(value: unknown): value is Settings {
   if (!value || typeof value !== 'object') return false
   const item = value as Record<string, unknown>
@@ -113,10 +152,12 @@ function hasValidRoadmap(value: { tasks?: unknown }) {
   return Array.isArray(value.tasks) && value.tasks.length === 90 && value.tasks.every(isTask) && uniqueIds(value.tasks)
 }
 
-export function isValidAppData(value: unknown): value is AppData {
+type CoreData = Omit<V2AppData, 'schemaVersion'>
+
+function hasValidCoreData(value: unknown): value is CoreData {
   if (!value || typeof value !== 'object') return false
-  const item = value as Partial<AppData>
-  if (item.schemaVersion !== 2 || !isStoredDate(item.savedAt) || !hasValidRoadmap(item)) return false
+  const item = value as Partial<CoreData>
+  if (!isStoredDate(item.savedAt) || !hasValidRoadmap(item)) return false
   if (!Array.isArray(item.clients) || !item.clients.every(isClient) || !uniqueIds(item.clients)) return false
   if (!Array.isArray(item.proposals) || !item.proposals.every(isProposal) || !uniqueIds(item.proposals)) return false
   if (!Array.isArray(item.projects) || !item.projects.every(isProject) || !uniqueIds(item.projects)) return false
@@ -126,6 +167,21 @@ export function isValidAppData(value: unknown): value is AppData {
   const proposalById = new Map(item.proposals.map((proposal) => [proposal.id, proposal]))
   return item.proposals.every((proposal) => clientIds.has(proposal.clientId) && (proposal.serviceId === null || serviceIds.has(proposal.serviceId)))
     && item.projects.every((project) => clientIds.has(project.clientId) && (project.proposalId === null || proposalById.get(project.proposalId)?.clientId === project.clientId))
+}
+
+export function isValidV2Data(value: unknown): value is V2AppData {
+  return !!value && typeof value === 'object' && (value as { schemaVersion?: unknown }).schemaVersion === 2 && hasValidCoreData(value)
+}
+
+export function isValidAppData(value: unknown): value is AppData {
+  if (!value || typeof value !== 'object' || (value as { schemaVersion?: unknown }).schemaVersion !== 3 || !hasValidCoreData(value)) return false
+  const item = value as Partial<AppData>
+  if (!Array.isArray(item.projectPlannings) || !item.projectPlannings.every(isProjectPlanning) || !uniqueIds(item.projectPlannings)) return false
+  if (!Array.isArray(item.projectTasks) || !item.projectTasks.every(isProjectTask) || !uniqueIds(item.projectTasks)) return false
+  const projectIds = new Set(item.projects!.map((project) => project.id))
+  return item.projectPlannings.every((planning) => projectIds.has(planning.projectId))
+    && new Set(item.projectPlannings.map((planning) => planning.projectId)).size === item.projectPlannings.length
+    && item.projectTasks.every((task) => projectIds.has(task.projectId))
 }
 
 function isLegacyProposal(value: unknown): value is LegacyProposal {
@@ -175,7 +231,7 @@ function inferClientStatus(name: string, proposals: LegacyProposal[], contracts:
   return 'Lead'
 }
 
-export function migrateV1ToV2(legacy: LegacyAppData): AppData {
+export function migrateV1ToV2(legacy: LegacyAppData): V2AppData {
   const records = [
     ...legacy.proposals.map((item) => ({ name: item.clientName, source: sourceFromPlatform(item.platform), date: item.date })),
     ...legacy.contracts.map((item) => ({ name: item.client, source: sourceFromPlatform(item.platform), date: item.startDate })),
@@ -219,7 +275,7 @@ function migrateV0(value: Record<string, unknown>): LegacyAppData | null {
   return isValidV1Data(candidate) ? candidate : null
 }
 
-function repairPreviouslyMigratedV2(data: AppData): AppData {
+function repairPreviouslyMigratedV2(data: V2AppData): V2AppData {
   let changed = false
   const projects = data.projects.map((project) => {
     if (project.platformFeePercent !== undefined || project.exchangeRateToBrl !== undefined || !project.notes.includes('Dados preservados da migração V1:')) return project
@@ -241,18 +297,23 @@ function repairPreviouslyMigratedV2(data: AppData): AppData {
   return changed ? { ...data, projects } : data
 }
 
+export function migrateV2ToV3(data: V2AppData): AppData {
+  return { ...data, schemaVersion: 3, projectPlannings: [], projectTasks: [] }
+}
+
 export function migrateData(value: unknown): AppData | null {
-  if (isValidAppData(value)) return repairPreviouslyMigratedV2(value)
-  if (isValidV1Data(value)) return migrateV1ToV2(value)
+  if (isValidAppData(value)) return value
+  if (isValidV2Data(value)) return migrateV2ToV3(repairPreviouslyMigratedV2(value))
+  if (isValidV1Data(value)) return migrateV2ToV3(migrateV1ToV2(value))
   if (!value || typeof value !== 'object') return null
   const version = (value as { schemaVersion?: unknown }).schemaVersion
   if (version !== undefined && version !== 0) return null
   const legacy = migrateV0(value as Record<string, unknown>)
-  return legacy ? migrateV1ToV2(legacy) : null
+  return legacy ? migrateV2ToV3(migrateV1ToV2(legacy)) : null
 }
 
 export function loadData(storage: Storage = localStorage): AppData {
-  for (const key of [STORAGE_KEY, LEGACY_STORAGE_KEY]) {
+  for (const key of [STORAGE_KEY, V2_STORAGE_KEY, LEGACY_STORAGE_KEY]) {
     try {
       const raw = storage.getItem(key)
       if (!raw) continue
@@ -277,9 +338,9 @@ export function parseBackup(raw: string): AppData {
   let parsed: unknown
   try { parsed = JSON.parse(raw) } catch { throw new Error('O arquivo não contém um JSON válido.') }
   const version = parsed && typeof parsed === 'object' ? (parsed as { schemaVersion?: unknown }).schemaVersion : undefined
-  if (version !== 1 && version !== 2) throw new Error('Este arquivo não é um backup V1 ou V2 válido do Freelance Focus.')
+  if (version !== 1 && version !== 2 && version !== 3) throw new Error('Este arquivo não é um backup V1, V2 ou V3 válido do Freelance Focus.')
   const migrated = migrateData(parsed)
-  if (!migrated) throw new Error('Este arquivo não é um backup V1 ou V2 válido do Freelance Focus.')
+  if (!migrated) throw new Error('Este arquivo não é um backup V1, V2 ou V3 válido do Freelance Focus.')
   return migrated
 }
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { createRoadmap } from '../data/roadmap'
-import type { Client, Project, Proposal } from '../types'
-import { clientFinancials, clientMetrics, isTaskOverdue, projectMetrics, proposalMetrics, taskMetrics } from '../utils/calculations'
+import type { Client, Project, ProjectTask, Proposal } from '../types'
+import { clientFinancials, clientMetrics, isTaskOverdue, projectExecutionMetrics, projectMetrics, proposalMetrics, taskMetrics } from '../utils/calculations'
 
 const client: Client = { id: 'client-1', name: 'Acme', companyName: '', contactName: '', phone: '', email: '', source: 'Contato direto', referredBy: '', status: 'Cliente ativo', notes: '', createdAt: '2026-01-01', updatedAt: '2026-01-01' }
 const proposal: Proposal = { id: 'proposal-1', clientId: client.id, serviceId: null, title: 'API', description: '', amount: 1000, currency: 'USD', source: 'Upwork', status: 'Aceita', createdAt: '2026-01-01', sentAt: '2026-01-01', validUntil: null, followUpDate: null, estimatedHours: 20, notes: '', platformData: { connects: 8 } }
@@ -32,5 +32,11 @@ describe('cálculos do painel V2', () => {
   it('calcula indicadores e relacionamentos do cliente', () => {
     expect(clientMetrics([client, { ...client, id: 'client-2', status: 'Lead' }])).toEqual({ active: 1, leads: 1 })
     expect(clientFinancials(client.id, [project])).toEqual({ contracted: { BRL: 0, USD: 1000 }, received: { BRL: 0, USD: 400 } })
+  })
+
+  it('calcula indicadores simples de execução sem misturar tarefas do roadmap', () => {
+    const baseTask: ProjectTask = { id: 'project-task-1', projectId: project.id, title: 'Implementar', description: '', status: 'Pendente', priority: 'Alta', deadline: null, completedAt: null, createdAt: '2026-01-01', updatedAt: '2026-01-01' }
+    const nearDeadline = { ...project, deadline: '2026-01-07' }
+    expect(projectExecutionMetrics([nearDeadline], [baseTask, { ...baseTask, id: 'blocked', status: 'Bloqueado' }], new Date('2026-01-01T12:00:00'))).toEqual({ pendingTasks: 1, blockedTasks: 1, projectsNearDeadline: 1 })
   })
 })

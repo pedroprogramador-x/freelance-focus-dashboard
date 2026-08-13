@@ -1,11 +1,11 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { recalculateRoadmapDates } from '../data/roadmap'
 import { createDefaultData } from '../data/defaults'
-import { deletionBlockReason, hasValidEntityReferences, type DomainEntity, type EntityCollection } from '../data/domain'
+import { deletionBlockReason, hasValidEntityReferences, removeProjectWithRelatedData, type DomainEntity, type EntityCollection } from '../data/domain'
 import { loadData, saveData } from '../services/storage'
-import type { AppData, Client, FreelanceService, Project, Proposal, RoadmapTask, Settings } from '../types'
+import type { AppData, Client, FreelanceService, Project, ProjectPlanning, ProjectTask, Proposal, RoadmapTask, Settings } from '../types'
 
-type Entity = Client | Proposal | Project | FreelanceService
+type Entity = Client | Proposal | Project | ProjectPlanning | ProjectTask | FreelanceService
 interface Toast { id: number; message: string; tone: 'success' | 'error' | 'info' }
 interface AppContextValue {
   data: AppData
@@ -16,6 +16,7 @@ interface AppContextValue {
   toggleTask: (id: string) => void
   upsert: (collection: EntityCollection, value: Entity) => void
   remove: (collection: EntityCollection, id: string) => void
+  removeProjectWithRelated: (id: string) => void
   updateSettings: (settings: Settings) => void
   replaceData: (data: AppData) => void
   resetAll: () => void
@@ -70,6 +71,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setData((current) => deletionBlockReason(current, collection, id) ? current : { ...current, [collection]: (current[collection] as Entity[]).filter((item) => item.id !== id) })
   }, [])
 
+  const removeProjectWithRelated = useCallback((id: string) => {
+    setData((current) => removeProjectWithRelatedData(current, id))
+  }, [])
+
   const updateSettings = useCallback((settings: Settings) => {
     setData((current) => {
       const dateChanged = settings.roadmapStartDate !== current.settings.roadmapStartDate
@@ -79,11 +84,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const value = useMemo<AppContextValue>(() => ({
-    data, ready, toast, lastSavedAt, updateTask, toggleTask, upsert, remove, updateSettings,
+    data, ready, toast, lastSavedAt, updateTask, toggleTask, upsert, remove, removeProjectWithRelated, updateSettings,
     replaceData: setData,
     resetAll: () => setData(createDefaultData()),
     notify,
-  }), [data, ready, toast, lastSavedAt, updateTask, toggleTask, upsert, remove, updateSettings, notify])
+  }), [data, ready, toast, lastSavedAt, updateTask, toggleTask, upsert, remove, removeProjectWithRelated, updateSettings, notify])
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>
 }

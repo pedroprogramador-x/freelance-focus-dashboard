@@ -94,6 +94,50 @@ export interface Project {
   updatedAt: string
 }
 
+export interface TechnicalDecision {
+  id: string
+  title: string
+  decision: string
+  reason: string
+}
+
+export interface ProjectRisk {
+  id: string
+  description: string
+  mitigation: string
+}
+
+export interface ProjectPlanning {
+  id: string
+  projectId: string
+  problem: string
+  objective: string
+  functionalRequirements: string[]
+  nonFunctionalRequirements: string[]
+  stack: string[]
+  architecture: string
+  technicalDecisions: TechnicalDecision[]
+  risks: ProjectRisk[]
+  createdAt: string
+  updatedAt: string
+}
+
+export type ProjectTaskStatus = 'Pendente' | 'Em andamento' | 'Bloqueado' | 'Concluído'
+export type ProjectTaskPriority = 'Alta' | 'Média' | 'Baixa'
+
+export interface ProjectTask {
+  id: string
+  projectId: string
+  title: string
+  description: string
+  status: ProjectTaskStatus
+  priority: ProjectTaskPriority
+  deadline: string | null
+  completedAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
 export type ServiceStatus = 'Rascunho' | 'Pronto' | 'Publicado' | 'Vendido'
 export interface FreelanceService {
   id: string
@@ -119,10 +163,12 @@ export interface Settings {
 }
 
 export interface AppData {
-  schemaVersion: 2
+  schemaVersion: 3
   clients: Client[]
   proposals: Proposal[]
   projects: Project[]
+  projectPlannings: ProjectPlanning[]
+  projectTasks: ProjectTask[]
   services: FreelanceService[]
   tasks: RoadmapTask[]
   settings: Settings
