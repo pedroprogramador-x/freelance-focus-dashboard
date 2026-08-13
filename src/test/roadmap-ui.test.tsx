@@ -38,8 +38,9 @@ describe('alteração da data inicial no roadmap', () => {
       priority: 'Alta',
     }
     initial.tasks[1] = { ...initial.tasks[1], status: 'Adiado', rescheduledDate: '2026-09-01' }
-    initial.proposals = [{ id: 'proposal-1', date: '2026-08-01', platform: 'Upwork', projectName: 'API', clientName: 'Cliente', serviceType: 'Integração', budgetUsd: 300, connects: 8, url: '', status: 'Enviada', deadline: '2026-08-20', estimatedHours: 10, estimatedHourlyRate: 30, nextStep: 'Aguardar', notes: 'Manter', followUpDate: '2026-08-08' }]
-    initial.contracts = [{ id: 'contract-1', project: 'Automação', client: 'Cliente', platform: 'Upwork', service: 'Python', startDate: '2026-08-02', deadline: '2026-08-30', grossUsd: 500, platformFeePercent: 10, exchangeRate: 5.5, hoursWorked: 2, status: 'Em andamento', rating: null, notes: 'Manter' }]
+    initial.clients = [{ id: 'client-1', name: 'Cliente', companyName: '', contactName: '', phone: '', email: '', source: 'Upwork', referredBy: '', status: 'Cliente ativo', notes: '', createdAt: '2026-08-01', updatedAt: '2026-08-01' }]
+    initial.proposals = [{ id: 'proposal-1', clientId: 'client-1', serviceId: null, title: 'API', description: 'Integração', amount: 300, currency: 'USD', source: 'Upwork', status: 'Enviada', createdAt: '2026-08-01', sentAt: '2026-08-01', validUntil: '2026-08-20', followUpDate: '2026-08-08', estimatedHours: 10, notes: 'Manter', platformData: { connects: 8 } }]
+    initial.projects = [{ id: 'project-1', clientId: 'client-1', proposalId: null, name: 'Automação', description: 'Python', status: 'Em desenvolvimento', startDate: '2026-08-02', deadline: '2026-08-30', completedAt: null, amount: 500, currency: 'USD', estimatedHours: 10, workedHours: 2, repositoryUrl: '', productionUrl: '', paymentStatus: 'Pendente', amountReceived: 0, notes: 'Manter', createdAt: '2026-08-02', updatedAt: '2026-08-02' }]
     saveData(initial)
 
     renderRoadmap()
@@ -79,7 +80,8 @@ describe('alteração da data inicial no roadmap', () => {
       expect(persisted.tasks[1]).toMatchObject({ status: 'Adiado', rescheduledDate: '2026-09-01', plannedDate: '2026-08-11' })
       expect(persisted.tasks[89].plannedDate).toBe('2026-11-07')
       expect(persisted.proposals).toEqual(initial.proposals)
-      expect(persisted.contracts).toEqual(initial.contracts)
+      expect(persisted.clients).toEqual(initial.clients)
+      expect(persisted.projects).toEqual(initial.projects)
       expect(persisted.services).toEqual(initial.services)
     }, { timeout: 1000 })
   })

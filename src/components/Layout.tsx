@@ -1,12 +1,12 @@
-import { BarChart3, BriefcaseBusiness, CalendarDays, ChevronLeft, ChevronRight, CircleDollarSign, Menu, Moon, Settings, Sun, Wrench, X, type LucideIcon } from 'lucide-react'
+import { BarChart3, BriefcaseBusiness, CalendarDays, ChevronLeft, ChevronRight, FolderKanban, Menu, Moon, Settings, Sun, Users, Wrench, X, type LucideIcon } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useApp } from '../context/AppContext'
 
-export type PageId = 'dashboard' | 'roadmap' | 'proposals' | 'contracts' | 'services' | 'settings'
+export type PageId = 'dashboard' | 'roadmap' | 'clients' | 'proposals' | 'projects' | 'services' | 'settings'
 const navigation: { id: PageId; label: string; icon: LucideIcon }[] = [
-  { id: 'dashboard', label: 'Painel', icon: BarChart3 }, { id: 'roadmap', label: 'Plano de 90 dias', icon: CalendarDays },
-  { id: 'proposals', label: 'Propostas', icon: BriefcaseBusiness }, { id: 'contracts', label: 'Clientes e ganhos', icon: CircleDollarSign },
-  { id: 'services', label: 'Serviços', icon: Wrench }, { id: 'settings', label: 'Configurações', icon: Settings },
+  { id: 'dashboard', label: 'Painel', icon: BarChart3 }, { id: 'roadmap', label: 'Plano 90 Dias', icon: CalendarDays },
+  { id: 'clients', label: 'Clientes', icon: Users }, { id: 'proposals', label: 'Propostas', icon: BriefcaseBusiness },
+  { id: 'projects', label: 'Projetos', icon: FolderKanban }, { id: 'services', label: 'Serviços', icon: Wrench }, { id: 'settings', label: 'Configurações', icon: Settings },
 ]
 
 export function Layout({ page, setPage, children }: { page: PageId; setPage: (page: PageId) => void; children: React.ReactNode }) {
@@ -35,15 +35,13 @@ export function Layout({ page, setPage, children }: { page: PageId; setPage: (pa
     menuWasOpen.current = true
     const selector = 'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
     const focusable = () => Array.from(sidebarRef.current?.querySelectorAll<HTMLElement>(selector) ?? []).filter((element) => element.offsetParent !== null)
-    const activeItem = sidebarRef.current?.querySelector<HTMLElement>('[aria-current="page"]')
-    activeItem?.focus()
+    sidebarRef.current?.querySelector<HTMLElement>('[aria-current="page"]')?.focus()
     const handleKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') { setMenuOpen(false); return }
       if (event.key !== 'Tab') return
       const elements = focusable()
       if (!elements.length) return
-      const first = elements[0]
-      const last = elements[elements.length - 1]
+      const first = elements[0]; const last = elements[elements.length - 1]
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
     }

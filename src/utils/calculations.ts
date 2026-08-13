@@ -1,4 +1,4 @@
-import type { Contract, Proposal, RoadmapTask } from '../types'
+import type { Client, Currency, Project, Proposal, RoadmapTask } from '../types'
 import { toDateInput } from '../data/roadmap'
 
 export const isTaskOverdue = (task: RoadmapTask, today = new Date()) => {
@@ -19,33 +19,39 @@ export function calculateStreak(tasks: RoadmapTask[], today = new Date()) {
   const cursor = new Date(today)
   if (!completedDays.has(toDateInput(cursor))) cursor.setDate(cursor.getDate() - 1)
   let streak = 0
-  while (completedDays.has(toDateInput(cursor))) {
-    streak += 1
-    cursor.setDate(cursor.getDate() - 1)
-  }
+  while (completedDays.has(toDateInput(cursor))) { streak += 1; cursor.setDate(cursor.getDate() - 1) }
   return streak
 }
 
-export const netUsd = (contract: Contract) => contract.grossUsd * (1 - contract.platformFeePercent / 100)
-export const netBrl = (contract: Contract) => netUsd(contract) * contract.exchangeRate
-export const netHourly = (contract: Contract) => contract.hoursWorked > 0 ? netUsd(contract) / contract.hoursWorked : 0
-
-export function contractMetrics(contracts: Contract[]) {
-  const active = contracts.filter((item) => item.status !== 'Cancelado')
-  const revenueUsd = active.reduce((sum, item) => sum + netUsd(item), 0)
-  const revenueBrl = active.reduce((sum, item) => sum + netBrl(item), 0)
-  const hours = active.reduce((sum, item) => sum + item.hoursWorked, 0)
-  const currentMonth = toDateInput(new Date()).slice(0, 7)
-  const monthlyRevenue = active.filter((item) => item.startDate.startsWith(currentMonth)).reduce((sum, item) => sum + netUsd(item), 0)
-  const clients = new Set(active.map((item) => item.client.trim().toLowerCase()).filter(Boolean))
-  const counts = active.reduce<Record<string, number>>((acc, item) => { const key = item.client.trim().toLowerCase(); if (key) acc[key] = (acc[key] ?? 0) + 1; return acc }, {})
-  return { revenueUsd, revenueBrl, monthlyRevenue, hours, averageProject: active.length ? revenueUsd / active.length : 0, averageHourly: hours ? revenueUsd / hours : 0, clients: clients.size, recurringClients: Object.values(counts).filter((count) => count > 1).length }
+export function proposalMetrics(proposals: Proposal[]) {
+  const sent = proposals.filter((item) => item.status !== 'Rascunho').length
+  const open = proposals.filter((item) => ['Enviada', 'Aguardando resposta'].includes(item.status)).length
+  const accepted = proposals.filter((item) => item.status === 'Aceita').length
+  const platformConnects = proposals.reduce((sum, item) => sum + (item.platformData?.connects ?? 0), 0)
+  return { total: proposals.length, sent, open, accepted, acceptanceRate: sent ? accepted / sent * 100 : 0, connects: platformConnects }
 }
 
-export function proposalMetrics(proposals: Proposal[]) {
-  const sent = proposals.filter((item) => item.status !== 'Salva').length
-  const viewed = proposals.filter((item) => ['Visualizada', 'Entrevista', 'Contratado'].includes(item.status)).length
-  const interviews = proposals.filter((item) => ['Entrevista', 'Contratado'].includes(item.status)).length
-  const hired = proposals.filter((item) => item.status === 'Contratado').length
-  return { total: proposals.length, sent, viewed, interviews, hired, viewRate: sent ? viewed / sent * 100 : 0, interviewRate: sent ? interviews / sent * 100 : 0, hireRate: sent ? hired / sent * 100 : 0, connects: proposals.reduce((sum, item) => sum + item.connects, 0), wonValue: proposals.filter((item) => item.status === 'Contratado').reduce((sum, item) => sum + item.budgetUsd, 0) }
+const totalsByCurrency = <T>(items: T[], value: (item: T) => number, currency: (item: T) => Currency) => items.reduce<Record<Currency, number>>((totals, item) => {
+  totals[currency(item)] += value(item)
+  return totals
+}, { BRL: 0, USD: 0 })
+
+export function projectMetrics(projects: Project[]) {
+  const valid = projects.filter((item) => item.status !== 'Cancelado')
+  const active = valid.filter((item) => !['Entregue', 'Cancelado', 'Pausado'].includes(item.status)).length
+  const contracted = totalsByCurrency(valid, (item) => item.amount, (item) => item.currency)
+  const received = totalsByCurrency(valid, (item) => item.amountReceived, (item) => item.currency)
+  const pending = { BRL: contracted.BRL - received.BRL, USD: contracted.USD - received.USD }
+  return { active, contracted, received, pending, hours: valid.reduce((sum, item) => sum + item.workedHours, 0) }
+}
+
+export function clientMetrics(clients: Client[]) {
+  return { active: clients.filter((item) => item.status === 'Cliente ativo').length, leads: clients.filter((item) => item.status === 'Lead').length }
+}
+
+export function clientFinancials(clientId: string, projects: Project[]) {
+  const related = projects.filter((item) => item.clientId === clientId && item.status !== 'Cancelado')
+  const contracted = totalsByCurrency(related, (item) => item.amount, (item) => item.currency)
+  const received = totalsByCurrency(related, (item) => item.amountReceived, (item) => item.currency)
+  return { contracted, received }
 }

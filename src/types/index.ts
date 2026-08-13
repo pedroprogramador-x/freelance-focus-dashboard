@@ -1,6 +1,7 @@
 export type TaskStatus = 'Pendente' | 'Em andamento' | 'Concluído' | 'Adiado'
 export type Priority = 'Alta' | 'Média' | 'Baixa'
 export type Theme = 'light' | 'dark' | 'system'
+export type Currency = 'BRL' | 'USD'
 
 export interface RoadmapTask {
   id: string
@@ -18,44 +19,79 @@ export interface RoadmapTask {
   completedAt: string | null
 }
 
-export type ProposalStatus = 'Salva' | 'Enviada' | 'Visualizada' | 'Entrevista' | 'Contratado' | 'Recusada' | 'Ignorada'
-export type Platform = 'Upwork' | '99Freelas' | 'LinkedIn' | 'Indicação' | 'Outra'
+export type ClientStatus = 'Lead' | 'Em negociação' | 'Cliente ativo' | 'Cliente inativo'
+export type ClientSource = 'Indicação' | 'WhatsApp' | 'Instagram' | 'Upwork' | '99Freelas' | 'LinkedIn' | 'Contato direto' | 'Outro'
+
+export interface Client {
+  id: string
+  name: string
+  companyName: string
+  contactName: string
+  phone: string
+  email: string
+  source: ClientSource
+  referredBy: string
+  status: ClientStatus
+  notes: string
+  createdAt: string
+  updatedAt: string
+}
+
+export type ProposalStatus = 'Rascunho' | 'Enviada' | 'Aguardando resposta' | 'Aceita' | 'Recusada' | 'Expirada'
+
+export interface ProposalPlatformData {
+  url?: string
+  connects?: number
+  platformFeePercent?: number
+}
 
 export interface Proposal {
   id: string
-  date: string
-  platform: Platform
-  projectName: string
-  clientName: string
-  serviceType: string
-  budgetUsd: number
-  connects: number
-  url: string
+  clientId: string
+  serviceId: string | null
+  title: string
+  description: string
+  amount: number
+  currency: Currency
+  source: ClientSource
   status: ProposalStatus
-  deadline: string
+  createdAt: string
+  sentAt: string | null
+  validUntil: string | null
+  followUpDate: string | null
   estimatedHours: number
-  estimatedHourlyRate: number
-  nextStep: string
   notes: string
-  followUpDate: string
+  platformData?: ProposalPlatformData
 }
 
-export type ContractStatus = 'Em negociação' | 'Em andamento' | 'Entregue' | 'Pausado' | 'Cancelado'
-export interface Contract {
+export type ProjectStatus = 'Planejamento' | 'Em desenvolvimento' | 'Aguardando cliente' | 'Em revisão' | 'Entregue' | 'Pausado' | 'Cancelado'
+export type PaymentStatus = 'Pendente' | 'Parcial' | 'Pago'
+
+export interface Project {
   id: string
-  project: string
-  client: string
-  platform: Platform
-  service: string
-  startDate: string
-  deadline: string
-  grossUsd: number
-  platformFeePercent: number
-  exchangeRate: number
-  hoursWorked: number
-  status: ContractStatus
-  rating: number | null
+  clientId: string
+  proposalId: string | null
+  name: string
+  description: string
+  status: ProjectStatus
+  startDate: string | null
+  deadline: string | null
+  completedAt: string | null
+  amount: number
+  currency: Currency
+  /** Taxa percentual informada pela plataforma; não altera o valor contratado. */
+  platformFeePercent?: number | null
+  /** Cotação histórica BRL por USD, quando registrada; não implica conversão automática. */
+  exchangeRateToBrl?: number | null
+  estimatedHours: number
+  workedHours: number
+  repositoryUrl: string
+  productionUrl: string
+  paymentStatus: PaymentStatus
+  amountReceived: number
   notes: string
+  createdAt: string
+  updatedAt: string
 }
 
 export type ServiceStatus = 'Rascunho' | 'Pronto' | 'Publicado' | 'Vendido'
@@ -75,7 +111,7 @@ export interface Settings {
   roadmapStartDate: string
   weeklyGoalUsd: number
   weeklyHours: number
-  primaryCurrency: 'USD' | 'BRL'
+  primaryCurrency: Currency
   defaultExchangeRate: number
   theme: Theme
   notificationsEnabled: boolean
@@ -83,11 +119,12 @@ export interface Settings {
 }
 
 export interface AppData {
-  schemaVersion: 1
-  tasks: RoadmapTask[]
+  schemaVersion: 2
+  clients: Client[]
   proposals: Proposal[]
-  contracts: Contract[]
+  projects: Project[]
   services: FreelanceService[]
+  tasks: RoadmapTask[]
   settings: Settings
   savedAt: string
 }

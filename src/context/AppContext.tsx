@@ -1,10 +1,11 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { recalculateRoadmapDates } from '../data/roadmap'
 import { createDefaultData } from '../data/defaults'
+import { deletionBlockReason, hasValidEntityReferences, type DomainEntity, type EntityCollection } from '../data/domain'
 import { loadData, saveData } from '../services/storage'
-import type { AppData, Contract, FreelanceService, Proposal, RoadmapTask, Settings } from '../types'
+import type { AppData, Client, FreelanceService, Project, Proposal, RoadmapTask, Settings } from '../types'
 
-type Entity = Proposal | Contract | FreelanceService
+type Entity = Client | Proposal | Project | FreelanceService
 interface Toast { id: number; message: string; tone: 'success' | 'error' | 'info' }
 interface AppContextValue {
   data: AppData
@@ -13,8 +14,8 @@ interface AppContextValue {
   lastSavedAt: string
   updateTask: (id: string, changes: Partial<RoadmapTask>) => void
   toggleTask: (id: string) => void
-  upsert: (collection: 'proposals' | 'contracts' | 'services', value: Entity) => void
-  remove: (collection: 'proposals' | 'contracts' | 'services', id: string) => void
+  upsert: (collection: EntityCollection, value: Entity) => void
+  remove: (collection: EntityCollection, id: string) => void
   updateSettings: (settings: Settings) => void
   replaceData: (data: AppData) => void
   resetAll: () => void
@@ -56,16 +57,17 @@ export function AppProvider({ children }: { children: ReactNode }) {
     } : task) }))
   }, [])
 
-  const upsert = useCallback((collection: 'proposals' | 'contracts' | 'services', value: Entity) => {
+  const upsert = useCallback((collection: EntityCollection, value: Entity) => {
     setData((current) => {
+      if (!hasValidEntityReferences(current, collection, value as DomainEntity)) return current
       const list = current[collection] as Entity[]
       const next = list.some((item) => item.id === value.id) ? list.map((item) => item.id === value.id ? value : item) : [value, ...list]
       return { ...current, [collection]: next }
     })
   }, [])
 
-  const remove = useCallback((collection: 'proposals' | 'contracts' | 'services', id: string) => {
-    setData((current) => ({ ...current, [collection]: current[collection].filter((item) => item.id !== id) }))
+  const remove = useCallback((collection: EntityCollection, id: string) => {
+    setData((current) => deletionBlockReason(current, collection, id) ? current : { ...current, [collection]: (current[collection] as Entity[]).filter((item) => item.id !== id) })
   }, [])
 
   const updateSettings = useCallback((settings: Settings) => {
@@ -86,7 +88,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>
 }
 
-// Contexto e hook ficam juntos para manter a API de estado em um único módulo.
+// Contexto e hook ficam juntos para manter a API pública de estado em um único módulo.
 // eslint-disable-next-line react-refresh/only-export-components
 export function useApp() {
   const context = useContext(AppContext)

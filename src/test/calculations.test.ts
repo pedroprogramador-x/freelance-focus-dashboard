@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { createRoadmap } from '../data/roadmap'
-import type { Contract } from '../types'
-import { contractMetrics, isTaskOverdue, netBrl, netHourly, netUsd, taskMetrics } from '../utils/calculations'
+import type { Client, Project, Proposal } from '../types'
+import { clientFinancials, clientMetrics, isTaskOverdue, projectMetrics, proposalMetrics, taskMetrics } from '../utils/calculations'
 
-describe('cálculos do painel', () => {
+const client: Client = { id: 'client-1', name: 'Acme', companyName: '', contactName: '', phone: '', email: '', source: 'Contato direto', referredBy: '', status: 'Cliente ativo', notes: '', createdAt: '2026-01-01', updatedAt: '2026-01-01' }
+const proposal: Proposal = { id: 'proposal-1', clientId: client.id, serviceId: null, title: 'API', description: '', amount: 1000, currency: 'USD', source: 'Upwork', status: 'Aceita', createdAt: '2026-01-01', sentAt: '2026-01-01', validUntil: null, followUpDate: null, estimatedHours: 20, notes: '', platformData: { connects: 8 } }
+const project: Project = { id: 'project-1', clientId: client.id, proposalId: proposal.id, name: 'API', description: '', status: 'Em desenvolvimento', startDate: '2026-01-01', deadline: null, completedAt: null, amount: 1000, currency: 'USD', estimatedHours: 20, workedHours: 5, repositoryUrl: '', productionUrl: '', paymentStatus: 'Parcial', amountReceived: 400, notes: '', createdAt: '2026-01-01', updatedAt: '2026-01-01' }
+
+describe('cálculos do painel V2', () => {
   it('calcula progresso e tarefas restantes', () => {
     const tasks = createRoadmap('2026-01-01').map((task, index) => index < 9 ? { ...task, status: 'Concluído' as const } : task)
     expect(taskMetrics(tasks, new Date('2025-12-01'))).toMatchObject({ completed: 9, remaining: 81, progress: 10 })
@@ -16,11 +20,17 @@ describe('cálculos do painel', () => {
     expect(isTaskOverdue({ ...task, status: 'Adiado' }, new Date('2026-01-03'))).toBe(false)
   })
 
-  it('calcula valor líquido, conversão e valor por hora', () => {
-    const contract: Contract = { id: '1', project: 'API', client: 'Acme', platform: 'Upwork', service: 'FastAPI', startDate: '2026-01-01', deadline: '', grossUsd: 1000, platformFeePercent: 10, exchangeRate: 5.5, hoursWorked: 20, status: 'Entregue', rating: 5, notes: '' }
-    expect(netUsd(contract)).toBe(900)
-    expect(netBrl(contract)).toBe(4950)
-    expect(netHourly(contract)).toBe(45)
-    expect(contractMetrics([contract])).toMatchObject({ revenueUsd: 900, averageProject: 900, averageHourly: 45, clients: 1 })
+  it('calcula propostas abertas, aceitas e connects opcionais', () => {
+    expect(proposalMetrics([proposal, { ...proposal, id: 'proposal-2', status: 'Aguardando resposta', platformData: undefined }])).toMatchObject({ sent: 2, open: 1, accepted: 1, connects: 8 })
+  })
+
+  it('calcula projetos e separa totais por moeda', () => {
+    const brlProject = { ...project, id: 'project-2', proposalId: null, amount: 500, amountReceived: 500, currency: 'BRL' as const, paymentStatus: 'Pago' as const }
+    expect(projectMetrics([project, brlProject])).toMatchObject({ active: 2, contracted: { USD: 1000, BRL: 500 }, received: { USD: 400, BRL: 500 }, pending: { USD: 600, BRL: 0 }, hours: 10 })
+  })
+
+  it('calcula indicadores e relacionamentos do cliente', () => {
+    expect(clientMetrics([client, { ...client, id: 'client-2', status: 'Lead' }])).toEqual({ active: 1, leads: 1 })
+    expect(clientFinancials(client.id, [project])).toEqual({ contracted: { BRL: 0, USD: 1000 }, received: { BRL: 0, USD: 400 } })
   })
 })
