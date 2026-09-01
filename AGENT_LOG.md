@@ -83,6 +83,59 @@ está em `docs/` (arquitetura congelada) e no histórico Git.
 
 ---
 
+## 2026-09-01 — Claude Sonnet 5 (effort medium) — Configuração do CodeGraph (MCP + índice)
+
+Ferramenta de ambiente Claude Code, não do projeto. Binário já instalado
+pelo Pedro fora da sessão (`install.ps1` oficial, `@colbymchenry/codegraph`
+v1.6.0, em `%LOCALAPPDATA%\codegraph\current\`). Esta sessão só configurou
+e validou.
+
+- Arquivos alterados:
+  - `.gitignore` — adicionada linha `.codegraph/` (único arquivo do projeto
+    tocado; `src/`, `api/`, `docs/` intactos). O `.codegraph/` já traz um
+    `.gitignore` próprio auto-ignorante, mas a regra na raiz também suprime
+    o `.codegraph/.gitignore` do `git status`.
+  - `~/.claude.json` — registrado MCP server `codegraph` (stdio,
+    `command: "codegraph"`, `args: ["serve","--mcp"]`). Ambiente, fora do repo.
+  - `~/.claude/settings.json` — `codegraph install` adicionou um hook
+    `UserPromptSubmit` → `codegraph.cmd prompt-hook`. Não pedi esse hook
+    explicitamente; veio junto do `install`. `--no-permissions` evitou a
+    lista de auto-allow. Ambiente, fora do repo.
+  - `~/.claude/CLAUDE.md` — `codegraph install` anexou um bloco
+    `<!-- CODEGRAPH_START/END -->` (~800 B) instruindo o agente a preferir
+    `codegraph_explore`/`codegraph explore` a grep em repos indexados.
+    Ambiente global, fora do repo.
+  - PATH de usuário (Windows) — `install --yes` adicionou
+    `%LOCALAPPDATA%\codegraph\current\bin`.
+  - `.codegraph/` (novo, ignorado) — índice local: 75 arquivos, 1.030 nós,
+    2.987 arestas, DB SQLite 3,58 MB. Só este projeto.
+
+- Decisões tomadas:
+  - `codegraph init` rodado só na raiz deste repo. `codegraph status`
+    confirma projeto único. Nenhum índice global.
+  - Telemetria DESATIVADA: `codegraph telemetry off`
+    (`~/.codegraph/telemetry.json` → `enabled:false`, `consent_source:cli`);
+    fila local não enviada foi apagada.
+  - MCP registrado só para o alvo `claude` (não cursor/codex/etc.).
+    `--location global`, `--no-permissions`.
+  - RTK e CodeBurn NÃO instalados nesta sessão (ver conversa: RTK sem
+    suporte oficial a Git Bash/Windows nativo; CodeBurn pendente).
+
+- Pendências:
+  - `claude mcp list` nesta sessão: `codegraph` conecta OK quando o bin
+    está no PATH; falha (`CONNECTION_CLOSED`) numa sessão que começou antes
+    da atualização do PATH. **Reiniciar o Claude Code** para o MCP subir
+    limpo.
+  - Teste comparativo real com as tools MCP (`codegraph_explore`) e os
+    números de token do CodeBurn: exige sessão nova. Nesta sessão a
+    comparação foi feita via CLI (`codegraph context`): 1 chamada vs
+    ~9 (find + leituras) da abordagem grep/Read.
+  - Avaliar se o hook `UserPromptSubmit` e o bloco no `~/.claude/CLAUDE.md`
+    devem ficar ou ser removidos (`codegraph uninstall` reverte).
+  - `.gitignore` alterado sem commit — aguardando Pedro.
+
+---
+
 ## 2026-09-01 — Claude Sonnet 5 — Convenção de branch por fase + merge da E2 em main
 
 - Arquivos alterados: `.gitignore` (+`.idea/`), `AGENT_LOG.md`, `CLAUDE.md`

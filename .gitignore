@@ -28,3 +28,6 @@ api/*.egg-info/
 
 # IDE local
 .idea/
+
+# CodeGraph — índice local por máquina (ferramenta de ambiente, não do projeto)
+.codegraph/

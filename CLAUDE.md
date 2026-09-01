@@ -65,3 +65,22 @@ PY="/c/Users/pedro/AppData/Local/FreelanceFocus/venvs/api/Scripts/python.exe"
 
 - Conventional Commits, minúsculas, sem escopo: `feat:`, `fix:`, `docs:`.
 - Não commite/pushe sem autorização explícita do Pedro.
+
+## CodeGraph
+
+Este repo é indexado pelo CodeGraph (existe `.codegraph/` na raiz — índice
+local, ignorado pelo git). Quando precisar entender ou localizar código,
+use o CodeGraph ANTES de grep/find ou de abrir arquivos:
+
+- **Tool MCP** (quando disponível): `codegraph_explore` responde a maioria
+  das perguntas de código numa chamada — source verbatim dos símbolos
+  relevantes + os call paths entre eles, incluindo saltos de dispatch
+  dinâmico que o grep não segue. Cite um arquivo ou símbolo na query para
+  ler o source atual com números de linha. Se a tool estiver listada mas
+  deferida, carregue-a pelo nome via tool search.
+- **Shell** (sempre funciona): `codegraph explore "<símbolos ou pergunta>"`
+  imprime a mesma saída. Também: `codegraph context`, `codegraph query`.
+
+Configuração de ambiente (fora do repo): MCP server em `~/.claude.json` e
+hook `UserPromptSubmit` em `~/.claude/settings.json`. Ver entrada de
+2026-09-01 no `AGENT_LOG.md`.
