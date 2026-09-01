@@ -1,0 +1,81 @@
+[project]
+name = "freelance-focus-api"
+version = "0.1.0"
+description = "AI Dev Workspace backend — E2 foundation (FastAPI + SQLite + Safety Kernel + Path Runtime)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<0.116",
+    "uvicorn>=0.32,<0.35",
+    "sqlalchemy>=2.0.36,<2.1",
+    "alembic>=1.14,<1.15",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9",
+    "httpx>=0.27,<0.29",
+    "ruff>=0.8,<0.10",
+    "mypy>=1.13,<2",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+# ---------------------------------------------------------------- ruff
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["."]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "B",        # bugbear
+    "UP",       # pyupgrade
+    "S",        # bandit — security
+    "C4",       # comprehensions
+    "SIM",      # simplify
+    "TID",      # tidy imports
+    "RUF",
+]
+ignore = [
+    "S101",    # assert — usado nos testes e em invariantes internas
+    "RUF002",  # travessão e aspas tipográficas: a prosa deste projeto é em português
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106", "S108"]
+"migrations/*" = ["I001"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+# ---------------------------------------------------------------- mypy
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+files = ["app", "tests"]
+exclude = "^migrations/"
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+# ---------------------------------------------------------------- pytest
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+filterwarnings = ["error"]

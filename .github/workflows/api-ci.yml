@@ -1,0 +1,88 @@
+name: API CI
+
+# Workflow separado do frontend por decisão de ADR-0001: uma falha na API nunca pode
+# bloquear o deploy do web. `deploy.yml` não é tocado.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "api/**"
+      - ".github/workflows/api-ci.yml"
+  pull_request:
+    paths:
+      - "api/**"
+      - ".github/workflows/api-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: api-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: api
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: api/pyproject.toml
+
+      - name: Install
+        run: python -m pip install --disable-pip-version-check -e ".[dev]"
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Format
+        run: python -m ruff format --check .
+
+      - name: Typecheck
+        run: python -m mypy
+
+      - name: Tests
+        run: python -m pytest
+
+      # Gate explícito da E2: banco vazio → migration → schema esperado.
+      # Roda fora do pytest para provar que `alembic upgrade head` funciona sozinho, com
+      # a URL vindo da configuração — como em produção.
+      - name: Migration em banco vazio
+        env:
+          FF_DATABASE_URL: sqlite+pysqlite:///${{ runner.temp }}/ci-migration.db
+        run: |
+          python -m alembic upgrade head
+          python -m alembic current
+          python - <<'PY'
+          import os
+          import sqlalchemy as sa
+
+          engine = sa.create_engine(os.environ["FF_DATABASE_URL"])
+          tables = set(sa.inspect(engine).get_table_names()) - {"alembic_version"}
+          expected = {
+              "dev_workspace",
+              "context_registry_entry",
+              "workspace_task",
+              "context_manifest",
+              "run",
+              "audit_finding",
+              "safety_event",
+          }
+          assert tables == expected, f"schema inesperado: {sorted(tables)}"
+          print("schema ok:", len(tables), "tabelas")
+          PY
+
+      - name: Migration reverte limpo
+        env:
+          FF_DATABASE_URL: sqlite+pysqlite:///${{ runner.temp }}/ci-migration.db
+        run: python -m alembic downgrade base
