@@ -25,3 +25,6 @@ api/*.egg-info/
 *.sqlite3
 *.db-wal
 *.db-shm
+
+# IDE local
+.idea/
