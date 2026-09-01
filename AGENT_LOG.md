@@ -82,3 +82,20 @@ está em `docs/` (arquitetura congelada) e no histórico Git.
   commit/push — aguardando revisão do diff pelo Pedro.
 
 ---
+
+## 2026-09-01 — Claude Sonnet 5 — Convenção de branch por fase + merge da E2 em main
+
+- Arquivos alterados: `.gitignore` (+`.idea/`), `AGENT_LOG.md`, `CLAUDE.md`
+  commitados em `9d9cc1b` (autoria: Pedro). Identidade global do Git
+  corrigida para `Pedro Henrique Bezerra de Lima <pedrophbezerra@gmail.com>`.
+- Decisões tomadas — **convenção de branch por fase**:
+  - Cada fase (E2, E3, E4…) é desenvolvida em branch própria e mesclada em
+    `main` via **fast-forward** assim que fechar auditoria GREEN.
+  - A próxima fase sempre abre branch nova a partir de `main` atualizado.
+  - `main` remoto agora em `9d9cc1b` (E2 completa + CLAUDE.md/AGENT_LOG.md).
+  - Branch `claude/ai-dev-e2-backend-safety-foundation` mantida por ora
+    (não deletar até o Pedro confirmar).
+- Pendências: E3 (Workspace Registry) não iniciada. Nova branch a partir de
+  `main@9d9cc1b` quando começar.
+
+---
