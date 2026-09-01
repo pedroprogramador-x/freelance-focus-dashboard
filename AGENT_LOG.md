@@ -136,6 +136,33 @@ e validou.
 
 ---
 
+## 2026-09-01 — Claude Sonnet 5 (effort medium) — Validação prática da integração CodeGraph
+
+Tarefa só de validação: nada de código alterado, nada instalado.
+
+- Arquivos alterados: só este `AGENT_LOG.md` (esta entrada).
+- Verificações:
+  - MCP server `codegraph` **connected**. Expõe **uma** tool:
+    `mcp__codegraph__codegraph_explore` (o `codegraph_context` do prompt-hook
+    é injeção de contexto via `UserPromptSubmit`, não tool MCP). A tool estava
+    *deferred*; carregada via tool search e usada.
+  - Teste 1 (SafetyPolicy × PathRuntime): 1ª ferramenta = `codegraph_explore`.
+    Uma chamada devolveu policy.py + paths.py + path_runtime.py + types.py com
+    blast radius. Sem grep/Read.
+  - Teste 2 (validação de `source_ref` / glob): 1ª ferramenta =
+    `codegraph_explore`. Uma chamada devolveu `source_refs.py` inteiro +
+    `prevalidate_path_syntax`; reaproveitou paths.py já trazido no teste 1.
+    Sem grep/Read.
+  - Nenhum caso de "disponível mas não usado". Integração funcionando na prática.
+  - **Não existe** `codegraph gain` nem comando de economia de tokens no
+    CodeGraph 1.6.0 (subcomandos: init/index/sync/status/query/explore/context/
+    node/files/daemon/callers/callees/impact/affected/install/telemetry/upgrade).
+    `codegraph status`: 75 arquivos, 1.030 nós, 2.987 arestas, DB 3,58 MB,
+    índice up to date. Métrica de economia é do CodeBurn, não instalado.
+- Pendências: instalar CodeBurn fica para tarefa separada (não feito aqui).
+
+---
+
 ## 2026-09-01 — Claude Sonnet 5 — Convenção de branch por fase + merge da E2 em main
 
 - Arquivos alterados: `.gitignore` (+`.idea/`), `AGENT_LOG.md`, `CLAUDE.md`
