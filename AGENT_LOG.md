@@ -179,3 +179,37 @@ Tarefa só de validação: nada de código alterado, nada instalado.
   `main@9d9cc1b` quando começar.
 
 ---
+
+## 2026-09-03 — Claude Sonnet 5 (effort medium) — Notas de roadmap: projeto do zero, checkpoint pós-E9, decisões adiadas
+
+Tarefa SOMENTE DOCUMENTAÇÃO. E3 não iniciada; nenhum código funcional escrito.
+
+- Arquivos alterados: `docs/architecture/07-roadmap-v1.md`, `AGENT_LOG.md`.
+  Nenhum outro arquivo tocado. `docs/` alterado com autorização explícita do
+  Pedro nesta conversa (escopo restrito a este arquivo de roadmap).
+- Decisões tomadas (todas notas explicativas — nenhum Entregável, Gate, ADR
+  ou invariante de dados alterado):
+  - Nova seção "Projeto criado do zero — fluxo até um `HEAD` válido" após a
+    tabela de Etapas: workspace pode ser registrado sem Git (só contexto,
+    execução bloqueada, conforme `04-safety-and-git-runtime.md` §8); para
+    estágios que exigem `git_head`/`planning_base_commit`/`HEAD`, o usuário
+    roda `git init` + commit inicial **manualmente, fora do backend**.
+  - **Correção registrada explicitamente:** o backend **nunca** executa
+    `git init`, automaticamente nem em nome de um agente. Alinha com a
+    decisão adiada já existente "Workspace sem git executar tarefas".
+  - Criação da estrutura inicial de arquivos NÃO faz parte do passo manual —
+    vira a primeira tarefa normal do Developer mediado quando E7/E8 existirem.
+  - Novo checkpoint de leitura "Núcleo seguro pronto" após E9 (não é gate
+    novo): ciclo planejar→implementar mediado→testar→auditar fechado; ressalva
+    de que UI sem SSE até E11 e correção manual até E10; marco de segurança
+    técnica, distinto de um futuro "Freelance Ready" (não decidido agora).
+  - Duas linhas novas em "Decisões adiadas": scaffold assistido de projeto
+    novo (via Developer mediado a partir de E8, reusa `WriteFile`/`ApplyPatch`,
+    sem capacidade nova, sem `git init` automatizado) e camada educacional
+    opcional (endpoint de explicação em linguagem simples a partir de E9,
+    reusa plan+diff+findings, sem nova entidade de banco, não bloqueia o
+    fluxo principal, formato exato indefinido).
+- Pendências: aguardando revisão do diff pelo Pedro antes de commitar. Nada
+  commitado ou pushado.
+
+---

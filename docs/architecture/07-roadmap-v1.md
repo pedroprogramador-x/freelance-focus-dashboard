@@ -70,6 +70,43 @@ IO real e E3/E4 já dependem disso.
 
 ---
 
+## Projeto criado do zero — fluxo até um `HEAD` válido
+
+Nota explicativa; não altera nenhum Entregável ou Gate. Descreve como um
+`DevWorkspace` sem repositório Git avança pelo roadmap.
+
+- Um `DevWorkspace` novo pode ser **registrado** mesmo sem ser um repositório
+  Git, preservando o comportamento já definido em
+  [`04-safety-and-git-runtime.md`](04-safety-and-git-runtime.md) §8: nesse
+  estado ele serve para **contexto**, mas **execução permanece bloqueada**.
+- Para avançar até qualquer estágio que exija `git_head`,
+  `planning_base_commit` ou um `HEAD` válido, o usuário prepara o repositório
+  **manualmente, fora do backend**: `git init` e um commit inicial.
+- O backend **nunca** executa `git init`, automaticamente ou em nome de um
+  agente.
+- Com um `HEAD` válido, o workspace segue normalmente pelo Context Registry
+  (E4), Context Router (E5) e planejamento/aprovação (E6), respeitando os
+  invariantes já existentes.
+- A **criação da estrutura inicial de arquivos** do software não faz parte
+  desse passo manual. Quando E7/E8 existirem, ela pode ser feita como a
+  primeira tarefa normal do Developer mediado.
+
+---
+
+## Checkpoint após E9 — "Núcleo seguro pronto"
+
+Marco de leitura, não um novo gate. Alcançado quando **E9** fecha.
+
+- **Critérios:** ciclo completo planejar → implementar mediado (sem shell) →
+  testar → auditar, **fechado e funcional**.
+- **Ressalva explícita:** a UI ainda **não tem SSE** (só chega em E11); a
+  correção de findings ainda é **manual** (`max_fix_rounds` só ativa em E10).
+- **Nota:** este é o marco de **segurança técnica**, não de conforto de uso.
+  Distinguir de uma futura avaliação separada de "Freelance Ready" mais
+  ampla — critério não decidido agora.
+
+---
+
 ## Riscos residuais
 
 | # | Risco | Nível | Situação |
@@ -111,6 +148,8 @@ IO real e E3/E4 já dependem disso.
 | **Workspace sem git executar tarefas** | Não previsto: sem git não há isolamento |
 | **Agentes além dos cinco previstos** | Só com tarefa concreta que os cinco não concluam |
 | **Watcher de filesystem para staleness** | Depois de E14, e provavelmente nunca em pasta do OneDrive |
+| **Scaffold assistido de projeto novo** (criar estrutura inicial de arquivos) | Disponível como a primeira tarefa comum via Developer mediado, a partir de E8 — reutiliza `WriteFile`/`ApplyPatch` já previstos; sem capacidade nova, sem `git init` automatizado |
+| **Camada educacional opcional** (endpoint de explicação em linguagem simples) | A partir de E9, reaproveitando `plan`+`diff`+`findings` já existentes; formato exato não decidido agora; sem nova entidade de banco e sem bloquear o fluxo principal |
 
 ---
 
