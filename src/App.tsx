@@ -4,13 +4,14 @@ import { UnsavedChangesModal } from './components/Modal'
 import { useApp } from './context/AppContext'
 import { ClientsPage } from './pages/ClientsPage'
 import { DashboardPage } from './pages/DashboardPage'
+import { DevWorkspaces } from './pages/DevWorkspaces'
 import { ProjectsPage } from './pages/ProjectsPage'
 import { ProposalsPage } from './pages/ProposalsPage'
 import { RoadmapPage } from './pages/RoadmapPage'
 import { ServicesPage } from './pages/ServicesPage'
 import { SettingsPage } from './pages/SettingsPage'
 
-const validPages: PageId[] = ['dashboard', 'roadmap', 'clients', 'proposals', 'projects', 'services', 'settings']
+const validPages: PageId[] = ['dashboard', 'roadmap', 'clients', 'proposals', 'projects', 'services', 'workspaces', 'settings']
 const getHashPage = (): PageId => { const value = window.location.hash.slice(1) as PageId; return validPages.includes(value) ? value : 'dashboard' }
 
 export function App() {
@@ -38,6 +39,6 @@ export function App() {
   const createProjectFromProposal = useCallback((proposalId: string) => { setProposalForProjectId(proposalId); navigate('projects') }, [navigate])
   const clearProposalForProject = useCallback(() => setProposalForProjectId(null), [])
   if (!ready) return <div className="loading-screen"><div className="loading-brand"><span>F</span><strong>Freelance Focus</strong></div><div className="skeleton wide" /><div className="skeleton-grid"><div className="skeleton" /><div className="skeleton" /><div className="skeleton" /></div><p>Preparando seu plano...</p></div>
-  const content = page === 'dashboard' ? <DashboardPage navigate={navigate} /> : page === 'roadmap' ? <RoadmapPage /> : page === 'clients' ? <ClientsPage /> : page === 'proposals' ? <ProposalsPage navigate={navigate} onCreateProject={createProjectFromProposal} /> : page === 'projects' ? <ProjectsPage navigate={navigate} proposalForProjectId={proposalForProjectId} onProposalHandled={clearProposalForProject} onPlanningDirtyChange={setPlanningDirty} /> : page === 'services' ? <ServicesPage /> : <SettingsPage />
+  const content = page === 'dashboard' ? <DashboardPage navigate={navigate} /> : page === 'roadmap' ? <RoadmapPage /> : page === 'clients' ? <ClientsPage /> : page === 'proposals' ? <ProposalsPage navigate={navigate} onCreateProject={createProjectFromProposal} /> : page === 'projects' ? <ProjectsPage navigate={navigate} proposalForProjectId={proposalForProjectId} onProposalHandled={clearProposalForProject} onPlanningDirtyChange={setPlanningDirty} /> : page === 'services' ? <ServicesPage /> : page === 'workspaces' ? <DevWorkspaces /> : <SettingsPage />
   return <><Layout page={page} setPage={navigate}>{content}</Layout>{pendingPage && <UnsavedChangesModal onStay={() => setPendingPage(null)} onDiscard={() => { const next = pendingPage; setPendingPage(null); setPlanningDirty(false); commitNavigation(next) }} />}</>
 }

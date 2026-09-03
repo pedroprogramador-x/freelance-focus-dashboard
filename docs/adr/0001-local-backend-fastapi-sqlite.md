@@ -86,3 +86,33 @@ npm para `orchestrator`, `context-engine` e `agent-runtime`.
 
 [01 — Arquitetura V1](../architecture/01-v1-architecture.md) §4 ·
 [06 — Fronteiras de API e UI](../architecture/06-api-and-ui-boundaries.md) §1
+
+## Addendum — auditoria da E3 (2026-09-03)
+
+Este addendum **não altera o item 7 original** nem qualquer outra decisão acima. Ele
+registra um ajuste de **entrega**, não de decisão.
+
+- Durante a **auditoria independente da E3** (Codex), foi confirmado que a parte do
+  **item 7** referente ao **launcher local e ao canal privado em memória do Vite dev**
+  (o `transformIndexHtml` que injeta a `<meta>` do token no `npm run dev`) **não foi
+  efetivamente entregue pela E2**, apesar de o roadmap, naquele momento, tê-la descrito
+  como entregue.
+- A **auditoria original da E2 não detectou essa ausência**. Ela foi identificada
+  **posteriormente**, na auditoria da E3 (finding E3-AUD3-002). O que a E2 de fato
+  entregou e auditou foi a injeção do `LocalSessionToken` **pela FastAPI no build
+  compilado** servido em modo local.
+- A implementação dessa parte específica foi **formalmente diferida para a E11**. O
+  Entregável/Gate da E11 no [roadmap](../architecture/07-roadmap-v1.md) passou a listar
+  explicitamente os 6 itens correspondentes (launcher; canal privado em memória;
+  `transformIndexHtml` no modo dev; garantias de não vazamento do token em bundle/`.env`/
+  log; validações de loopback/`Host`/CORS do Vite dev, reaproveitando o guarda de
+  `Origin`/`Host` construído na E3; e um gate automatizado que prova o fluxo Vite dev
+  real ponta a ponta).
+- A **decisão arquitetural do item 7 permanece válida e não está sendo revertida** —
+  "servir ou transformar o HTML é parte do mecanismo de autenticação local" continua
+  valendo. Apenas a **entrega** dessa parte está sendo **reagendada** da E2 para a E11.
+- Até a E11, o fluxo de desenvolvimento local **suportado** é `vite build` com
+  `VITE_APP_MODE=local_dev_workspace` servido pela FastAPI — coberto pelo teste
+  `api/tests/test_web_spa_integration.py` e pelo workflow dedicado
+  `.github/workflows/cross-stack-ci.yml` (E3-AUD3-001), independentes de `api-ci.yml` e
+  `deploy.yml` (item 5).

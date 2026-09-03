@@ -45,6 +45,23 @@ _MAX_PORT = 65535
 
 _BEARER_PREFIX = "bearer "
 
+#: Métodos que alteram estado. [01](../../../docs/architecture/01-v1-architecture.md) §4:
+#: "requisições que alteram estado exigem mesma origem".
+MUTATING_METHODS: frozenset[str] = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+#: `Origin` de escrita: só `http`/`https`, e a comparação é contra a **autoridade do
+#: `Host`** — não "qualquer porta loopback". `[0-9]` (não `\d`) para porta, casamento total.
+_ORIGIN_PATTERN = re.compile(r"(https?)://([a-z0-9.\-]+|\[[0-9a-f:]+\])(?::([0-9]{1,5}))?")
+
+#: Autoridade de um header `Host`: `host[:porta]`, sem esquema.
+_HOST_AUTHORITY_PATTERN = re.compile(r"([a-z0-9.\-]+|\[[0-9a-f:]+\])(?::([0-9]{1,5}))?")
+
+_DEFAULT_PORT_BY_SCHEME: dict[str, int] = {"http": 80, "https": 443}
+
+#: `Sec-Fetch-Site` aceitos para uma escrita via browser: só mesma origem. `same-site`
+#: (outra porta/subdomínio) e qualquer valor desconhecido são recusados (E3-AUD2-004).
+_ACCEPTED_SEC_FETCH_SITE: frozenset[str] = frozenset({"same-origin", "none"})
+
 
 def generate_session_token() -> str:
     """Token efêmero de sessão local.
@@ -116,3 +133,85 @@ def host_is_local(host_header: str | None) -> bool:
 
     # `[0-9]{1,5}` já garante só dígitos ASCII; falta o intervalo.
     return _MIN_PORT <= int(port) <= _MAX_PORT
+
+
+def _authority(host: str, port_group: str | None, scheme: str) -> tuple[str, int] | None:
+    """`(host, porta)` normalizado; porta ausente vira a default do esquema. `None` se inválida."""
+    if port_group is None:
+        default = _DEFAULT_PORT_BY_SCHEME.get(scheme)
+        return None if default is None else (host, default)
+    port = int(port_group)
+    if not (_MIN_PORT <= port <= _MAX_PORT):
+        return None
+    return host, port
+
+
+def origin_matches_host(
+    origin_header: str | None, host_header: str | None, *, request_scheme: str = "http"
+) -> bool:
+    """`True` se o `Origin` é **exatamente a origem servida**: esquema + host + porta do `Host`.
+
+    - `Origin` ausente/vazio → `True`: clientes não-browser (a suíte, `curl`, o futuro
+      *launcher*) não mandam `Origin`, e a barreira real é o `LocalSessionToken`.
+    - `Origin` presente → tem de casar **esquema, host e porta** com a autoridade do
+      `Host` efetivo da requisição. Ser loopback não basta (E3-AUD2-004):
+      `http://localhost:5173` contra um `Host` `127.0.0.1:8756` é **negado** — porta
+      diferente, e `localhost` ≠ `127.0.0.1` são origens distintas para o browser.
+    - Proxy do Vite dev: `changeOrigin: false` preserva o `Host` do dev server
+      (`localhost:5173`), que é o mesmo do `Origin` → casa.
+    """
+    if not origin_header or not origin_header.strip():
+        return True
+    if not host_header:
+        return False
+
+    origin_match = _ORIGIN_PATTERN.fullmatch(origin_header.strip().lower())
+    if origin_match is None:
+        return False
+    origin_scheme, origin_host, origin_port = origin_match.groups()
+    if origin_scheme != request_scheme.lower():
+        return False
+
+    host_match = _HOST_AUTHORITY_PATTERN.fullmatch(host_header.strip().lower())
+    if host_match is None:
+        return False
+    host_name, host_port = host_match.groups()
+
+    origin_authority = _authority(origin_host, origin_port, origin_scheme)
+    host_authority = _authority(host_name, host_port, request_scheme.lower())
+    return origin_authority is not None and origin_authority == host_authority
+
+
+def sec_fetch_site_allows_write(value: str | None) -> bool:
+    """`Sec-Fetch-Site` numa requisição mutante: só valores conhecidos e de mesma origem.
+
+    - Ausente → aceito (cliente não-browser, ou browser sem *Fetch Metadata*).
+    - `same-origin` / `none` → aceito.
+    - `same-site`, `cross-site` e **qualquer valor desconhecido** (incluindo string vazia)
+      → recusado (E3-AUD2-004). Uma escrita via browser legítima nesta app é sempre
+      `same-origin` — a página é servida pela mesma origem da API, inclusive atrás do
+      proxy do Vite dev.
+    """
+    if value is None:
+        return True
+    return value.strip().lower() in _ACCEPTED_SEC_FETCH_SITE
+
+
+def same_origin_write_allowed(
+    method: str,
+    origin_header: str | None,
+    sec_fetch_site: str | None,
+    host_header: str | None,
+    *,
+    request_scheme: str = "http",
+) -> bool:
+    """Decisão composta para o middleware ([01] §4). `False` ⇒ bloquear a requisição.
+
+    Só se aplica a métodos que alteram estado; `GET`/`HEAD`/`OPTIONS` passam sempre por
+    aqui (a proteção deles é o token).
+    """
+    if method.upper() not in MUTATING_METHODS:
+        return True
+    return origin_matches_host(
+        origin_header, host_header, request_scheme=request_scheme
+    ) and sec_fetch_site_allows_write(sec_fetch_site)

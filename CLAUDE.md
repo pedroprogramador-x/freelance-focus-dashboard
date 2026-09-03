@@ -39,6 +39,23 @@ npm run build         # tsc -b && vite build
 npm run dev
 ```
 
+### AI Dev Workspace — fluxo de dev local (até a E11)
+
+O frontend do AI Dev Workspace só funciona autenticado quando **a FastAPI serve o
+SPA compilado** (ela injeta o `LocalSessionToken` no HTML). O fluxo suportado é:
+
+```bash
+VITE_APP_MODE=local_dev_workspace npm run build   # base '/', assets em /assets/
+"$PY" -m uvicorn app.main:app                      # da pasta api/; serve dist/ + /api
+```
+
+`npm run dev` **isolado não é suportado** até a E11: sem o launcher de hot-reload
+(FastAPI + Vite com token compartilhado em memória), o Vite dev server não tem token
+para injetar e toda chamada à API responde 401. O launcher está adiado para a E11
+(ver "Decisões adiadas" em `docs/architecture/07-roadmap-v1.md`) porque entre E4 e
+E10 o roadmap é quase todo backend. O `server.proxy` em `vite.config.ts` já deixa o
+caminho pronto para esse launcher.
+
 ### Backend (`api/`) — venv Python FICA FORA DO REPO
 
 O repo está no OneDrive; o venv vive em

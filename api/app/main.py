@@ -31,16 +31,20 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app import __version__
-from app.api import health, web
+from app.api import health, web, workspaces
 from app.api.security import (
     extract_bearer_token,
     generate_session_token,
     host_is_local,
+    is_api_path,
     requires_session_token,
+    same_origin_write_allowed,
     token_is_valid,
 )
 from app.config import AppSettings, get_settings
+from app.db.session import create_engine, create_session_factory
 from app.safety import redact
+from app.workspace import PurgeTokenStore, WorkspaceError
 
 
 async def _unhandled_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
@@ -54,6 +58,19 @@ async def _unhandled_exception_handler(_request: Request, exc: Exception) -> JSO
     return JSONResponse(
         status_code=500,
         content={"code": "internal_error", "message": redact("erro interno do backend")},
+    )
+
+
+async def _workspace_error_handler(_request: Request, exc: Exception) -> JSONResponse:
+    """`WorkspaceError` → `{code, message}` no status que o domínio pediu ([06] §2).
+
+    O router não conhece HTTP status de erro: levanta a exceção tipada, e a tradução mora
+    aqui, no composition root. Toda mensagem passa pelo redator ([06] §2).
+    """
+    assert isinstance(exc, WorkspaceError)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"code": exc.code, "message": redact(exc.message)},
     )
 
 
@@ -75,6 +92,14 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     #: Efêmero, só em memória, novo a cada `create_app` — logo, a cada reinício.
     app.state.session_token = generate_session_token()
 
+    #: Engine e fábrica de sessão. Construir não toca o disco — só o primeiro `connect`
+    #: o faz (ver `app.db.session`), então criar o app segue sem efeito colateral.
+    app.state.db_engine = create_engine(active)
+    app.state.session_factory = create_session_factory(app.state.db_engine)
+
+    #: Confirmação forte da purga ([02] §11). Uma instância por app, só em memória.
+    app.state.purge_token_store = PurgeTokenStore()
+
     @app.middleware("http")
     async def local_guard(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
@@ -89,6 +114,25 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             return JSONResponse(
                 status_code=400,
                 content={"code": "invalid_host", "message": "host não permitido"},
+            )
+
+        # [01] §4: requisições que alteram estado exigem mesma origem. Um POST/PATCH/PUT/
+        # DELETE sob `/api/` é recusado (antes da verificação de token — aba maliciosa não
+        # sonda a rota) quando o `Origin` não bate exatamente com a autoridade do `Host`
+        # servido, ou o `Sec-Fetch-Site` não é `same-origin`/`none`.
+        if is_api_path(request.url.path) and not same_origin_write_allowed(
+            request.method,
+            request.headers.get("origin"),
+            request.headers.get("sec-fetch-site"),
+            request.headers.get("host"),
+            request_scheme=request.url.scheme,
+        ):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "code": "cross_origin_denied",
+                    "message": "origem não permitida para operação que altera estado",
+                },
             )
 
         if requires_session_token(request.method, request.url.path):
@@ -106,12 +150,14 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         return await call_next(request)
 
     app.include_router(health.router, prefix="/api")
+    app.include_router(workspaces.router, prefix="/api")
     app.include_router(web.router)
 
     assets_dir = active.web_assets_dir
     if assets_dir.is_dir():
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
+    app.add_exception_handler(WorkspaceError, _workspace_error_handler)
     app.add_exception_handler(Exception, _unhandled_exception_handler)
     return app
 

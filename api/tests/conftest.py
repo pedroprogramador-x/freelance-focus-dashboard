@@ -110,6 +110,22 @@ def client(temp_settings: AppSettings) -> Iterator[TestClient]:
 
 
 @pytest.fixture
+def api_client(temp_settings: AppSettings, migrated_url: str) -> Iterator[TestClient]:
+    """Cliente **sem** credencial mas com o schema já migrado — rotas que tocam o banco (E3+)."""
+    del migrated_url  # dependência de ordem: garante o schema aplicado
+    with TestClient(create_app(temp_settings), base_url=LOCAL_BASE_URL) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def auth_api_client(api_client: TestClient) -> TestClient:
+    """`api_client` autenticado, como o SPA faria após ler a `<meta>` do HTML."""
+    token = api_client.app.state.session_token  # type: ignore[attr-defined]
+    api_client.headers["Authorization"] = f"Bearer {token}"
+    return api_client
+
+
+@pytest.fixture
 def session_token(client: TestClient) -> str:
     """Token do app em teste, lido da memória do processo — nunca de uma rota."""
     return str(client.app.state.session_token)  # type: ignore[attr-defined]

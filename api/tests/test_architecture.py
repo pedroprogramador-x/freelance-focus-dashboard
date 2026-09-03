@@ -33,9 +33,14 @@ FORBIDDEN_EVERYWHERE = (
     "redis",
 )
 
-#: `subprocess` é a superfície de execução de processo. Ela pertence ao Full Safety
-#: Runtime (E7) e ao Test Runner, nenhum dos dois existindo ainda.
-FORBIDDEN_PROCESS = ("subprocess", "multiprocessing", "pty")
+#: `multiprocessing` e `pty` são superfície de execução de processo e pertencem ao Full
+#: Safety Runtime (E7) e ao Test Runner, nenhum dos dois existindo ainda.
+FORBIDDEN_PROCESS = ("multiprocessing", "pty")
+
+#: `subprocess` é liberado **exclusivamente** em `git_runtime/`, e só para o preflight de
+#: LEITURA da E3 ([01] contrato de `git_runtime/`, [07] gate E3). Em qualquer outro módulo
+#: continua proibido até E7.
+SUBPROCESS_ALLOWED_UNDER = APP_ROOT / "git_runtime"
 
 
 def _python_files() -> list[Path]:
@@ -84,6 +89,41 @@ def test_nenhuma_execucao_de_processo(path: Path) -> None:
         assert root not in FORBIDDEN_PROCESS, (
             f"{_module_name(path)} importa `{imported}`: execução de processo é E7"
         )
+        if root == "subprocess":
+            assert path.is_relative_to(SUBPROCESS_ALLOWED_UNDER), (
+                f"{_module_name(path)} importa `subprocess` fora de git_runtime/: "
+                "execução de processo fora do preflight de leitura é E7"
+            )
+
+
+def test_git_runtime_e_somente_leitura() -> None:
+    """[01]: `git_runtime/` nunca executa verbo que altere o repositório do usuário."""
+    mutating_verbs = (
+        "commit",
+        "merge",
+        "push",
+        "rebase",
+        "reset",
+        "checkout",
+        "clean",
+        "init",
+        "apply",
+        "stash",
+        "cherry-pick",
+        "restore",
+        "switch",
+        "tag",
+        "fetch",
+        "pull",
+        "gc",
+        "prune",
+    )
+    for path in (APP_ROOT / "git_runtime").rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        for verb in mutating_verbs:
+            assert f'"{verb}"' not in source, (
+                f"git_runtime/{path.name} usa o verbo git `{verb}`: o adaptador é só leitura"
+            )
 
 
 def test_safety_e_puro() -> None:

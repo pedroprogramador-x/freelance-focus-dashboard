@@ -1,0 +1,77 @@
+name: Cross-stack CI
+
+# E3-AUD3-001. Um gate dedicado que prova o fluxo de execução local "FastAPI serve o SPA
+# compilado" ponta a ponta: `vite build` REAL + FastAPI servindo os assets com hash + a
+# `<meta>` do LocalSessionToken injetada no HTML servido + rota `/api` autenticada com esse
+# token. Precisa das DUAS toolchains (Node e Python), por isso não cabe no `api-ci.yml`
+# (só Python, por desenho — ADR-0001 item 5).
+#
+# Totalmente independente: sem `needs`, não é `needs` de ninguém. NÃO toca `deploy.yml`
+# nem `api-ci.yml`. Uma falha aqui não bloqueia o deploy do GitHub Pages nem a CI da API.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "api/**"
+      - "vite.config.ts"
+      - "src/**"
+      - "index.html"
+      - "package*.json"
+      - ".nvmrc"
+      - ".github/workflows/cross-stack-ci.yml"
+  pull_request:
+    paths:
+      - "api/**"
+      - "vite.config.ts"
+      - "src/**"
+      - "index.html"
+      - "package*.json"
+      - ".nvmrc"
+      - ".github/workflows/cross-stack-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cross-stack-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  spa-integration:
+    runs-on: ubuntu-latest
+    env:
+      # Só ESTE workflow define esta variável. Com ela ligada, o teste de integração
+      # FALHA (não pula) se `npx`/`node_modules` sumirem — é o gate que não pode ficar
+      # mudo. Fora daqui (ex.: dentro do `api-ci.yml`, sem Node por desenho) o skip
+      # continua sendo o comportamento correto.
+      FF_CROSS_STACK_CI: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: api/pyproject.toml
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Install backend
+        working-directory: api
+        run: python -m pip install --disable-pip-version-check -e ".[dev]"
+
+      # EXCLUSIVAMENTE o teste de integração cross-stack. A suíte completa do backend já
+      # roda no `api-ci.yml`.
+      - name: Cross-stack SPA integration test
+        working-directory: api
+        run: python -m pytest tests/test_web_spa_integration.py -q

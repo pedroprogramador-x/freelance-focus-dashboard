@@ -1,12 +1,13 @@
-import { BarChart3, BriefcaseBusiness, CalendarDays, ChevronLeft, ChevronRight, FolderKanban, Menu, Moon, Settings, Sun, Users, Wrench, X, type LucideIcon } from 'lucide-react'
+import { BarChart3, Boxes, BriefcaseBusiness, CalendarDays, ChevronLeft, ChevronRight, FolderKanban, Menu, Moon, Settings, Sun, Users, Wrench, X, type LucideIcon } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useApp } from '../context/AppContext'
 
-export type PageId = 'dashboard' | 'roadmap' | 'clients' | 'proposals' | 'projects' | 'services' | 'settings'
+export type PageId = 'dashboard' | 'roadmap' | 'clients' | 'proposals' | 'projects' | 'services' | 'workspaces' | 'settings'
 const navigation: { id: PageId; label: string; icon: LucideIcon }[] = [
   { id: 'dashboard', label: 'Painel', icon: BarChart3 }, { id: 'roadmap', label: 'Plano 90 Dias', icon: CalendarDays },
   { id: 'clients', label: 'Clientes', icon: Users }, { id: 'proposals', label: 'Propostas', icon: BriefcaseBusiness },
-  { id: 'projects', label: 'Projetos', icon: FolderKanban }, { id: 'services', label: 'Serviços', icon: Wrench }, { id: 'settings', label: 'Configurações', icon: Settings },
+  { id: 'projects', label: 'Projetos', icon: FolderKanban }, { id: 'services', label: 'Serviços', icon: Wrench },
+  { id: 'workspaces', label: 'Dev Workspaces', icon: Boxes }, { id: 'settings', label: 'Configurações', icon: Settings },
 ]
 
 export function Layout({ page, setPage, children }: { page: PageId; setPage: (page: PageId) => void; children: React.ReactNode }) {

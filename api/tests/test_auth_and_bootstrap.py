@@ -131,7 +131,7 @@ def test_authorization_malformado_devolve_401(client: TestClient, header: str) -
 
 def test_token_valido_passa_pelo_guarda(auth_client: TestClient) -> None:
     """Com credencial válida o 401 some; o 404 é do roteamento, não da autenticação."""
-    assert auth_client.get("/api/workspaces").status_code == 404
+    assert auth_client.get("/api/rota-que-nao-existe").status_code == 404
     assert auth_client.get("/api/health").status_code == 200
 
 
@@ -270,7 +270,8 @@ def test_enumeracao_de_rotas_prova_a_superficie(client: TestClient) -> None:
     paths = {route.path for route in app.routes if hasattr(route, "path")}  # type: ignore[attr-defined]
 
     api_paths = {path for path in paths if is_api_path(path)}
-    assert api_paths == {"/api/health"}
+    assert "/api/health" in api_paths
+    assert "/api/workspaces" in api_paths  # E3 acrescentou o Workspace Registry
 
     non_api_paths = {path for path in paths if not is_api_path(path)}
     assert non_api_paths == {"/"}, "rota pública fora de /api precisa ser decisão explícita"
@@ -279,6 +280,11 @@ def test_enumeracao_de_rotas_prova_a_superficie(client: TestClient) -> None:
     for path in api_paths:
         publico = ("GET", path) in PUBLIC_API_ENDPOINTS
         assert requires_session_token("GET", path) is not publico
+
+    # Mesmo com rotas novas, `GET /api/health` continua sendo a única pública.
+    assert {path for path in api_paths if not requires_session_token("GET", path)} == {
+        "/api/health"
+    }
 
 
 def test_qualquer_rota_api_nova_nasce_protegida() -> None:

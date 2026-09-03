@@ -10,6 +10,12 @@ dependencies = [
     "alembic>=1.14,<1.15",
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.6,<3",
+    # anyio 4.15.0 transformou `anyio.abc.BlockingPortal` num lazy-import que emite
+    # `DeprecationWarning` ao ser acessado; o Starlette (via `TestClient`, `testclient.py`
+    # nível de módulo) ainda o referencia, e com `filterwarnings = ["error"]` o aviso vira
+    # erro e trava a coleta dos testes numa instalação limpa. Teto até o Starlette migrar;
+    # o piso `>=3.6.2` já vem do próprio Starlette. (E3-AUD4-001)
+    "anyio<4.15",
 ]
 
 [project.optional-dependencies]
