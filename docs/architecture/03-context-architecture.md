@@ -171,6 +171,47 @@ sob demanda por `POST /api/workspaces/{id}/context/verify`. Sem watcher de files
 polling na V1 — um `ls-tree` mais um `status` por verificação é barato, e um watcher em
 pasta sincronizada por OneDrive geraria ruído contínuo.
 
+### `verification_commit` — o SHA que a verificação enxerga
+
+Toda verificação captura, **uma única vez no seu início, um `verification_commit`**
+imutável durante toda a execução dela. As duas partes da verificação — o `git ls-tree`
+da Parte A e o `git status` da Parte B — usam esse mesmo SHA; ele não é relido no meio
+da chamada.
+
+| Onde a verificação roda | `verification_commit` |
+| --- | --- |
+| Dentro do planejamento de uma task (E6+), em `POST /api/tasks/{id}/plan` | `= planning_base_commit` — o commit já congelado para a task |
+| Sob demanda, sem task (E4), em `POST /api/workspaces/{id}/context/verify` | `= HEAD` atual do workspace, lido **uma única vez** no início da chamada e tratado como congelado pelo resto dela |
+
+O texto acima ("toda verificação é feita em relação ao `planning_base_commit`") descreve
+o caso E6+. `verification_commit` generaliza a regra para o caso E4, em que ainda não
+existe `planning_base_commit`: a verificação sob demanda fixa o `HEAD` do workspace no
+início e o trata como base congelada, exatamente como o planejamento trata o base commit.
+
+### `source_hash` / `source_hash_commit` — baseline confirmado, escrito só na origem
+
+`source_hash` e `source_hash_commit` juntos são o **baseline confirmado** de uma entrada:
+o hash das fontes cobertas e o commit em que esse hash foi medido. Esse par é escrito
+**somente** em dois momentos:
+
+- na **criação** de uma entrada cujo `source_refs` não é vazio; ou
+- quando `source_refs` é **explicitamente alterado** via `PATCH`.
+
+`verify()` **nunca** escreve nesses dois campos. Ele apenas lê o baseline armazenado,
+recomputa o `source_hash` no `verification_commit` e compara. O que `verify()` atualiza é
+**exclusivamente** `state`, `stale_reason`, `last_verified_at` e `last_verified_commit`.
+
+Decorre disso:
+
+- **Uma entrada `stale` nunca volta a `fresh` só porque `verify()` rodou de novo.** O
+  baseline armazenado não muda quando `verify()` roda, então a comparação continua dando o
+  mesmo resultado.
+- Editar apenas `body`, `title`, `structured` ou `tags` **não toca** o baseline — muda o
+  `content_hash` (§2), não o `source_hash`.
+- `source_refs` alterado para **lista vazia** remove o baseline (`source_hash` e
+  `source_hash_commit` → `null`) e devolve o estado a `fresh` sem `stale_reason`, pela
+  primeira linha da regra de estado.
+
 ---
 
 ## 4. Seleção, manifest e artefato renderizado

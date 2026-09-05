@@ -129,3 +129,13 @@ caro e piora o resultado: contexto irrelevante compete com contexto relevante.
 
 [03 — Arquitetura de contexto](../architecture/03-context-architecture.md) ·
 [02 — Modelo de dados](../architecture/02-data-model.md)
+
+## Addendum — planejamento da E4 (2026-09-05)
+
+O item 6 já definia a fórmula de `source_hash` e as regras de estado, mas não
+formalizava explicitamente que `source_hash`/`source_hash_commit` são um baseline
+escrito apenas na criação/edição de `source_refs`, nunca por `verify()`. Esta distinção
+foi tornada normativa em [03](../architecture/03-context-architecture.md) §3 durante o
+planejamento da E4, para eliminar ambiguidade antes da implementação — nenhuma decisão
+original é revertida. Também foi formalizado o conceito de `verification_commit`,
+generalizando o que antes assumia sempre a existência de `planning_base_commit`.

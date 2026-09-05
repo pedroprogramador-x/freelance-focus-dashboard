@@ -684,3 +684,40 @@ novo.**
   partir de `main` atualizado.
 
 ---
+
+## 2026-09-05 — Claude Sonnet 5 (effort medium) — E4 (planejamento): formalização de `verification_commit` e do baseline de `source_hash`
+
+Tarefa **SOMENTE DOCUMENTAÇÃO** — formalização de algo já decidido na sessão de
+planejamento da E4, sem decisão nova e sem código. `docs/` alterado com autorização
+explícita do Pedro nesta conversa, escopo restrito aos dois arquivos abaixo.
+
+- Arquivos alterados:
+  - `docs/architecture/03-context-architecture.md` — §3 (*staleness*): **duas
+    subseções novas ao final da seção**, antes do `---`. (a) `verification_commit`:
+    SHA capturado uma única vez no início de cada verificação, imutável durante ela;
+    tabela mapeando E6+ (`= planning_base_commit`) e E4/`POST /context/verify`
+    (`= HEAD` do workspace lido uma vez). (b) `source_hash`/`source_hash_commit` como
+    baseline confirmado, escrito só na criação com `source_refs` não vazio ou no
+    `PATCH` explícito de `source_refs`; `verify()` nunca escreve nesses campos, só
+    atualiza `state`/`stale_reason`/`last_verified_at`/`last_verified_commit`; entrada
+    `stale` não volta a `fresh` só por `verify()` repetir; editar
+    `body`/`title`/`structured`/`tags` não toca o baseline; `source_refs` → lista
+    vazia zera o baseline (`null`) e volta a `fresh` sem motivo.
+  - `docs/adr/0006-context-registry-selective-context.md` — **addendum ao final**
+    ("planejamento da E4 (2026-09-05)"). Item 6 e todo o texto anterior intactos.
+    Registra que a distinção baseline-vs-`verify()` foi tornada normativa em [03] §3
+    e que `verification_commit` generaliza o que antes assumia sempre
+    `planning_base_commit` — nenhuma decisão original revertida.
+  - `AGENT_LOG.md` — esta entrada.
+
+- Decisões tomadas: **nenhuma nova.** Só formalização normativa para eliminar
+  ambiguidade antes de implementar a E4.
+
+- GATE: `git diff` dos dois docs = **51 insertions(+), 0 deletions(-)** (03: +41 /
+  ADR-0006: +10). Só adição, zero remoção de texto original. Verificado.
+
+- Pendências: diff revisado e commit/push autorizados pelo Pedro nesta sessão —
+  commitado direto em `main` (`docs:`, sem branch de fase, por ser só documentação de
+  planejamento). Implementação da E4 (Context Registry) não iniciada.
+
+---
