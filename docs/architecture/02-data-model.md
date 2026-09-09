@@ -337,10 +337,18 @@ reversível dos bytes UTF-8 exatos (ex: hexadecimal ou base64) — o alfabeto he
 tem variantes de normalização, então atravessa `canonical_json` inalterado. Isso não
 modifica o contrato de `canonical_json`; é responsabilidade do chamador.
 
-> **Pendência conhecida (E5):** `file_map` e `ContextManifest.source_files` ainda **não**
-> aplicam essa pré-codificação — `path` entra em `canonical_json` como string crua e sofre
-> a normalização NFC de que este parágrafo trata. Isso é uma lacuna a fechar em código, não
-> um padrão já resolvido; nenhum helper de referência existe ainda no repositório.
+**Fechado na correção de auditoria da E5 (AUD-001/006/007).** `encode_path_identity`
+(`app/context_engine/file_map.py`) é o helper de referência: hex dos bytes UTF-8 exatos.
+`FileMapItem.as_canonical()` codifica `path`/`dir_path`/`extension` antes de entrar em
+`compute_file_map_hash`; `manifest.compute_manifest_hash` codifica o `path` de
+`source_files` e de `working_tree_divergence.covered` (e o `path_or_entry` de `excluded`
+quando é caminho, não quando é `entry_id`) no mesmo ponto de entrada em `canonical_json`.
+Os valores **armazenados** e exibidos em `ContextManifest` continuam legíveis — a
+pré-codificação existe só na forma que entra no hash. Testado com `café.py` grafado em
+NFC e o mesmo nome em NFD como dois arquivos reais no mesmo commit:
+`test_file_map_trata_nfc_e_nfd_como_arquivos_distintos` e
+`test_manifest_hash_trata_nfc_e_nfd_como_identidades_distintas`, em
+`api/tests/test_context_router_e5.py`.
 
 **Auditor ausente:** se, na fase da execução, o auditor ainda não existe e a política de
 workflow permite ausência, `auditor_binding` recebe **`null` explícito**. Omitir a chave
