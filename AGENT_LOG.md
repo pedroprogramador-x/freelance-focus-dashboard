@@ -1981,3 +1981,32 @@ pendente só da decisão de Pedro de seguir com isso — e, se ele quiser, da co
 - Nada commitado, nada pushado — aguardando autorização explícita de Pedro, como pedido.
 
 ---
+
+## 2026-09-09 — Claude Sonnet 5 (effort medium) — E5 (formalização): `rendered_context_hash` sem `created_at` + política de orçamento V1
+
+Tarefa **SOMENTE DOCUMENTAÇÃO** — correção de um exemplo ilustrativo e registro de
+decisões de design já fechadas nesta sessão (sem decisão nova). `docs/` alterado com
+autorização explícita de Pedro nesta conversa, escopo restrito aos dois arquivos abaixo.
+
+- Arquivos alterados:
+  - `docs/architecture/02-data-model.md` — §5 (*Rendered Context Artifact*):
+    (a) removido `created_at` do bloco de exemplo JSON do artefato — timestamp operacional
+    vive só em `ContextManifest.created_at`; (b) frase normativa nova: `rendered_context_hash`
+    é o sha256 dos bytes UTF-8 canônicos (sem BOM) do JSON canônico, que **não** inclui
+    `created_at`; (c) nota "V1 (E5)" sobre orçamento — sem truncamento parcial de bloco:
+    entrada que não cabe inteira em `max_context_tokens` é excluída inteira
+    (`excluded`, `reason=budget`); `domain=objective` é sempre incluída mesmo excedendo o
+    orçamento (`approx_tokens > max_context_tokens` é esperado nesse caso); campos
+    `truncated`/`original_chars`/`emitted_chars` do schema de bloco ficam reservados para
+    uso futuro, sempre `truncated=false` nesta fase.
+  - `AGENT_LOG.md` — esta entrada.
+
+- Decisões tomadas: **nenhuma nova.** Só formalização normativa para eliminar ambiguidade
+  antes de implementar a E5.
+
+- GATE: `git diff` de `02-data-model.md` = só adição de texto + a remoção pontual de
+  `created_at` do exemplo. Zero remoção de qualquer outra linha. Verificado.
+
+- Pendências: diff aguardando revisão de Pedro. **Nada commitado, nada pushado.**
+
+---

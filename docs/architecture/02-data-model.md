@@ -241,18 +241,29 @@ Três camadas distintas:
 Arquivo JSON imutável em `data_dir/artifacts/<sha256>.json`, **endereçado por conteúdo** —
 integridade verificável e deduplicação gratuita.
 
+`rendered_context_hash` é o sha256 dos bytes UTF-8 canônicos (sem BOM) do JSON canônico
+abaixo, que **não** inclui `created_at` — timestamp operacional vive exclusivamente em
+`ContextManifest.created_at`.
+
 ```text
 {
   renderer_version,
   blocks: [ { order, origin, role, text, truncated, original_chars,
               emitted_chars, transformations } ],
-  approx_tokens, total_chars, created_at
+  approx_tokens, total_chars
 }
 ```
 
 É um **snapshot**: sobrevive à edição e à exclusão de qualquer `ContextRegistryEntry`. A
 redação de segredos é aplicada **antes** do hash. Nunca contém *chain-of-thought*,
 segredo, conteúdo de `.env` ou credencial.
+
+**V1 (E5):** sem truncamento parcial de bloco por orçamento. Entrada que não cabe inteira
+em `max_context_tokens` é excluída inteira (`excluded`, `reason=budget`). `domain=objective`
+é sempre incluída mesmo que isso sozinho ultrapasse o orçamento — `approx_tokens` pode
+exceder `max_context_tokens` nesse caso, e isso é esperado. Campos
+`truncated`/`original_chars`/`emitted_chars` do schema de bloco ficam reservados para uso
+futuro (ex: truncamento por transformação de redação), sempre `truncated=false` nesta fase.
 
 **GC:** um artefato só é elegível a remoção quando **nenhuma referência restante existir**
 (§11).
