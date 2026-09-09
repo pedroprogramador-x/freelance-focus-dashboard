@@ -327,6 +327,21 @@ execution_fingerprint = sha256( canonical_json( ... ) )
 | Transitórios | proibidos: timestamps, PIDs, caminhos que variam entre máquinas, contadores |
 | Versão | `"v"` presente, para que uma mudança de formato não colida com fingerprints antigos |
 
+**Identidade de caminho vs. normalização textual.** `canonical_json` normaliza toda string
+em NFC, o que é correto para texto autoral, mas colapsaria duas identidades Git
+genuinamente distintas: um path em NFC e o mesmo path visualmente em NFD são arquivos
+diferentes para o Git (exceto em macOS, onde o filesystem já normaliza). Qualquer campo
+que representa **identidade de caminho de arquivo** (não texto para leitura humana) deve,
+antes de entrar em `canonical_json`, ser pré-codificado como representação ASCII
+reversível dos bytes UTF-8 exatos (ex: hexadecimal ou base64) — o alfabeto hex/base64 não
+tem variantes de normalização, então atravessa `canonical_json` inalterado. Isso não
+modifica o contrato de `canonical_json`; é responsabilidade do chamador.
+
+> **Pendência conhecida (E5):** `file_map` e `ContextManifest.source_files` ainda **não**
+> aplicam essa pré-codificação — `path` entra em `canonical_json` como string crua e sofre
+> a normalização NFC de que este parágrafo trata. Isso é uma lacuna a fechar em código, não
+> um padrão já resolvido; nenhum helper de referência existe ainda no repositório.
+
 **Auditor ausente:** se, na fase da execução, o auditor ainda não existe e a política de
 workflow permite ausência, `auditor_binding` recebe **`null` explícito**. Omitir a chave
 faria dois cenários distintos colidirem no mesmo hash.

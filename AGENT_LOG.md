@@ -2010,3 +2010,256 @@ autorização explícita de Pedro nesta conversa, escopo restrito aos dois arqui
 - Pendências: diff aguardando revisão de Pedro. **Nada commitado, nada pushado.**
 
 ---
+
+## 2026-09-09 — Claude Opus 5 (effort high) — E5: Context Router + file map (implementação)
+
+Implementação completa da E5, nas seis sub-etapas do plano aprovado. **Nada commitado,
+nada pushado.** `docs/`, `.github/`, `CLAUDE.md` e `src/` (frontend): `git diff` vazio.
+
+### Arquivos alterados
+
+- **Novos** — `api/app/context_engine/file_map.py` (192), `rendering.py` (159),
+  `selection.py` (647), `manifest.py` (299); `api/tests/test_context_router_e5.py`
+  (1087, **33 testes**).
+- **Modificados** — `api/app/context_engine/__init__.py` (reexporta a superfície nova e
+  documenta as três regras de dono único da fase); `api/tests/context_helpers.py`
+  (`make_task`, `head_of`).
+- Nenhuma rota HTTP nova. `select_context`, `freeze_manifest` e `render_context` são
+  capacidades internas de `context_engine/`, consumidas pelo Planner a partir da E6. As
+  `WorkspaceTask` dos testes são escritas **direto pela sessão de teste** só para
+  satisfazer a FK de `ContextManifest.task_id` — não é caminho de produção, e o docstring
+  de `make_task` diz isso.
+
+### As quatro regras estruturais do prompt, e onde cada uma virou código
+
+1. **`canonical_json` reaproveitado, nunca reimplementado.** `grep` confirma: uma única
+   definição em `app/safety/canonical.py`, importada por `content_hash`, `file_map`,
+   `manifest`, `rendering`, `service`, `source_ref_expansion` e `policy`. Zero `json.dumps`
+   fora dela em `app/`.
+2. **Zero `float`.** Pesos, distâncias e orçamento são `int`; `approx_tokens` é
+   `(len + 3) // 4`. `updated_at` vira epoch inteiro por aritmética de `timedelta`
+   (`epoch_seconds`), **nunca** `datetime.timestamp()` — que devolve `float` e é
+   justamente a comparação que decide o desempate.
+3. **Escrita em bytes.** `render_context` abre `"wb"` sobre bytes que ele mesmo produziu
+   com `.encode("utf-8")`. Mesma classe de bug de E4-AUD4-001 (`subprocess.run(text=True)`),
+   do outro lado da fronteira: lá na leitura, aqui na escrita. Escrita atômica por arquivo
+   temporário + `os.replace`, para nunca existir blob truncado com nome de blob íntegro.
+4. **Ordenação canônica explícita em tudo que entra em hash ou score**: `entries` (por
+   `entry_id`), `source_files` (por `path`), `working_tree_divergence.covered` (por
+   `(path, kind)`), `derived` (por `(kind, hash)`), `excluded` (por
+   `(reason, path_or_entry)`), itens do file map (por `path`) e candidatos (normalizados,
+   deduplicados, ordenados). Nenhuma ordem de `dict`, `set`, inserção ou `SELECT`
+   sobrevive até o resultado.
+
+### Sub-etapas
+
+- **1 — `build_file_map`.** `[{path, dir_path, dir_depth, extension}]` ordenado por `path`,
+  construído **só** de `list_tree(base_commit)`. Cache por `(workspace_id, base_commit)`
+  ([ADR-0006] item 4); `local_path` fica **fora** da chave de propósito, para não divergir
+  do documento (`DevWorkspace.local_path` é UNIQUE, então não distinguiria nada). Leitura
+  que falhou nunca é cacheada — falha é transitória. `hash` por `canonical_json`.
+- **2 — `select_context`.** Tabela inteira: sobreposição `source_refs`=100, domínio
+  afetado=100, tags=50, proximidade=`max(0, 30 - distância)`, `fresh`=10. `objective`
+  sempre incluída. Chave de ordenação **total**: score desc → `updated_at` (epoch int)
+  desc → `entry_id` asc — `entry_id` é PK, então nada sobra para o `SELECT` desempatar.
+  Corte por orçamento sobre `render_block_text()`, a representação real.
+- **3 — `render_block_text`.** A **única** função que produz texto emitido; não existe
+  estimativa de tamanho em lugar nenhum. Pipeline: `normalize_text` de [03] §2 (a mesma de
+  `content_hash`) → transformações previstas → `safety.redact` → framing fixo. A redação
+  roda sobre **todo o conteúdo autoral de uma vez**, então um segredo partido entre `body`
+  e `structured` não escapa por estar em dois campos, e a contagem de caracteres é sempre
+  do texto já redigido.
+- **4 — `freeze_manifest`.** `manifest_hash` sobre os sete campos semânticos; `id`,
+  `task_id`, `created_at`, `rendered_context_*`, `renderer_version`, `approx_tokens`,
+  `total_chars` e o próprio `manifest_hash` ficam **fora**.
+- **5 — `render_context`.** `objeto canônico → canonical_json → UTF-8 sem BOM → bytes →
+  sha256 → artifacts/<sha256>.json`. Idempotente: o nome **é** o hash, então um arquivo já
+  presente já tem aquele conteúdo.
+- **6 — revisão.** Abaixo.
+
+### Gates
+
+- **Backend: 1044 passed / 6 skipped** (era 1011; +33). `ruff check` · `ruff format --check`
+  · `mypy` limpos (73 arquivos).
+- **`test_architecture.py` verde**, incluindo
+  `test_context_engine_nao_importa_camadas_superiores`. Confirmado também por `grep`: os
+  quatro módulos novos importam só `app.db`, `app.git_runtime`, `app.safety`,
+  `app.context_engine`, `sqlalchemy` e stdlib. Nenhum `agent_runtime`, `tool_executor`,
+  `orchestrator`, `api`, `fastapi` ou `starlette`.
+- **Frontend não tocado** (`git diff` vazio em `src/`), logo `npm test`/`npm run lint` não
+  foram reexecutados nesta rodada.
+
+### Os 9 testes de determinismo — todos implementados
+
+| # | Teste |
+| --- | --- |
+| 1 | `test_file_map_e_deterministico_byte_a_byte` |
+| 2 | `test_select_context_pontua_conforme_a_tabela` + `..._ordena_por_score_depois_recencia_depois_id` + `..._desempata_por_entry_id...` |
+| 3 | `test_manifest_hash_ignora_id_task_id_e_created_at` |
+| 4 | `test_render_context_grava_o_artefato_e_e_idempotente` |
+| 5 | `test_ordem_de_insercao_no_banco_nao_altera_o_resultado` |
+| 6 | `test_render_block_text_ignora_a_ordem_das_chaves_de_structured` + `test_ordem_das_chaves_de_structured_nao_altera_os_hashes` |
+| 7 | `test_updated_at_muda_selecao_mas_nao_a_identidade_semantica` + `test_epoch_seconds_nunca_passa_por_float` |
+| 8 | `test_processo_python_separado_produz_os_mesmos_hashes` |
+| 9 | `test_hash_do_arquivo_em_disco_bate_com_o_registrado` |
+
+O **teste 8 foi implementado de verdade**, e o valor dele está no `PYTHONHASHSEED`: dois
+processos filhos rodam com seeds **explicitamente diferentes** (`0` e `12345`), sobre o
+mesmo banco e o mesmo commit, e são comparados entre si e com o pai (que tem um terceiro
+seed, aleatório). `hash()` de `str` é randomizado por esse seed, e com ele muda a ordem de
+iteração de qualquer `set` de strings — se alguma coleção chegasse a um hash sem ordenação
+explícita, as três execuções divergiriam. É a reprodução direta da classe de bug que a fase
+existe para fechar, e não um "roda de novo e dá igual".
+
+O teste 6 compara a **mesma** entrada reescrita com as chaves em outra ordem, e não duas
+entradas: `entry_id` faz parte da identidade do bloco (é o que responde de onde o texto
+veio depois de a entrada sumir), então comparar entradas diferentes mediria outra coisa. A
+primeira versão do teste caiu exatamente nisso e foi corrigida.
+
+O teste 7 separa explicitamente as duas coisas que o prompt manda não confundir:
+`updated_at` **pode** mudar a seleção (é o critério de desempate) e o timestamp
+**operacional** (`ContextManifest.created_at`, `id`, `task_id`) **não pode** mudar hash
+nenhum.
+
+### Decisões de implementação não 100% especificadas no prompt
+
+1. **Assinatura.** `select_context(session, workspace, *, base_commit, candidate_paths,
+   max_context_tokens, affected_domains=(), objective_terms=(), transformations=…,
+   policy=None)`. `session` é necessário para ler as entradas e segue o padrão de
+   `create_entry`/`verify_workspace_entries`. `affected_domains` e `objective_terms` são a
+   saída do Task Analyzer ([03] §5), que só existe na E6 — nascem vazios, e aí os dois
+   sinais valem zero para todas as entradas sem quebrar o determinismo.
+2. **`candidate_paths` são caminhos literais, não globs.** [03] §4 fala em "globs
+   candidatos da análise", mas o parâmetro do plano se chama `candidate_paths` e nenhum
+   Analyzer existe ainda para emiti-los. Validação por
+   `validate_source_ref(..., allow_glob_syntax=False)`. Os `source_refs` **da entrada**
+   continuam podendo ser glob e são casados pelo dono único da gramática. Candidato em
+   forma de glob fica para a E6.
+3. **Sobreposição é binária (100), não somada por arquivo casado** — senão `src/**` vence
+   qualquer entrada precisa só por cobrir mais arquivos.
+4. **Proximidade** = menor distância de árvore de diretórios entre os `dir_path` dos
+   arquivos que a entrada resolveu e os dos candidatos. Sem arquivo resolvido ou sem
+   candidato, o sinal vale `0` — "não sei" não é "perto". Sobreposição dá distância `0` e
+   portanto 30 pontos **por cima** dos 100: são sinais diferentes de [03] §4, e nenhum
+   absorve o outro.
+5. **Casamento de tag** é igualdade exata após NFC + `strip` + `casefold`. Sem substring,
+   sem radical, sem sinônimo — qualquer um dos três seria heurística não determinística de
+   linguagem dentro de um roteador que precisa ser reproduzível.
+6. **Bônus `fresh` só para `state = fresh`.** `unknown` não ganha nada: não é frescor
+   confirmado.
+7. **O corte de orçamento continua varrendo depois da primeira entrada que não coube** —
+   uma menor, mais abaixo no ranking, ainda pode caber. Parar na primeira desperdiçaria
+   orçamento sem melhorar a ordem, e a ordem de emissão é preservada de qualquer forma
+   porque a lista final é reordenada pela chave de ranking. Toda entrada pulada entra em
+   `excluded(budget)`, então "por que o agente não sabia disso?" continua tendo resposta.
+8. **`approx_tokens = ceil(chars / 4)`.** Nenhum tokenizador de provider existe nesta fase,
+   e importar um criaria a dependência de provider que [03] §4 proíbe ao Context Engine. O
+   campo se chama `approx_` no próprio [02] §5.
+9. **`renderer_version = "e5.block.v1"`** — valor escolhido aqui; nenhum documento o fixa.
+10. **Framing do bloco**: cabeçalho `### contexto · <domain>`, depois `## <título>`, corpo
+    e o `structured` canônico numa cerca de código JSON. `structured` entra porque é lá que
+    mora a justificativa de uma `decisions`/`risks` ([ADR-0006] item 5) — omiti-lo
+    entregaria a decisão sem o porquê. A redação roda sobre a concatenação do conteúdo
+    autoral e o cabeçalho fixo é acrescentado depois: "framing" aqui é o cabeçalho e a
+    quebra final, e os marcadores markdown que separam os campos ficam **dentro** da string
+    redigida, de propósito, para o redator enxergar um segredo partido entre dois campos.
+11. **`transformations` não consegue desligar a redação**: lista sem `REDACT` levanta
+    `ValueError`, e a ordem do pipeline vem de uma constante, não da ordem em que o
+    chamador listou.
+12. **`role` = `domain` da entrada; `origin` é objeto** (`kind`, `entry_id`, `domain`,
+    `title`, `content_hash`). [02] §5 não tipa nenhum dos dois. `origin` como objeto é o
+    que faz o artefato continuar respondendo depois de a entrada ser apagada — um
+    `entry_id` órfão não responde nada.
+13. **`truncated=false` e `original_chars == emitted_chars`** em todo bloco, imposto pela
+    política V1 de [02] §5 (sem truncamento parcial). Gravados em vez de omitidos: a
+    ausência precisaria ser reinterpretada depois.
+14. **`manifest_hash` inclui `"v": 1`.** Não é campo do `ContextManifest` — é o marcador de
+    formato que [02] §7 ("Versão") exige, mesmo padrão de `content_hash`. Constante, então
+    não afeta nenhuma comparação semântica.
+15. **`rendered_context_ref` é relativo ao store** (`artifacts/<sha256>.json`), não
+    absoluto: `data_dir` muda de máquina e o `tmp_path` de teste muda a cada execução, e o
+    caminho absoluto tornaria a linha incomparável entre ambientes por um motivo sem
+    relação com o contexto selecionado. `RenderedContext.path` carrega o absoluto, só em
+    memória.
+16. **`ContextTreeUnavailable`** (`context_tree_unavailable`, **409**) — subclasse nova de
+    `ContextError` para "não deu para ler a árvore do `base_commit`". Nenhuma rota a
+    levanta ainda; ela existe para a E6 não ter de inventar o status na hora.
+17. **`working_tree_divergence.covered` usa os `source_refs` das entradas selecionadas**,
+    calculado **por entrada** e unido — nunca um matcher único sobre a união dos refs. Um
+    ref recusado invalidaria o matcher inteiro e apagaria a cobertura conhecida das outras,
+    que é exatamente o *fail open* de E4-AUD5-001. `dirty_file_count` é do workspace inteiro
+    e é registrado sempre ([03] §3: "nunca é escondida").
+18. **Cache do file map**: `dict` global do processo, teto de 64, esvaziado inteiro no
+    estouro — sem LRU, porque todo valor é reconstruível e idêntico e escolher entre
+    equivalentes seria complexidade sem ganho. `clear_file_map_cache()` existe só para os
+    testes.
+19. **`extension` preserva a caixa** e um nome que só tem o ponto inicial (`.gitignore`,
+    `.env`) tem extensão `""` — ali o ponto abre o nome, não separa sufixo.
+20. **Escrita atômica** (temporário no mesmo diretório + `os.replace`) por cima do modo
+    binário exigido. O nome temporário carrega PID + UUID, então dois processos gravando o
+    mesmo hash não disputam o intermediário.
+
+### Pendências
+
+- Diff aguardando revisão de Pedro. **Nada commitado, nada pushado.** Branch de fase ainda
+  não criada.
+- Auditoria independente (Codex) da E5 ainda não rodou.
+- **E6 não iniciada**, conforme o prompt.
+
+---
+
+## 2026-09-09 — Claude Sonnet 5 (effort medium) — E5 (addendum): formalização de padrão de identidade de caminho, sinal `exact_literal_match` e ordem redação/estrutura
+
+Tarefa **SOMENTE DOCUMENTAÇÃO** — três notas aditivas pedidas nesta sessão de
+planejamento, sobre conflitos reais identificados entre `canonical_json` (NFC) e
+identidade de caminho Git, e sobre a ordem exigida entre redação e formatação estrutural.
+`docs/` alterado com autorização explícita de Pedro nesta conversa, escopo restrito aos
+dois arquivos abaixo.
+
+- Arquivos alterados:
+  - `docs/architecture/02-data-model.md` — §7 (`canonical_json`, tabela de regras): nota
+    nova "Identidade de caminho vs. normalização textual" — string que representa
+    identidade de caminho de arquivo precisa ser pré-codificada (hex/base64) antes de
+    entrar em `canonical_json`, para não colapsar duas identidades Git distintas (NFC vs
+    NFD) na normalização NFC que a função já faz sobre texto autoral. Não altera a regra
+    de NFC existente — é responsabilidade do chamador, aditiva.
+  - `docs/architecture/03-context-architecture.md` — §4 (Context Router): linha nova na
+    tabela de scoring, `exact_literal_match` (match literal exato entre `source_ref` e
+    `candidate_path`, sinal mais alto que sobreposição+proximidade combinadas, mesmo sem o
+    candidato existir no `base_commit`) + nota explicando o motivo (precisão de match ≠
+    cobertura de arquivos). E nota sobre ordem redação → formatação estrutural: a redação
+    roda sobre representação **plana** de título+corpo+`structured` linearizado, antes de
+    JSON/markdown/framing; cópias propagadas para `origin`/manifest refletem o resultado
+    já redigido.
+  - `AGENT_LOG.md` — esta entrada.
+
+- **Discrepância sinalizada e corrigida durante a escrita:** o prompt afirmava, para a
+  nota 1, "Ver E5 (file_map, `ContextManifest.source_files`) para o helper de referência"
+  — mas **esse helper não existe**. O código da E5 ([file_map.py](../api/app/context_engine/file_map.py),
+  [selection.py](../api/app/context_engine/selection.py)) coloca `path` como string crua
+  direto em `canonical_json`, sem nenhuma pré-codificação hex/base64: é exatamente a
+  colisão NFC/NFD que a nota descreve, não um caso já resolvido. Removi a referência ao
+  helper inexistente e documentei as três notas como **pendências conhecidas da E5** (blocos
+  `>` dedicados, um por nota), incluindo a terceira — a ordem redação/JSON de
+  `render_block_text` também não segue a garantia mais forte que a nota de redação
+  formaliza (o `structured` é serializado via `canonical_json` **antes** do `redact()`
+  rodar sobre o texto concatenado; funciona hoje porque o redator opera por regex sobre a
+  string inteira, mas não é a ordem descrita). Nenhuma auditoria (Codex) da E5 rodou até
+  agora — o prompt também presumia "padrão descoberto por auditoria", e não há registro de
+  auditoria no `AGENT_LOG.md`; a formalização documenta a regra que uma auditoria futura
+  vai cobrar, não um finding já confirmado.
+
+- Decisões tomadas: **nenhuma nova de arquitetura.** Formalização normativa das três
+  notas, com os ajustes de precisão factual acima. Nenhuma mudança na regra de NFC
+  existente de `canonical_json`, nenhuma mudança na tabela de sinais além da linha nova.
+
+- GATE: `git diff` dos dois arquivos = só adição (blocos `+`, nenhum `-`, nenhuma linha
+  alterada). Verificado.
+
+- Pendências: diff aguardando revisão de Pedro. **Nada commitado, nada pushado.** Três
+  itens de código ficam abertos para uma correção futura da E5 (pré-codificação de `path`
+  em `file_map`/`source_files`; sinal `exact_literal_match` em `select_context`; ordem
+  redação-antes-de-JSON em `render_block_text`) — nenhum implementado nesta tarefa, que é
+  só documentação.
+
+---

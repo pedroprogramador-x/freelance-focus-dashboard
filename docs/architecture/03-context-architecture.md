@@ -230,12 +230,23 @@ Pontuação por entrada:
 
 | Sinal | Peso |
 | --- | --- |
+| Match literal exato entre `source_ref` e `candidate_path` | `exact_literal_match` — sinal mais alto que qualquer combinação de sobreposição+proximidade, mesmo se o candidato não existir no `base_commit` |
 | Sobreposição entre `source_refs` e os globs candidatos da análise | alto |
 | `domain` entre os domínios que a análise marcou como afetados | alto |
 | Casamento de `tags` com termos do objetivo | médio |
 | Proximidade no file map | médio |
 | `state = fresh` | bônus pequeno |
 | Recência de `updated_at` | desempate |
+
+Este sinal existe para garantir que uma referência precisa nunca perca para um glob largo
+por causa de proximidade de file map — precisão de match é distinta de cobertura de
+arquivos.
+
+> **Pendência conhecida (E5):** `select_context` ainda **não** implementa
+> `exact_literal_match` como sinal separado — a sobreposição atual (`source_ref_overlap`,
+> peso 100) é binária e não distingue match literal exato de match por glob largo. Formalizar
+> este sinal aqui antecipa a correção; nenhuma auditoria da E5 rodou ainda para confirmá-la
+> como finding.
 
 Entradas `domain = objective` são sempre incluídas. O corte é por orçamento
 (`max_context_tokens`); o que não coube entra em `excluded` com `reason = budget`, para que
@@ -251,6 +262,19 @@ candidatos — nunca acrescenta entrada nem contorna exclusão de política.
 O renderizador transforma a seleção no payload final e grava um snapshot imutável, com:
 blocos na ordem emitida, origem de cada bloco, truncamentos, transformações aplicadas,
 tamanhos e `renderer_version`. A redação de segredos é aplicada **antes** do hash.
+
+**Ordem da redação em relação à formatação estrutural.** A redação de segredos roda sobre
+uma representação **plana** de todo o conteúdo autoral (título + corpo + `structured`
+linearizado), **antes** de qualquer formatação estrutural (JSON, markdown, framing).
+Cópias do título/metadado que se propagam para `origin`/manifest devem refletir o
+resultado já redigido — nunca o valor autoral cru em paralelo.
+
+> **Pendência conhecida (E5):** `render_block_text` aplica `canonical_json` a `structured`
+> (formatação estrutural) **antes** de invocar `redact()` sobre o texto concatenado —
+> a ordem inversa da descrita acima. Na prática o redator ainda encontra o segredo porque
+> opera por regex sobre a string inteira, mas a implementação não segue a garantia mais
+> forte de "plano antes de estruturado" que este parágrafo formaliza; é um ajuste a fazer
+> em código, não um padrão já resolvido.
 
 Estrutura e propriedades em [02](02-data-model.md) §5. O ponto essencial: por ser um
 **snapshot**, ele responde *"qual conhecimento o Developer recebeu?"* mesmo depois de a
