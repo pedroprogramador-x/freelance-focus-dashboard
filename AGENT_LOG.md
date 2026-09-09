@@ -2263,3 +2263,346 @@ dois arquivos abaixo.
   só documentação.
 
 ---
+
+## 2026-09-09 — Claude Opus 5 (effort high) — E5: correção de 9 findings de auditoria + 3 pendências documentais
+
+Fecha em código os 9 findings (AUD-001..009) e as três "Pendência conhecida (E5)" que a
+sessão anterior tinha deixado documentadas mas não implementadas. **Nada commitado.**
+Segue para uma segunda rodada do Codex.
+
+**Discrepância sinalizada antes de começar:** o prompt referenciava uma "auditoria
+E5-AUD-001..009 completa, já commitada" no `AGENT_LOG.md` — ela não existe no log; a
+sessão anterior (addendum documental) registra explicitamente "nenhuma auditoria da E5
+rodou ainda". Os 9 findings mapeiam três-para-três nas três pendências que eu mesmo
+documentei, mais dois novos (AUD-005 desempate por microssegundo, AUD-009 integridade do
+artifact) que são autocontidos e bem especificados — segui a especificação técnica dada,
+que é acionável independente do documento de auditoria existir.
+
+### Arquivos alterados
+
+- `api/app/context_engine/rendering.py` — **redesenho completo** do pipeline de
+  `render_block_text` (321 linhas).
+- `api/app/context_engine/selection.py` — `exact_literal_match`, desempate por
+  microssegundo, adaptação ao novo `RenderedBlock` (707 linhas).
+- `api/app/context_engine/manifest.py` — pré-codificação de path no `manifest_hash`,
+  verificação de integridade do artifact antes de reutilizar (370 linhas).
+- `api/app/context_engine/file_map.py` — `encode_path_identity` (o helper de referência
+  que a documentação já citava sem que ele existisse) e uso em `as_canonical()`
+  (217 linhas).
+- `api/app/context_engine/__init__.py` — reexporta a superfície nova/renomeada.
+- `api/tests/test_context_router_e5.py` — 45 testes (era 33; +12 líquido — vários testes
+  antigos precisaram só de ajuste de API, não são novos).
+- `docs/architecture/02-data-model.md`, `docs/architecture/03-context-architecture.md` —
+  as três "Pendência conhecida (E5)" substituídas por "Fechado na correção de auditoria",
+  apontando para o código e o teste que fecham cada uma.
+
+### GRUPO B (prioridade máxima) — AUD-002/003/004: redesenho de `render_block_text`
+
+**O bug:** a versão anterior serializava `structured` em JSON (`canonical_json`) **antes**
+de `redact()` rodar. `{"password":"hunter2"}` vira `{"password":"hunter2"}` no compacto —
+o `"` que o JSON insere logo depois de `password` não é espaço nem `:`/`=`, e o padrão
+`assigned_secret` (`\s*[:=]\s*` entre o nome do campo e o valor) nunca disparava. Um
+segredo partido entre `body` e `structured` nunca se recompunha se os dois fossem
+redigidos separadamente. Confirmado por reconstrução standalone da implementação anterior
+(fora do working tree, só para o teste): `hunter2` e `sk-1234567890ABCDEF` vazavam os
+dois.
+
+**A correção, em duas iterações (a primeira ainda vazava):**
+
+*Primeira tentativa* — linhas "chave: valor" para `structured`, redigidas junto com uma
+cópia dos valores **colada ao corpo sem separador** (para pegar o token partido). Um
+smoke test manual pegou o problema antes de eu escrever os testes formais: o mesmo valor
+(`hunter2`) aparecia **duas vezes** no corpus — uma vez colado ao corpo sem contexto de
+campo (onde `assigned_secret` não reconhece nada, porque não há `password` por perto), e
+uma vez na linha rotulada (onde reconhece e redige). `redact()` rodando sobre a
+concatenação inteira redigia a cópia rotulada e **deixava vazar a cópia sem contexto**.
+
+*Correção final* — `_redact_body_and_structured`: cada valor passa pela redação **uma
+única vez** (`_redact_leaf` redige `"<path>: <value>"` isoladamente e recorta de volta só
+o valor, pela primeira ocorrência de `": "` — `path` nunca contém essa subsequência).
+Segredo partido entre campos é fechado por uma leitura **só de verificação**: cola `body`
+a todos os valores de `structured` sem separador, conta quantas redações essa leitura
+colada revela, e compara contra a soma das redações já feitas campo a campo. Se a colada
+achar **mais**, existe segredo cruzando a fronteira que nenhuma leitura isolada revela por
+inteiro — e a resposta é redigir `body` e as folhas envolvidas **por inteiro**, nunca um
+recorte que arrisque deixar passar metade de um token. Mesmo princípio que `redact()` já
+declara para si ("prefere redigir demais a deixar passar"), estendido à fronteira entre
+campos.
+
+O título é redigido à parte (`redact(title)`, sem depender de contexto de outro campo) e
+o resultado passa a ser o **único** valor que se propaga: `render_block_text` agora
+devolve `RenderedBlock(text, title)`, e `title` substitui `entry.title` em
+`ScoredEntry.title` — de onde `blocks[].origin.title` e `ContextManifest.entries[].title`
+o leem. Nenhuma cópia paralela do título cru sobrevive em lugar nenhum (antes,
+`ScoredEntry.title = entry.title` cru — `origin.title`/`entries[].title` vazavam mesmo
+quando `text` já mostrava redigido).
+
+`RENDERER_VERSION` avançou para `"e5.block.v2"` — a forma do texto emitido mudou.
+
+**Testes (reproduções exatas):**
+- `test_segredo_no_titulo_propaga_redigido_a_todo_lugar` — confere `blocks[].text`,
+  `blocks[].origin.title`, `ContextManifest.entries[].title` **e os bytes do artifact**.
+- `test_atribuicao_em_structured_e_reconhecida_apos_linearizacao` — `{"password":
+  "hunter2"}`.
+- `test_segredo_partido_entre_body_e_structured_como_token_continuo` — `"sk-123456"` em
+  `body`, `"7890ABCDEF"` em `structured`; inclui prova negativa de que as duas metades
+  coladas **fora** do pipeline batem o padrão, confirmando que o teste exercitaria o
+  padrão certo se a implementação vazasse.
+- `test_duas_representacoes_do_mesmo_valor_nao_vazam_uma_pela_outra` — regressão do bug
+  que a primeira tentativa introduziu.
+- `test_render_block_text_redige_segredo_partido_entre_campos` (já existia, PEM split) —
+  continua verde, cobre o caso onde a fronteira tolera separador.
+
+### GRUPO A — AUD-001/006/007: `encode_path_identity` + consistência de normalização
+
+**O bug:** `canonical_json` normaliza toda string em NFC — correto para texto autoral,
+errado para identidade de caminho: um path em NFC e o mesmo path visualmente em NFD são
+**arquivos diferentes** para o Git (blob SHA distinto), e a normalização colapsava os dois
+no mesmo texto antes de hashear. Confirmado por reconstrução da serialização anterior:
+dois `FileMapItem.as_canonical()` com `path` em NFC e NFD produziam `canonical_json`
+**idêntico**.
+
+**A correção:** `encode_path_identity(path) -> path.encode("utf-8").hex()` — hex não tem
+variante de normalização Unicode nenhuma, então atravessa `canonical_json` inalterado.
+Aplicado em três pontos, todos **só na forma que entra no hash**, nunca no dado
+armazenado/exibido:
+- `FileMapItem.as_canonical()` — `path`, `dir_path` e `extension` (este último é
+  substring do `path`, mesmo risco);
+- `manifest.compute_manifest_hash` — `source_files[].path` e
+  `working_tree_divergence.covered[].path`, transformados **dentro** da função, sem tocar
+  o que `ContextManifest.source_files`/`working_tree_divergence` grava;
+- `excluded[].path_or_entry` — só quando `reason` é `secret_policy`/`out_of_workspace`
+  (é caminho); em `reason=budget` é um `entry_id` (UUID, sempre ASCII, imune a NFC/NFD) e
+  não precisa da codificação — decisão explícita para não misturar um campo que não
+  representa caminho na pré-codificação que existe especificamente para caminho.
+
+`FILE_MAP_VERSION` e `MANIFEST_HASH_VERSION` avançaram para `2` — a forma canônica mudou.
+
+**Consistência de normalização (a outra metade do Grupo A):** `content_hash`, o título
+propagado para `origin`/`entries[].title`, e a medição (`total_chars`/`approx_tokens`)
+já usavam a mesma `normalize_text` antes desta rodada — o redesenho do Grupo B preservou
+isso por construção (mesma função, chamada nos mesmos dois lugares). Confirmado por teste
+dedicado, não presumido.
+
+**Testes (reproduções exatas):**
+- `test_file_map_trata_nfc_e_nfd_como_arquivos_distintos` — `café.py` grafado em NFC e o
+  mesmo nome em NFD, **dois arquivos reais** no mesmo commit git (confirmado
+  manualmente antes de escrever o teste: NTFS + git preservam os dois como blobs
+  distintos no Windows desta máquina — `git ls-tree` devolve dois SHAs diferentes).
+- `test_manifest_hash_trata_nfc_e_nfd_como_identidades_distintas` — mesma prova, na
+  camada de `compute_manifest_hash`; inclui round-trip do hex de volta para os bytes
+  UTF-8 exatos.
+- `test_titulo_com_crlf_e_espaco_final_fica_consistente_entre_content_hash_e_manifest` —
+  `"Line A  \r\nLine B"` vs. `"Line A\nLine B"`. **Ajuste de escopo em relação ao pedido
+  literal:** comparar `manifest_hash` entre duas entradas *diferentes* (título cru vs.
+  título já normalizado, cada uma sua própria `ContextRegistryEntry`) não podia dar
+  igual — `entry_id` é semanticamente relevante em `manifest_hash` (por design, coberto
+  por `test_manifest_hash_ignora_id_task_id_e_created_at`, que testa o oposto: `id`,
+  `task_id`, `created_at` **não** entram). O teste ficou em duas camadas: (1)
+  `compute_content_hash` chamado diretamente com as duas formas do título, sem banco,
+  produz o mesmo hash; (2) uma entrada real com o título cru — `entry.content_hash` e
+  `manifest.entries[0]["title"]` concordam com o que as funções puras produziriam
+  isoladamente.
+- `test_medicao_usa_a_representacao_final_normalizada_e_redigida` — corpo com caractere
+  combinante repetido, `transformations=(REDACT,)` (sem `NORMALIZE`): `approx_tokens`
+  mede exatamente `RenderedBlock.text`, nunca uma forma intermediária.
+
+### GRUPO C — AUD-008: `exact_literal_match`
+
+`SCORE_EXACT_LITERAL_MATCH = 131` — a menor margem inteira que garante vencer **qualquer**
+combinação de `SCORE_SOURCE_REF_OVERLAP + PROXIMITY_MAX` (100 + 30 = 130) sozinho.
+`_has_exact_literal_match` verifica, por comparação de string (nunca resolução contra
+`base_commit`), se algum `source_ref` compilado da entrada é **literal**
+(`CompiledSourceRef.literal`, sem metacaractere de glob) e seu `.normalized` é exatamente
+um `candidate_path`. Um `source_ref` glob que resolve para um único arquivo não conta —
+`.literal` é `False`. Um `source_ref` literal que não bate **nenhum** candidato também não
+conta — não é "todos os refs são literais", é match contra um candidato específico.
+
+**Teste (reprodução exata):** `candidate_path = "src/new.py"`, inexistente no
+`base_commit`. Entrada A (`source_ref = "src/new.py"`, literal exato) contra entrada B
+(`source_ref = "src/**"`, glob com proximidade favorável) — domínio, tags e frescor
+mantidos **iguais** entre as duas de propósito, para que a vitória de A seja atribuível
+só a `exact_literal_match` contra a combinação overlap+proximidade de B, não a outro
+sinal variando por coincidência. `test_exact_literal_match_vence_glob_mesmo_sem_existir_no_commit`.
+Segundo teste, `test_exact_literal_match_exige_candidato_especifico_nao_so_ref_literal`,
+cobre o "não é só ser literal" explicitamente.
+
+### GRUPO D — AUD-005: desempate por microssegundo
+
+`epoch_seconds` (granularidade de segundo) renomeado para `epoch_microseconds`:
+`(days*86400 + seconds) * 1_000_000 + microseconds`. Sem isso, duas entradas que só
+diferiam em microssegundo empatavam no segundo inteiro e caíam para `entry_id` — que não
+tem relação nenhuma com recência. `ScoredEntry.updated_at_epoch` renomeado para
+`updated_at_epoch_us` (o nome antigo, mantido, teria escondido a mudança de unidade).
+Teste: mesmo score, mesmo segundo civil, microssegundo diferente — a mais recente vence
+(`test_desempate_por_microssegundo`).
+
+### GRUPO E — AUD-009: integridade do artifact antes de reaproveitar
+
+`render_context` lia só `target.exists()` antes de decidir não regravar — um arquivo com
+o nome certo (hash) mas conteúdo corrompido (cópia interrompida, disco, edição por
+engano) passava como "já existe, está correto" e o `rendered_context_hash` registrado
+deixava de corresponder ao que estava de fato em disco. `_matches_digest` lê os bytes
+reais (`"rb"`, o mesmo cuidado da escrita do outro lado da fronteira IO) e compara o
+sha256 deles ao hash esperado; só quando batem a escrita é pulada. Qualquer divergência —
+incluindo arquivo ilegível — é tratada como "não existe" e o artifact é regravado.
+
+Teste: escreve o artifact, corrompe os bytes no caminho exato do hash, chama
+`render_context` de novo com a mesma seleção — confirma que os bytes em disco voltam a
+bater com o hash e que `written=True` na segunda chamada (regravou, não confiou no
+`exists()` sozinho). `test_render_context_reescreve_artifact_corrompido`.
+
+### Gates
+
+- **Backend: 1056 passed / 6 skipped** (era 1044; +12 líquido em
+  `test_context_router_e5.py`, que foi de 33 para 45 testes — vários dos 33 antigos só
+  precisaram de ajuste de API, não são testes novos). `ruff check` · `ruff format --check`
+  · `mypy` limpos (75 arquivos).
+- `test_architecture.py` verde, incluindo
+  `test_context_engine_nao_importa_camadas_superiores` e
+  `test_gramatica_de_glob_tem_dono_unico`. Confirmado por análise estática dedicada
+  (script AST): nenhum arquivo de `context_engine/` importa `agent_runtime`,
+  `tool_executor`, `orchestrator`, `api`, `main`, `fastapi` ou `starlette`.
+- **Uma só** definição de `canonical_json`/`canonical_sha256`
+  (`app/safety/canonical.py`), confirmado por `grep`. Zero `json.dumps` fora dela em
+  `app/`.
+- **As nove reproduções rodaram contra a implementação anterior antes da correção**, fora
+  do working tree (reconstrução standalone das funções antigas, sem alterar nenhum
+  arquivo): confirmado que `hunter2` e `sk-1234567890ABCDEF` vazavam sob a serialização
+  JSON-antes-da-redação antiga, e que `café.py` em NFC/NFD colapsava no mesmo
+  `canonical_json` sob a ausência de `encode_path_identity`. As reproduções de AUD-005 e
+  AUD-009 são confirmadas por construção (o código antigo, lido nesta mesma sessão,
+  literalmente não tinha a lógica que os testes novos exigem).
+
+### As três "Pendência conhecida (E5)" nos documentos
+
+Todas as três substituídas por "Fechado na correção de auditoria da E5 (AUD-...)",
+apontando para o módulo/função e o teste que fecham cada uma —
+`docs/architecture/02-data-model.md` §7 e `docs/architecture/03-context-architecture.md`
+§4 (as duas notas de scoring/redação). `git diff` dos dois arquivos: só as três
+blockquotes substituídas, nenhuma outra linha tocada.
+
+### Decisões de implementação não 100% especificadas no prompt
+
+1. **`RenderedBlock(text, title)` em vez de `str`.** `render_block_text` precisava expor
+   o título redigido separadamente para propagá-lo a `ScoredEntry.title` sem reconstruir
+   a divisão de um blob combinado — mudança de assinatura não pedida explicitamente, mas
+   necessária para a exigência "o resultado redigido do título substitui o valor cru em
+   todo lugar".
+2. **Estrutura de `structured` no bloco emitido deixou de ser JSON com cerca de
+   markdown** e passou a ser linhas `caminho: valor` diretamente — [02]/[03] não impõem
+   schema nenhum ao texto de um bloco (é uma string opaca), e a reformatação de volta
+   para JSON depois da redação não tinha como preservar a garantia de "nunca duas
+   representações do mesmo valor" sem reintroduzir o bug.
+3. **A leitura de verificação para segredo partido usa contagem de redações
+   (`text.count(REDACTED)`), não diffing de span.** Uma técnica exata de span-tracking
+   sobre `redact()` (que só devolve string, não posições de match) seria
+   desproporcional; a contagem é uma heurística conservadora — na dúvida (colada acha
+   mais do que a soma das isoladas), redige tudo por inteiro. Mantém o princípio já
+   documentado do próprio `redact()`.
+4. **`excluded[].path_or_entry` só é pré-codificado quando `reason != budget`** — decisão
+   explícita para não misturar um UUID (imune a NFC/NFD) na pré-codificação que existe
+   especificamente para identidade de caminho.
+5. **`FILE_MAP_VERSION`/`MANIFEST_HASH_VERSION` avançaram para `2`** e
+   `RENDERER_VERSION` para `"e5.block.v2"` — nenhum documento fixa esses valores; são
+   marcadores de formato ([02] §7, "Versão") para que hashes desta versão não colidam
+   com uma versão futura que mude a forma de novo.
+
+### Pendências
+
+- Diff aguardando revisão de Pedro. **Nada commitado.** Segue para segunda rodada do
+  Codex, conforme instruído.
+- A discrepância sobre a auditoria "E5-AUD-001..009" inexistente no log está registrada
+  acima; nenhuma ação adicional tomada além de documentá-la e seguir com a especificação
+  técnica.
+
+---
+
+## 2026-09-09 — Codex — auditoria E5 rodada 2
+
+- Veredito: **NÃO GREEN** — E5-AUD2-001..005 (quatro Alta/P1, um Média/P2).
+- Relatório completo: [docs/audits/e5-round-2.md](docs/audits/e5-round-2.md).
+- Histórico disponível reconstruído em [docs/audits/e5-round-1.md](docs/audits/e5-round-1.md). Nenhum código corrigido; nenhum commit realizado.
+
+## 2026-09-09 — Claude Sonnet 5 (effort medium) — E5 (redesenho documental): redação em três camadas, substituindo a comparação de contagem
+
+Tarefa **SOMENTE DOCUMENTAÇÃO** — reescrita da seção de redação de
+`docs/architecture/03-context-architecture.md` §4 e nota nova em
+`docs/architecture/04-safety-and-git-runtime.md` §5, documentando o redesenho decidido
+nesta sessão em resposta aos cinco findings Alta/Média da rodada 2 de auditoria da E5
+(`docs/audits/e5-round-2.md`, E5-AUD2-001..005). `docs/` alterado com autorização
+explícita de Pedro nesta conversa, escopo restrito aos dois arquivos + este log.
+
+**Discrepância sinalizada:** o prompt pedia para ler "a decisão de redesenho desta
+sessão" no `AGENT_LOG.md` — não há entrada de planejamento registrada; a última entrada
+antes desta é o resultado da auditoria (rodada 2, NÃO GREEN). A especificação técnica do
+redesenho (as três camadas, o invariante, o fallback) veio completa e detalhada no
+próprio prompt desta tarefa, então segui ela diretamente — não há decisão anterior
+faltando para o trabalho, só a entrada de log que a nomeasse como tal.
+
+Também note-se: `safety.is_sensitive_key`/`safety.detect_secret_spans`, citadas na nova
+seção e na nota do §5, **ainda não existem em código** — esta tarefa é só documentação
+do redesenho pretendido; implementá-las é trabalho de uma próxima sessão de código.
+
+### Arquivos alterados
+
+- `docs/architecture/03-context-architecture.md` §4 — **reescrita** (não só adição) do
+  bloco sobre redação no renderizador:
+  - **Removido:** o parágrafo "Ordem da redação em relação à formatação estrutural"
+    (versão anterior, que só afirmava "roda sobre representação plana", sem mecanismo);
+    o blockquote "Pendência conhecida (E5)" correspondente (já obsoleto — a rodada 1
+    achou fechado, a rodada 2 achou reaberto); e o parágrafo "Fechado na correção de
+    auditoria da E5 (AUD-002/003/004)" que descrevia a abordagem de **comparação de
+    contagem de redações** (leitura colada vs. soma de leituras isoladas) —
+    abandonada porque `E5-AUD2-001` provou que ela não isola a fronteira certa quando
+    há um campo adicional ou uma folha interposta.
+  - **Adicionado:** a descrição das três camadas independentes — estrutural
+    (`is_sensitive_key` marca subárvore inteira, chave insegura vira marcador fixo,
+    nunca reconstrução parcial — fecha `E5-AUD2-003`/`004`), posicional
+    (`detect_secret_spans` sobre uma projeção plana única, com mapa de posição de volta
+    — fecha `E5-AUD2-001`), e propagação (valor já comprovado sensível é redigido em
+    toda ocorrência literal, escalares genéricos excluídos do conjunto — fecha
+    `E5-AUD2-002`). Mais o invariante ("nenhum dado autoral cru reaparece em nenhuma
+    superfície emitida", framing depois da redação, medição depois do framing final —
+    isto último fecha `E5-AUD2-005`/reabertura de `AUD-007`) e o fallback fail-closed
+    (estrutura não redigível com prova suficiente → redige por inteiro ou recusa,
+    nunca melhor esforço).
+  - A seção de `exact_literal_match` (linhas ~245–255) aparece no `git diff` mas **não
+    foi tocada nesta tarefa** — é herança não commitada da sessão anterior (correção
+    dos 9 findings da rodada 1), que trocou o blockquote "Pendência conhecida" daquele
+    sinal por "Fechado na correção". Ver a seção "Gate" abaixo para a distinção exata.
+- `docs/architecture/04-safety-and-git-runtime.md` §5 — nota breve logo após a tabela
+  de três camadas, na linha da Camada 3 (Saída): `safety/redaction.py` expõe, além de
+  `redact(text)`, `is_sensitive_key(key)` e `detect_secret_spans(text)` — mesmo motor,
+  reaproveitado pelo Context Engine; nenhuma segunda lista/motor de regex.
+- `AGENT_LOG.md` — esta entrada.
+
+### Decisões tomadas: nenhuma nova de arquitetura
+
+Formalização documental do redesenho especificado no prompt desta sessão. As três
+camadas, o invariante e o fallback são exatamente os cinco pontos do prompt, em prosa
+consistente com o estilo do documento e ligados aos IDs de finding que cada um fecha.
+
+### GATE
+
+`git diff` dos dois arquivos colado na conversa. Resumo:
+
+- `docs/architecture/03-context-architecture.md`: dois hunks. O primeiro
+  (`exact_literal_match`, linhas ~245–255) é herança não commitada da sessão anterior,
+  não tocada aqui. O segundo é o trabalho desta tarefa: substitui dois parágrafos +
+  um blockquote pela descrição das três camadas + invariante + fallback + referência
+  cruzada para `04` §5.
+- `docs/architecture/04-safety-and-git-runtime.md`: um hunk, só adição — quatro linhas
+  novas depois da tabela de três camadas de proteção de segredos, nenhuma linha
+  removida ou alterada.
+
+### Pendências
+
+- Diff aguardando revisão de Pedro. **Nada commitado.**
+- `is_sensitive_key`/`detect_secret_spans` documentadas mas **não implementadas** —
+  próxima sessão de código precisa: (1) criá-las em `safety/redaction.py`; (2)
+  redesenhar `render_block_text` para as três camadas descritas; (3) rodar a suíte de
+  ataques da rodada 2 (`E5-AUD2-001..005`) como regressão; (4) terceira rodada de
+  auditoria antes de qualquer commit.
+
+---

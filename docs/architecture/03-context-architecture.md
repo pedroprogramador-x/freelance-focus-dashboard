@@ -242,11 +242,17 @@ Este sinal existe para garantir que uma referência precisa nunca perca para um 
 por causa de proximidade de file map — precisão de match é distinta de cobertura de
 arquivos.
 
-> **Pendência conhecida (E5):** `select_context` ainda **não** implementa
-> `exact_literal_match` como sinal separado — a sobreposição atual (`source_ref_overlap`,
-> peso 100) é binária e não distingue match literal exato de match por glob largo. Formalizar
-> este sinal aqui antecipa a correção; nenhuma auditoria da E5 rodou ainda para confirmá-la
-> como finding.
+**Fechado na correção de auditoria da E5 (AUD-008).** `SCORE_EXACT_LITERAL_MATCH = 131`
+(`app/context_engine/selection.py`) — a menor margem inteira que garante vencer qualquer
+combinação de `SCORE_SOURCE_REF_OVERLAP + PROXIMITY_MAX` (100 + 30 = 130) sozinho. Dispara
+quando algum `source_ref` da entrada é padrão **literal** (`CompiledSourceRef.literal`,
+sem metacaractere de glob) e seu valor normalizado é exatamente um `candidate_path` — por
+comparação de string, nunca por resolução contra `base_commit`; um candidato que não
+existe na árvore ainda dispara o sinal. Testado com `candidate_path = "src/new.py"`
+inexistente no commit, entrada A (`source_ref` literal igual ao candidato) contra entrada
+B (`source_ref = "src/**"`, com proximidade favorável e domínio/tags/frescor idênticos a
+A): `test_exact_literal_match_vence_glob_mesmo_sem_existir_no_commit`, em
+`api/tests/test_context_router_e5.py`.
 
 Entradas `domain = objective` são sempre incluídas. O corte é por orçamento
 (`max_context_tokens`); o que não coube entra em `excluded` com `reason = budget`, para que
@@ -263,18 +269,76 @@ O renderizador transforma a seleção no payload final e grava um snapshot imut�
 blocos na ordem emitida, origem de cada bloco, truncamentos, transformações aplicadas,
 tamanhos e `renderer_version`. A redação de segredos é aplicada **antes** do hash.
 
-**Ordem da redação em relação à formatação estrutural.** A redação de segredos roda sobre
-uma representação **plana** de todo o conteúdo autoral (título + corpo + `structured`
-linearizado), **antes** de qualquer formatação estrutural (JSON, markdown, framing).
-Cópias do título/metadado que se propagam para `origin`/manifest devem refletir o
-resultado já redigido — nunca o valor autoral cru em paralelo.
+**Redação no renderizador — três camadas independentes, não uma comparação de
+contagem.** Duas rodadas de auditoria da E5 ([e5-round-1](../audits/e5-round-1.md),
+[e5-round-2](../audits/e5-round-2.md)) sucessivamente reprovaram abordagens que
+tentavam decidir "isto é segredo?" olhando o texto já linearizado e comparando *quantas*
+redações uma leitura combinada revela contra a soma de leituras isoladas
+(`E5-AUD2-001`): um campo `password` adicional, ou uma folha interposta entre duas
+metades de um mesmo token, mascarava a contagem sem proteger nada. A segunda rodada
+também encontrou chave-como-segredo reemitida crua (`E5-AUD2-003`), contêiner sob uma
+chave sensível perdendo a classificação (`E5-AUD2-004`) e cópia do mesmo valor
+sobrevivendo em outro campo — inclusive no título propagado para o manifest
+(`E5-AUD2-002`). A causa comum: nenhuma dessas versões tinha uma noção **estrutural**
+de "isto pertence a um segredo" — só comparações locais de texto já achatado.
 
-> **Pendência conhecida (E5):** `render_block_text` aplica `canonical_json` a `structured`
-> (formatação estrutural) **antes** de invocar `redact()` sobre o texto concatenado —
-> a ordem inversa da descrita acima. Na prática o redator ainda encontra o segredo porque
-> opera por regex sobre a string inteira, mas a implementação não segue a garantia mais
-> forte de "plano antes de estruturado" que este parágrafo formaliza; é um ajuste a fazer
-> em código, não um padrão já resolvido.
+O desenho substitui a comparação de contagem por três camadas que rodam em sequência,
+cada uma resolvendo uma classe de vazamento que a anterior não cobre:
+
+1. **Camada estrutural.** `structured` é percorrido como **árvore**, antes de qualquer
+   linearização em texto. Uma chave que `safety.is_sensitive_key` classifica como
+   sensível marca **toda a subárvore descendente** como sensível — independente de
+   profundidade, de a chave estar sob uma lista (`password[0]`), um objeto aninhado
+   (`password.current`) ou qualquer chave intermediária no caminho. Toda folha dessa
+   subárvore é redigida **incondicionalmente**, sem depender de o valor "parecer" um
+   segredo. Se a própria chave for insegura para apresentar (contém sequência que
+   quebraria o parser de exibição — ex.: um separador reservado do formato de
+   linearização), o rótulo emitido é um marcador fixo, **nunca** uma reconstrução
+   parcial da chave original: reconstruir parcialmente foi exatamente o que devolvia o
+   segredo pela chave em `E5-AUD2-003`.
+2. **Camada posicional.** Depois da camada estrutural, `título` + `corpo` + as folhas de
+   `structured` (na ordem canônica) formam uma **projeção plana determinística**, com um
+   mapa de posição de volta para cada fragmento de origem. `safety.detect_secret_spans`
+   roda **uma única vez** sobre essa projeção — nunca uma comparação de contagem entre
+   leituras separadas — e cada span detectado é projetado de volta para os fragmentos
+   que ele atravessa, marcando-os para redação. É esta camada que resolve o segredo
+   partido entre `body` e uma folha de `structured` (`E5-AUD2-001`): a detecção enxerga
+   a projeção inteira de uma vez, então um token dividido entre dois campos aparece
+   como um span só, não como dois fragmentos que precisam concordar sobre uma contagem.
+3. **Camada de propagação.** Depois das duas camadas acima, os valores textuais **já
+   comprovadamente sensíveis** (pela estrutura ou pela posição) são reunidos num
+   conjunto; qualquer ocorrência **literal** de um desses valores em `título`, `corpo`
+   ou `structured` é redigida — mesmo numa ocorrência sem rótulo de chave sensível
+   naquele local específico. É o que fecha `E5-AUD2-002`: o mesmo valor de `password`
+   copiado para `body` ou para outro campo, ou para o `título`, é redigido lá também,
+   porque já é conhecido como sensível — não porque aquela ocorrência específica
+   "pareceu" um segredo. **Escalares genéricos** (número, booleano, `null`) **não**
+   entram neste conjunto de propagação global — só são redigidos localmente, se
+   estiverem sob uma subárvore marcada sensível pela camada 1; um `3` ou um `true`
+   comuns não viram gatilho para redigir todo `3` ou `true` que aparecer em outro lugar.
+
+**Invariante.** Depois de as três camadas produzirem a representação redigida, nenhum
+dado autoral cru pode reaparecer em `blocks[].text`, `blocks[].origin.title`,
+`ContextManifest.entries[].title`, `structured` renderizado, ou qualquer metadado
+autoral equivalente. Framing e formatação estrutural (o cabeçalho fixo, a ordem dos
+blocos) vêm **depois** da redação, nunca antes — formatar antes é o que quebrava a
+adjacência que o padrão `password: valor` precisa, na primeira versão desta correção.
+Medição de tamanho (`total_chars`/`approx_tokens`) vem depois do **framing final**,
+sobre exatamente a representação que será persistida — nunca sobre uma forma
+intermediária que a serialização final ainda vai transformar (`E5-AUD2-005`, a
+reabertura de `AUD-007`: medir antes de `canonical_json` aplicar NFC produzia uma
+contagem que não batia com os bytes gravados).
+
+**Fallback fail-closed.** Se uma estrutura não puder ser linearizada, mapeada ou
+redigida com prova suficiente de segurança pelas três camadas, o bloco ou a subárvore
+envolvida é redigido por completo, ou a renderização é recusada — nunca uma heurística
+de melhor esforço que arrisca emitir metade de um segredo por não saber o que fazer com
+o resto.
+
+`is_sensitive_key`/`detect_secret_spans` são API pura de `safety.redaction`
+([04](04-safety-and-git-runtime.md) §5) — o mesmo motor de detecção de `redact()`,
+reaproveitado aqui, nunca uma segunda lista de nomes sensíveis ou um segundo motor de
+regex dentro de `context_engine`.
 
 Estrutura e propriedades em [02](02-data-model.md) §5. O ponto essencial: por ser um
 **snapshot**, ele responde *"qual conhecimento o Developer recebeu?"* mesmo depois de a

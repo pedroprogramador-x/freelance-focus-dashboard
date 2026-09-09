@@ -290,6 +290,11 @@ instrução**: nada ali eleva permissão.
 | **2 — Acesso** | `safety` + `path_runtime` + `ToolExecutor` | Nega leitura e escrita de path da denylist, para qualquer operação mediada |
 | **3 — Saída** | `safety.redact` | Texto que sai do backend — resposta JSON, log, `summary`, `error_summary`, diff — passa pelo redator |
 
+`safety/redaction.py` expõe, além de `redact(text)`, a API pura `is_sensitive_key(key)` e
+`detect_secret_spans(text)` — mesmo motor de detecção, reaproveitado pelo Context Engine
+(E5) para redação estrutural/posicional ([03](03-context-architecture.md) §4). Nenhuma
+segunda lista de nomes sensíveis ou segundo motor de regex existe.
+
 **Denylist inicial** `.env*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`, `id_ed25519*`,
 `.npmrc`, `.pypirc`, `.git-credentials`, `.aws/**`, `.ssh/**`, `secrets/**`,
 `**/credentials*`, `**/*secret*`.
