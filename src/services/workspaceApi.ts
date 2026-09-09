@@ -89,7 +89,10 @@ export function __resetSessionTokenCache(): void {
   cachedToken = undefined
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+// Exportado para `contextApi.ts` reusar exatamente o mesmo transporte: leitura do token,
+// cabeçalhos, guarda de modo hospedado e tradução de erro. Uma segunda implementação de
+// `fetch` no frontend seria uma segunda chance de esquecer o `Authorization`.
+export async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
   if (!isWorkspaceModeEnabled()) {
     throw new WorkspaceApiError(
       'workspace_mode_disabled',
@@ -127,30 +130,30 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export function listWorkspaces(status?: WorkspaceStatus): Promise<Workspace[]> {
   const query = status ? `?status=${status}` : ''
-  return request<Workspace[]>(`/workspaces${query}`)
+  return apiRequest<Workspace[]>(`/workspaces${query}`)
 }
 
 export function createWorkspace(input: WorkspaceCreateInput): Promise<Workspace> {
-  return request<Workspace>('/workspaces', { method: 'POST', body: JSON.stringify(input) })
+  return apiRequest<Workspace>('/workspaces', { method: 'POST', body: JSON.stringify(input) })
 }
 
 export function patchWorkspaceStatus(id: string, status: WorkspaceStatus): Promise<Workspace> {
-  return request<Workspace>(`/workspaces/${encodeURIComponent(id)}`, {
+  return apiRequest<Workspace>(`/workspaces/${encodeURIComponent(id)}`, {
     method: 'PATCH',
     body: JSON.stringify({ status }),
   })
 }
 
 export function getGitPreflight(id: string): Promise<GitPreflight> {
-  return request<GitPreflight>(`/workspaces/${encodeURIComponent(id)}/git`)
+  return apiRequest<GitPreflight>(`/workspaces/${encodeURIComponent(id)}/git`)
 }
 
 export function getPurgePreview(id: string): Promise<PurgePreview> {
-  return request<PurgePreview>(`/workspaces/${encodeURIComponent(id)}/purge-preview`)
+  return apiRequest<PurgePreview>(`/workspaces/${encodeURIComponent(id)}/purge-preview`)
 }
 
 export function purgeWorkspace(id: string, purgeToken: string): Promise<PurgeCounts> {
-  return request<PurgeCounts>(`/workspaces/${encodeURIComponent(id)}/purge`, {
+  return apiRequest<PurgeCounts>(`/workspaces/${encodeURIComponent(id)}/purge`, {
     method: 'POST',
     body: JSON.stringify({ purge_token: purgeToken }),
   })

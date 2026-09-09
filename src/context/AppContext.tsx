@@ -96,7 +96,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
 // Contexto e hook ficam juntos para manter a API pública de estado em um único módulo.
 // eslint-disable-next-line react-refresh/only-export-components
 export function useApp() {
-  const context = useContext(AppContext)
+  const context = useOptionalApp()
   if (!context) throw new Error('useApp precisa estar dentro de AppProvider')
   return context
+}
+
+// Variante que devolve `null` fora do provider, em vez de lançar.
+//
+// Existe para a área do AI Dev Workspace, que é **independente** do domínio comercial
+// (ADR-0002): ela precisa funcionar sem os dados comerciais carregados, e o único ponto em
+// que os dois se encontram é o import do seed de planejamento — uma conveniência opcional,
+// não uma dependência. Sem `null`, essa área passaria a exigir o provider comercial só para
+// desenhar uma tela que na maior parte do tempo não usa nada dele.
+// eslint-disable-next-line react-refresh/only-export-components
+export function useOptionalApp() {
+  return useContext(AppContext)
 }

@@ -68,10 +68,13 @@ afterEach(() => {
 })
 
 describe('WorkspaceDetail — abas', () => {
-  it('mostra Contexto e Tarefas desabilitadas com indicação de fase futura', async () => {
+  // A aba Contexto passou a ser habilitada na E4 (Context Registry). Tarefas continua em
+  // fase futura (E6), e é ela que mantém a cobertura do estado desabilitado.
+  it('habilita Contexto e mantém Tarefas em fase futura', async () => {
     installRouter((method, path) => {
       if (path === '/workspaces') return { body: [] }
       if (path === '/workspaces/w1/git') return { body: { is_git_repo: false, head: null, branch: null, dirty_file_count: null } }
+      if (path === '/workspaces/w1/context') return { body: [] }
       return { status: 404, body: {} }
     })
 
@@ -79,9 +82,26 @@ describe('WorkspaceDetail — abas', () => {
 
     const contexto = await screen.findByRole('tab', { name: /Contexto/ })
     const tarefas = screen.getByRole('tab', { name: /Tarefas/ })
-    expect(contexto).toBeDisabled()
+    expect(contexto).toBeEnabled()
     expect(tarefas).toBeDisabled()
-    expect(within(contexto).getByText('· fase futura')).toBeInTheDocument()
+    expect(within(tarefas).getByText('· fase futura')).toBeInTheDocument()
+  })
+
+  it('troca para o painel de contexto ao clicar na aba', async () => {
+    installRouter((method, path) => {
+      if (path === '/workspaces') return { body: [] }
+      if (path === '/workspaces/w1/git') return { body: { is_git_repo: false, head: null, branch: null, dirty_file_count: null } }
+      if (path === '/workspaces/w1/context') return { body: [] }
+      return { status: 404, body: {} }
+    })
+
+    renderDetail(workspaceFixture())
+
+    fireEvent.click(await screen.findByRole('tab', { name: /Contexto/ }))
+
+    expect(await screen.findByText('Contexto do workspace')).toBeInTheDocument()
+    // o painel de visão geral saiu de cena
+    expect(screen.queryByText('Git preflight')).not.toBeInTheDocument()
   })
 })
 

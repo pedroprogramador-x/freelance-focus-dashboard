@@ -2,11 +2,12 @@ import { ArrowLeft, GitBranch, Loader2, ShieldAlert } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { Modal } from '../components/Modal'
 import { useWorkspaces } from '../context/WorkspaceProvider'
+import { messageOf } from '../utils/contextEntries'
+import { ContextTab } from './WorkspaceContext'
 import {
   getGitPreflight,
   getPurgePreview,
   purgeWorkspace,
-  WorkspaceApiError,
   type GitPreflight,
   type PurgePreview,
   type Workspace,
@@ -16,7 +17,8 @@ type WorkspaceTab = 'overview' | 'context' | 'tasks'
 
 const TABS: { id: WorkspaceTab; label: string; enabled: boolean }[] = [
   { id: 'overview', label: 'Visão geral', enabled: true },
-  { id: 'context', label: 'Contexto', enabled: false },
+  // Ativa a partir da E4 (Context Registry). Tarefas continuam em fase futura (E6).
+  { id: 'context', label: 'Contexto', enabled: true },
   { id: 'tasks', label: 'Tarefas', enabled: false },
 ]
 
@@ -28,12 +30,6 @@ const PURGE_ROWS: { key: keyof PurgePreview; label: string }[] = [
   { key: 'manifests', label: 'Manifests' },
   { key: 'artifacts', label: 'Artefatos' },
 ]
-
-function messageOf(error: unknown): string {
-  if (error instanceof WorkspaceApiError) return error.message
-  if (error instanceof Error) return error.message
-  return 'Erro inesperado.'
-}
 
 function GitPreflightCard({ workspaceId }: { workspaceId: string }) {
   const [state, setState] = useState<
@@ -234,17 +230,20 @@ export function WorkspaceDetail({ workspace, onBack }: { workspace: Workspace; o
       </div>
 
       <section role="tabpanel">
-        <div className="workspace-overview-grid">
-          <GitPreflightCard workspaceId={workspace.id} />
-          {workspace.status === 'archived' ? (
-            <PurgePanel workspace={workspace} onPurged={onBack} />
-          ) : (
-            <section className="card">
-              <h3><ShieldAlert size={16} /> Purga destrutiva</h3>
-              <p>Arquive o workspace antes de poder purgá-lo.</p>
-            </section>
-          )}
-        </div>
+        {tab === 'overview' && (
+          <div className="workspace-overview-grid">
+            <GitPreflightCard workspaceId={workspace.id} />
+            {workspace.status === 'archived' ? (
+              <PurgePanel workspace={workspace} onPurged={onBack} />
+            ) : (
+              <section className="card">
+                <h3><ShieldAlert size={16} /> Purga destrutiva</h3>
+                <p>Arquive o workspace antes de poder purgá-lo.</p>
+              </section>
+            )}
+          </div>
+        )}
+        {tab === 'context' && <ContextTab workspaceId={workspace.id} />}
       </section>
     </div>
   )

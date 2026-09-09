@@ -14,7 +14,13 @@ from pathlib import Path
 
 import pytest
 
-from app.git_runtime import _GIT_ENV_OVERRIDES, GitPreflight, _git_env, preflight
+from app.git_runtime import (
+    _GIT_ENV_OVERRIDES,
+    _READONLY_GIT_OPTIONS,
+    GitPreflight,
+    _git_env,
+    preflight,
+)
 
 _GIT = shutil.which("git")
 _NEEDS_GIT = pytest.mark.skipif(_GIT is None, reason="git indisponível no PATH")
@@ -179,14 +185,20 @@ def test_git_env_e_exatamente_a_allowlist() -> None:
 def test_preflight_passa_travas_de_somente_leitura(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Toda invocação real do git leva `-c core.fsmonitor=false` e o env de `_git_env()`."""
+    """Toda invocação real leva **o bloco inteiro** de `-c` e o env de `_git_env()`.
+
+    A asserção é por **igualdade** do prefixo do `argv`, não por "contém `core.fsmonitor`"
+    (E4-AUD2). A versão anterior olhava só `argv[1:3]`, então bastava a primeira opção estar
+    certa: acrescentar ou remover qualquer outra passava batido — inclusive as três que
+    fixam a base de caminho, cuja ausência é um falso `fresh`.
+    """
     calls: list[tuple[list[str], dict[str, str]]] = []
 
-    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
         env = kwargs.get("env")
         assert isinstance(env, dict)
         calls.append((list(argv), dict(env)))
-        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="true\n", stderr="")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout=b"true\n", stderr=b"")
 
     monkeypatch.setattr("app.git_runtime.subprocess.run", fake_run)
 
@@ -195,7 +207,7 @@ def test_preflight_passa_travas_de_somente_leitura(
     expected_env = _git_env()
     assert calls, "preflight não chamou o git"
     for argv, env in calls:
-        assert argv[1:3] == ["-c", "core.fsmonitor=false"], argv
+        assert argv[1 : 1 + len(_READONLY_GIT_OPTIONS)] == list(_READONLY_GIT_OPTIONS), argv
         assert "-C" in argv
         # o env passado ao subprocess é EXATAMENTE o produzido por `_git_env`
         assert env == expected_env

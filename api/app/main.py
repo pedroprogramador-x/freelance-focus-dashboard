@@ -18,8 +18,8 @@ Superfície HTTP desta fase, e nada além:
 OpenAPI, Swagger e ReDoc estão **desligados**. Eles seriam superfícies públicas
 adicionais, e [06] §1 admite exatamente uma.
 
-Fora do escopo da E2, deliberadamente: Workspace Registry (E3), Context Registry (E4–E5),
-Orchestrator (E6), `ToolExecutor` e worktrees (E7), providers (E8+), streaming SSE (E11).
+Fora do escopo até aqui, deliberadamente: Context Router e file map (E5), Orchestrator
+(E6), `ToolExecutor` e worktrees (E7), providers (E8+), streaming SSE (E11).
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app import __version__
-from app.api import health, web, workspaces
+from app.api import context, health, web, workspaces
 from app.api.security import (
     extract_bearer_token,
     generate_session_token,
@@ -42,6 +42,7 @@ from app.api.security import (
     token_is_valid,
 )
 from app.config import AppSettings, get_settings
+from app.context_engine import ContextError
 from app.db.session import create_engine, create_session_factory
 from app.safety import redact
 from app.workspace import PurgeTokenStore, WorkspaceError
@@ -61,13 +62,17 @@ async def _unhandled_exception_handler(_request: Request, exc: Exception) -> JSO
     )
 
 
-async def _workspace_error_handler(_request: Request, exc: Exception) -> JSONResponse:
-    """`WorkspaceError` → `{code, message}` no status que o domínio pediu ([06] §2).
+async def _domain_error_handler(_request: Request, exc: Exception) -> JSONResponse:
+    """Erro de domínio → `{code, message}` no status que o domínio pediu ([06] §2).
 
     O router não conhece HTTP status de erro: levanta a exceção tipada, e a tradução mora
     aqui, no composition root. Toda mensagem passa pelo redator ([06] §2).
+
+    Serve `WorkspaceError` (E3) e `ContextError` (E4) — as duas hierarquias têm a mesma
+    forma (`code`, `status_code`, `message`) de propósito, então um handler só basta e uma
+    feature nova não precisa de um ramo de `isinstance` novo.
     """
-    assert isinstance(exc, WorkspaceError)
+    assert isinstance(exc, WorkspaceError | ContextError)
     return JSONResponse(
         status_code=exc.status_code,
         content={"code": exc.code, "message": redact(exc.message)},
@@ -151,13 +156,15 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
     app.include_router(health.router, prefix="/api")
     app.include_router(workspaces.router, prefix="/api")
+    app.include_router(context.router, prefix="/api")
     app.include_router(web.router)
 
     assets_dir = active.web_assets_dir
     if assets_dir.is_dir():
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
-    app.add_exception_handler(WorkspaceError, _workspace_error_handler)
+    app.add_exception_handler(WorkspaceError, _domain_error_handler)
+    app.add_exception_handler(ContextError, _domain_error_handler)
     app.add_exception_handler(Exception, _unhandled_exception_handler)
     return app
 

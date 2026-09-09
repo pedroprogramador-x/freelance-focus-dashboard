@@ -21,8 +21,10 @@ from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import AppSettings
+from app.db.models import DevWorkspace
 from app.db.session import create_engine, create_session_factory
 from app.main import create_app
+from tests import context_helpers
 
 API_ROOT = Path(__file__).resolve().parents[1]
 
@@ -168,3 +170,39 @@ def supports_symlinks(tmp_path: Path) -> bool:
         if probe.is_symlink() or probe.exists():
             os.unlink(probe)
     return True
+
+
+# ---------------------------------------------------- E4: Context Registry (sub-etapas 4+)
+
+
+@pytest.fixture
+def repo_path(tmp_path: Path) -> Path:
+    """Workspace que **é** repositório git, com um commit inicial e nenhum segredo."""
+    root = tmp_path / "workspace"
+    context_helpers.init_repo(root)
+    context_helpers.write(root, "README.md", "# projeto\n")
+    context_helpers.write(root, "src/app.py", "print('ok')\n")
+    context_helpers.write(root, "src/util.py", "def util():\n    return 1\n")
+    context_helpers.write(root, "src/nested/deep.py", "DEEP = 1\n")
+    context_helpers.write(root, "config/settings.json", '{"a": 1}\n')
+    context_helpers.commit_all(root, "commit inicial")
+    return root
+
+
+@pytest.fixture
+def plain_path(tmp_path: Path) -> Path:
+    """Workspace que **não** é repositório git ([07] "Projeto criado do zero")."""
+    root = tmp_path / "sem-git"
+    root.mkdir()
+    (root / "arquivo.txt").write_text("x\n", encoding="utf-8")
+    return root
+
+
+@pytest.fixture
+def workspace(session: Session, repo_path: Path) -> DevWorkspace:
+    return context_helpers.make_workspace(session, repo_path)
+
+
+@pytest.fixture
+def workspace_sem_git(session: Session, plain_path: Path) -> DevWorkspace:
+    return context_helpers.make_workspace(session, plain_path, name="ws-sem-git")
