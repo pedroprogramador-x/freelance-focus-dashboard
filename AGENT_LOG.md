@@ -2606,3 +2606,94 @@ consistente com o estilo do documento e ligados aos IDs de finding que cada um f
   auditoria antes de qualquer commit.
 
 ---
+
+## 2026-09-10 — Claude Opus 5 (effort high) — E5: pipeline de redação em três camadas (implementação)
+
+Implementa o redesenho normativo de [03](docs/architecture/03-context-architecture.md) §4,
+fechando `E5-AUD2-001..005` da segunda auditoria. A abordagem de **contagem de matches**
+foi removida, não ajustada. **Nada commitado** — segue para a terceira rodada do Codex.
+
+- **Relatório técnico completo:**
+  [docs/audits/e5-round-3-implementation-notes.md](docs/audits/e5-round-3-implementation-notes.md)
+  — decisões não fixadas pela especificação, limiares, custo/tetos, limites residuais
+  declarados e o desvio de §2.5. Este log aponta para lá em vez de duplicar.
+
+- Arquivos alterados:
+  - `api/app/safety/redaction.py` — motor único: `detect_secret_spans` (cascata simulada
+    com mapa de volta para coordenadas do texto original), `is_sensitive_key`,
+    `SecretSpan`, `merge_spans`. `redact()` virou wrapper fino e continua **byte a byte
+    idêntico** (7.214 casos, 0 divergências contra a implementação anterior).
+  - `api/app/context_engine/rendering.py` — as três camadas (estrutural, posicional,
+    propagação), fail-closed, NFC final. `RENDERER_VERSION` → `e5.block.v3`.
+  - `api/tests/test_context_redaction_e5_round3.py` — **novo**, 24 testes adversariais.
+  - `api/tests/test_context_router_e5.py` — o teste de medição que a rodada 2 apontou como
+    insuficiente foi substituído por um que lê os **bytes gravados** do artifact.
+  - `api/tests/test_architecture.py` — duas travas novas de dono único da detecção.
+
+- Gates: **1080 passed / 6 skipped** (era 1056). `ruff` · `ruff format --check` · `mypy`
+  limpos. As 10 reproduções da rodada 2 confirmadas **falhando** contra a implementação
+  anterior e passando contra esta.
+
+- **Ponto que precisa de decisão de Pedro:** §2.5 do relatório. O texto normativo de
+  [03] §4 diz que `detect_secret_spans` roda "uma única vez" sobre a projeção;
+  implementado literalmente isso **não fecha** `E5-AUD2-001b` (folha interposta). A
+  implementação faz quatro leituras que alimentam um único conjunto de marcas, sem
+  nenhuma comparar quantidade com outra. Não alterei `docs/architecture/` — sem
+  autorização nesta tarefa.
+
+- Pendências: terceira rodada do Codex. Nada commitado.
+
+---
+
+## 2026-09-10 — Codex — auditoria E5 rodada 3
+
+- Veredito: **NÃO GREEN** — E5-AUD3-001..003 (uma Alta/P1 e duas Média/P2).
+- Relatório completo: [docs/audits/e5-round-3.md](docs/audits/e5-round-3.md). Recomendação do Foco 2: ajustar a implementação; decisão de política/documentação reservada a Pedro.
+- 168 regressões passaram; 10 provas independentes executadas. Nenhuma correção de código ou arquitetura; nenhum commit.
+## 2026-09-10 — Claude Sonnet 5 (effort medium) — E5 §4: formalização do mecanismo posicional e do trade-off de falso positivo
+
+Tarefa **SOMENTE DOCUMENTAÇÃO** — `docs/architecture/03-context-architecture.md` §4 (seção
+do redesenho de três camadas) e este log. Formaliza decisões já tomadas nesta sessão em
+resposta à [rodada 3 de auditoria](docs/audits/e5-round-3.md); não é decisão nova.
+
+- Arquivos alterados: `docs/architecture/03-context-architecture.md`, `AGENT_LOG.md`.
+
+- **O que foi substituído em §4:**
+  - O texto normativo da camada posicional que dizia "`safety.detect_secret_spans` roda
+    **uma única vez** sobre essa projeção". A implementação real (rodada 3) faz **várias
+    leituras** — fragmento isolado, linha `caminho: valor`, pares ordenados de fragmentos
+    colados, projeção canônica inteira — todas alimentando **um único conjunto monotônico
+    de marcas**. A garantia normativa passou a ser: *nenhuma leitura decide com base em
+    contagem relativa a outra* (era a comparação `glued_hits > isolated_hits` que as
+    rodadas 1 e 2 reprovaram), não "uma única chamada".
+
+- **O que foi adicionado em §4:**
+  - Parágrafo **"Trade-off aceito na V1 — falso positivo entre pares de fragmentos"**:
+    a leitura de pares pode redigir conteúdo legítimo quando duas strings públicas sem
+    relação formam, coladas, uma sequência que bate um padrão (`E5-AUD3-001`). A V1
+    aceita isso deliberadamente — falso positivo de redação é preferível a falso negativo
+    (credencial real no artifact, que entra no `execution_fingerprint`). Registrado
+    explicitamente que **não** se restringe a pares adjacentes nem se adiciona heurística
+    de confiança/comprimento, porque qualquer das duas reabriria `E5-AUD2-001b`.
+  - Parágrafo **"Explicabilidade planejada"**: redação por detecção cross-fragment será
+    registrada no metadado `transformations` já existente, sem expor o valor — só para
+    explicar, no futuro, por que um bloco veio redigido sem campo isolado com segredo.
+
+- **Pendências / concern sinalizado:** esta formalização cobre **só** a dimensão de
+  trade-off de `E5-AUD3-001` (over-redaction por pares). A rodada 3 também encontrou:
+  - **`E5-AUD3-002` (Alta/P1)** — vazamento real: um prefixo preservado (`Bearer `,
+    `password: `) em outro fragmento faz o motor reconhecer o segredo, mas o span cobre
+    só o valor a substituir, então `span.start < boundary < span.end` é falso e o
+    renderer **descarta a detecção**. O valor completo permanece nos bytes do artifact.
+    Isso é **bug de consumo de span no renderer**, não trade-off de política — precisa de
+    correção de código (`rendering.py`), não de documentação.
+  - **`E5-AUD3-003` (Média/P2)** — `_propagation_values` consulta `propagatable` ao
+    adicionar fragmento inteiro, mas **não** ao adicionar recorte de span local; um
+    número ≥6 dígitos sob chave sensível entra na propagação global por essa segunda
+    porta e apaga contagens públicas iguais. Também bug de código.
+  - Nenhum dos dois é fechado por esta tarefa. A rodada 3 continua **NÃO GREEN** até
+    `E5-AUD3-002` e `E5-AUD3-003` serem corrigidos no código.
+
+- Nada commitado.
+
+---

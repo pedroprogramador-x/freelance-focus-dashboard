@@ -297,14 +297,26 @@ cada uma resolvendo uma classe de vazamento que a anterior não cobre:
    parcial da chave original: reconstruir parcialmente foi exatamente o que devolvia o
    segredo pela chave em `E5-AUD2-003`.
 2. **Camada posicional.** Depois da camada estrutural, `título` + `corpo` + as folhas de
-   `structured` (na ordem canônica) formam uma **projeção plana determinística**, com um
-   mapa de posição de volta para cada fragmento de origem. `safety.detect_secret_spans`
-   roda **uma única vez** sobre essa projeção — nunca uma comparação de contagem entre
-   leituras separadas — e cada span detectado é projetado de volta para os fragmentos
-   que ele atravessa, marcando-os para redação. É esta camada que resolve o segredo
-   partido entre `body` e uma folha de `structured` (`E5-AUD2-001`): a detecção enxerga
-   a projeção inteira de uma vez, então um token dividido entre dois campos aparece
-   como um span só, não como dois fragmentos que precisam concordar sobre uma contagem.
+   `structured` (na ordem canônica) viram fragmentos, cada um com um mapa de posição de
+   volta para a sua origem. `safety.detect_secret_spans` é chamado sobre **várias
+   leituras** desses fragmentos, e todas alimentam **um único conjunto monotônico de
+   marcas de redação**:
+   - cada fragmento **isolado** — segredo autocontido num campo só;
+   - a linha `caminho: valor` reconstruída — a adjacência que o padrão `password: valor`
+     precisa, mapeada de volta **por posição**, nunca recortada por delimitador
+     (`E5-AUD2-003`);
+   - cada **par ordenado** de fragmentos colados sem separador — o segredo partido entre
+     dois campos, reconhecido mesmo quando a ordem canônica põe uma folha entre eles
+     (`E5-AUD2-001b`);
+   - a **projeção canônica inteira** — corridas contíguas cobrindo três ou mais
+     fragmentos.
+
+   A garantia que importa **não é "uma única chamada"** — é que **nenhuma leitura decide
+   com base em contagem relativa a outra**. Cada leitura só acrescenta marcas ao
+   conjunto; nenhuma olha quantas marcas outra fez. Foi a comparação de contagem entre
+   leituras (`glued_hits > isolated_hits`) que as rodadas 1 e 2 reprovaram: um campo a
+   mais ou uma folha interposta mascarava o número sem proteger nada. Um conjunto de
+   marcas que só cresce, alimentado pelo mesmo motor de detecção, não tem essa falha.
 3. **Camada de propagação.** Depois das duas camadas acima, os valores textuais **já
    comprovadamente sensíveis** (pela estrutura ou pela posição) são reunidos num
    conjunto; qualquer ocorrência **literal** de um desses valores em `título`, `corpo`
@@ -334,6 +346,30 @@ redigida com prova suficiente de segurança pelas três camadas, o bloco ou a su
 envolvida é redigido por completo, ou a renderização é recusada — nunca uma heurística
 de melhor esforço que arrisca emitir metade de um segredo por não saber o que fazer com
 o resto.
+
+**Trade-off aceito na V1 — falso positivo entre pares de fragmentos.** A leitura de
+pares (`E5-AUD2-001b`) concatena dois fragmentos que na verdade **não têm relação
+nenhuma**. Duas strings de conteúdo legítimo podem, por coincidência, formar uma
+sequência que bate um padrão de segredo quando coladas — um prefixo público num campo,
+uma sequência alfanumérica pública noutro — e o resultado é redação de conteúdo que não
+era sensível (`E5-AUD3-001`). A V1 **aceita esse risco deliberadamente**. A prioridade é
+explícita: um **falso positivo de redação** (perda de qualidade do contexto entregue ao
+Developer) é preferível a um **falso negativo** (vazamento de uma credencial real no
+Rendered Context Artifact, que entra no `execution_fingerprint` e sobrevive à exclusão
+da entrada de origem). **Não** se restringe a leitura a pares adjacentes, nem se
+introduz heurística de confiança ou de comprimento para decidir se um par "parece"
+credencial: qualquer uma das duas reabriria a classe que `E5-AUD2-001b` provou — um
+segredo genuinamente partido entre fragmentos que a ordem canônica não deixa vizinhos.
+O registry autoral cru nunca é alterado; o que se perde é conhecimento naquele bloco
+específico, recuperável reeditando a entrada.
+
+**Explicabilidade planejada.** Quando um bloco sofre redação **especificamente por
+detecção cross-fragment** — um span de reconhecimento que atravessa a fronteira entre
+dois fragmentos —, o bloco registra essa transformação no metadado `transformations` que
+já existe, **sem** expor o valor redigido nem o par que a disparou. É só para responder,
+no futuro, *por que* aquele bloco foi redigido quando nenhum campo isolado continha
+segredo — distinguir "coincidência de par" de "segredo autocontido" na hora de revisar
+um contexto que veio mais pobre do que o esperado.
 
 `is_sensitive_key`/`detect_secret_spans` são API pura de `safety.redaction`
 ([04](04-safety-and-git-runtime.md) §5) — o mesmo motor de detecção de `redact()`,
