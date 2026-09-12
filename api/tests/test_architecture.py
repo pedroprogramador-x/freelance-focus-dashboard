@@ -520,3 +520,58 @@ def test_backend_nao_conhece_o_dominio_comercial() -> None:
 def test_nenhum_shell_true() -> None:
     for path in ALL_FILES:
         assert "shell=True" not in path.read_text(encoding="utf-8")
+
+
+#: O dono único da detecção de segredo. Nenhum outro módulo compila padrão de segredo,
+#: lista nome sensível ou casa regex sobre conteúdo autoral.
+_REDACTION_OWNER = APP_ROOT / "safety" / "redaction.py"
+
+#: Assinaturas de padrão de segredo. Se aparecerem fora do dono, alguém escreveu um
+#: segundo motor de detecção — foi o defeito que a E5 fechou nas rodadas 1 e 2.
+_SECRET_PATTERN_SIGNATURES = (
+    "PRIVATE KEY",
+    "sk-ant-",
+    "AKIA",
+    "github_pat_",
+    r"gh[pousr]_",
+)
+
+
+def test_deteccao_de_segredo_tem_dono_unico() -> None:
+    """`safety/redaction.py` é o único lugar que reconhece segredo.
+
+    O Context Engine consome `is_sensitive_key`/`detect_secret_spans` e decide **o que
+    fazer** com o resultado (mapear de volta ao campo, propagar valor conhecido). Ele não
+    decide **o que é** segredo: uma segunda lista de nomes sensíveis ou um segundo
+    conjunto de regex divergiria da primeira exatamente como as duas gramáticas de glob
+    divergiam antes de E2-AUD-003.
+    """
+    for path in ALL_FILES:
+        if path == _REDACTION_OWNER:
+            continue
+        fonte = path.read_text(encoding="utf-8")
+        for assinatura in _SECRET_PATTERN_SIGNATURES:
+            assert assinatura not in fonte, (
+                f"{_module_name(path)} contém a assinatura de padrão de segredo "
+                f"{assinatura!r}: reconhecer segredo pertence a safety/redaction.py"
+            )
+
+
+def test_context_engine_nao_casa_regex_sobre_conteudo_autoral() -> None:
+    """`context_engine/` não tem motor de casamento próprio para conteúdo autoral.
+
+    A exceção nomeada é `source_ref_expansion.py`, dono da gramática de glob — que casa
+    **caminho**, nunca texto de entrada. Qualquer `re.<casamento>` fora dele em
+    `context_engine/` é um segundo detector nascendo.
+    """
+    excecao = APP_ROOT / "context_engine" / "source_ref_expansion.py"
+
+    for path in (APP_ROOT / "context_engine").rglob("*.py"):
+        if path == excecao:
+            continue
+        casamentos = _re_matching_calls(path)
+        assert not casamentos, (
+            f"context_engine/{path.name} chama {sorted(casamentos)}: detecção sobre "
+            "conteúdo autoral pertence a safety/redaction.py "
+            "(`is_sensitive_key`/`detect_secret_spans`)"
+        )

@@ -2235,8 +2235,8 @@ dois arquivos abaixo.
 
 - **Discrepância sinalizada e corrigida durante a escrita:** o prompt afirmava, para a
   nota 1, "Ver E5 (file_map, `ContextManifest.source_files`) para o helper de referência"
-  — mas **esse helper não existe**. O código da E5 ([file_map.py](../api/app/context_engine/file_map.py),
-  [selection.py](../api/app/context_engine/selection.py)) coloca `path` como string crua
+  — mas **esse helper não existe**. O código da E5 ([file_map.py](api/app/context_engine/file_map.py),
+  [selection.py](api/app/context_engine/selection.py)) coloca `path` como string crua
   direto em `canonical_json`, sem nenhuma pré-codificação hex/base64: é exatamente a
   colisão NFC/NFD que a nota descreve, não um caso já resolvido. Removi a referência ao
   helper inexistente e documentei as três notas como **pendências conhecidas da E5** (blocos
@@ -2790,3 +2790,201 @@ commitado.**
     `recognition_span` ainda não representa lookaround. A norma foi escrita primeiro,
     de propósito: os três findings da rodada 4 seguem **abertos**.
   - Nada commitado. Commit desta documentação depende de autorização do Pedro.
+
+---
+
+## 2026-09-12 — Claude Opus 5 (effort high) — E5: fecha `E5-AUD4-001/002/003`
+
+Os três findings da [rodada 4](docs/audits/e5-round-4.md), que era **NÃO GREEN**. Implementa
+a norma escrita em [03](docs/architecture/03-context-architecture.md) §4 e commitada em
+`8f59cf7` — a documentação veio primeiro, de propósito. **Nada commitado**; segue para a
+quinta rodada do Codex.
+
+- **Relatório técnico completo:**
+  [docs/audits/e5-round-5-implementation-notes.md](docs/audits/e5-round-5-implementation-notes.md)
+  — inclui a revisão padrão a padrão do catálogo, por que `\b` ficou de fora, e três
+  limites que **esta** rodada piorou (§5).
+
+- Arquivos alterados:
+  - `api/app/safety/redaction.py` — `_PATTERNS` virou tupla de `_Pattern`, onde cada padrão
+    declara `prefix_preserving`, `lookbehind` e `lookahead`. `_recognition_window` amplia
+    `recognition_span` com o texto lido por lookaround positivo (fecha `E5-AUD4-003`).
+    `_validate_patterns` roda **no import** e recusa padrão com `(?<=`/`(?=` sem declaração.
+  - `api/app/context_engine/rendering.py` — `_is_greedy_extension` e `own_starts`
+    **removidos**, sem substituta (fecha `E5-AUD4-001`). `_clip` projeta a interseção de
+    `replacement_span` com cada fragmento; travessia não marca mais fragmento inteiro
+    (fecha `E5-AUD4-002`). `RENDERER_VERSION` → `e5.block.v5`.
+  - `api/tests/test_context_redaction_e5_round5.py` — **novo**, 44 testes.
+  - `api/tests/test_context_redaction_e5_round3.py` —
+    `test_segredo_no_fim_do_corpo_nao_apaga_o_titulo` **mudou de sinal** e virou
+    `..._consome_o_titulo_vizinho`: a over-redaction agora é o comportamento afirmado.
+  - `AGENT_LOG.md` — os dois links `../api/app/…` corrigidos para `api/app/…`.
+
+- Decisões tomadas:
+  - A trava do lookaround é **`ImportError` no boot**, não teste: quem acrescenta um padrão
+    novo não é quem lê a docstring do módulo.
+  - A cascata histórica de `redact()` foi escrita **dentro do teste, com os fontes dos
+    regex literais** — assim o GATE 1 trava também o catálogo, e o ensaio deixa de ser um
+    script de scratchpad (crítica justa do auditor nas rodadas 3 e 4).
+  - Os 22 cenários da varredura de bytes são **importados** do arquivo da rodada 4, não
+    copiados; somados aos 7 novos, a varredura cobre 29.
+
+- Gates: **1163 passed / 6 skipped (era 1119/6)**. `ruff` · `ruff format --check` · `mypy` limpos (76 arquivos).
+  GATE 1: 0 divergências em 5.800+ casos. GATE 2: 29 cenários, cada um sozinho e todos
+  juntos num arquivo físico, com `sha256` conferido.
+
+- Pendências: quinta rodada do Codex. Nada commitado. `E5-AUD3-001` segue como política
+  aceita, não corrigida.
+
+---
+
+## 2026-09-12 — Codex — auditoria independente E5, rodada 5
+
+- Relatório completo: [docs/audits/e5-round-5.md](docs/audits/e5-round-5.md).
+- **GREEN técnico sob a política V1.** E5-AUD4-001/002/003 fechados nas quatro
+  reproduções exatas, inclusive bytes do artifact e títulos de metadados.
+- **E5-AUD5-001, Média/P2, risco não bloqueante:** recorte público de seis caracteres
+  apagou 100 cópias distantes sem spans locais. Recomendação técnica: aceitar a
+  amplificação e manter a propagação; contraprova executada mostra que excluir os
+  recortes perde proteção de cópia de segredo genuinamente partido. Não substitui
+  a decisão de produto de Pedro.
+- Validação: **1163 passed / 6 skipped**, 15 provas independentes aprovadas;
+  Ruff, formatação e mypy limpos. Diferencial contra o HEAD histórico: **5.564 strings
+  únicas**, zero divergências UTF-8; essa é a contagem medida do corpus descrito
+  anteriormente como 5.800+. Quatro imports inválidos recusados em subprocess.
+- Somente relatório e esta entrada alterados pela auditoria no repositório.
+  Nenhuma correção de código, mudança de norma ou commit.
+
+---
+
+## 2026-09-12 — Claude Sonnet 5 (effort medium) — docs: registra E5-AUD5-001 como risco residual aceito
+
+Tarefa **somente de documentação**, depois da [rodada 5](docs/audits/e5-round-5.md)
+(**GREEN** para a política V1 documentada, com um risco novo classificado Média/P2 e
+recomendação explícita de aceitação). Formaliza em
+[03](docs/architecture/03-context-architecture.md) §4 o registro de `E5-AUD5-001`.
+**Nenhum código alterado, nada commitado.**
+
+- Arquivos alterados:
+  - `docs/architecture/03-context-architecture.md` — novo bloco em §4, logo após o
+    parágrafo de `E5-AUD4-002`, registrando `E5-AUD5-001`: um recorte curto
+    (6+ caracteres) nascido de fronteira entre fragmentos pode entrar na propagação
+    global e redigir toda ocorrência literal daquele texto **na mesma entrada/bloco**,
+    mesmo sendo conteúdo público — confirmado por auditoria com uma frase repetida 100
+    vezes redigida nas 100 ocorrências. Aceito pela mesma prioridade de `E5-AUD3-001`/
+    `E5-AUD4-001` (falso positivo aceitável, falso negativo não); excluir os recortes da
+    propagação perderia proteção real de cópias de segredo genuinamente partido,
+    também confirmado por auditoria. O raio de propagação é limitado à própria
+    entrada/bloco. Registra também um marcador de diagnóstico planejado,
+    `propagated_secret_redaction`, separado de `CROSS_FRAGMENT_REDACTION` — sem valor,
+    substring, posição ou hash reversível, só o fato (e, se o formato suportar, uma
+    contagem) de que a propagação foi acionada.
+  - `AGENT_LOG.md` — esta entrada.
+
+- Decisões tomadas:
+  - O bloco foi para logo depois do parágrafo de `E5-AUD4-002` — o limite da interseção
+    — e antes de "Explicabilidade planejada", porque `E5-AUD5-001` é um risco residual
+    da própria camada de propagação, não uma explicação do mecanismo de detecção
+    cross-fragment que o parágrafo seguinte já cobre.
+  - O marcador `propagated_secret_redaction` é registrado como **norma**, não como
+    implementação — o mesmo padrão que `CROSS_FRAGMENT_REDACTION` seguiu em
+    [03 §4] antes de existir em código. Nada em `rendering.py` foi tocado nesta tarefa.
+
+- Pendências:
+  - **Nada disso está implementado.** `transformations` ainda só conhece
+    `CROSS_FRAGMENT_REDACTION`; não há marcador de propagação nem contagem de
+    substituições no `RenderedBlock` atual.
+  - Nada commitado. Commit desta documentação depende de autorização do Pedro.
+
+---
+
+## 2026-09-12 — Claude Sonnet 5 (effort medium) — E5: marcador `PROPAGATED_SECRET_REDACTION` (`E5-AUD5-001`)
+
+Depois da [rodada 5](docs/audits/e5-round-5.md) (**GREEN** técnico; `E5-AUD5-001`
+classificado Média/P2 e recomendado para aceitação). Acrescenta um segundo marcador de
+diagnóstico a `blocks[].transformations`, conforme a norma já commitada em
+[03](docs/architecture/03-context-architecture.md) §4. **Só sinalização** — nenhuma
+lógica de detecção, propagação ou redação foi tocada. **Nada commitado**; segue para
+uma rechecagem curta do Codex.
+
+- **Relatório técnico completo:**
+  [docs/audits/e5-round-5-metadata-extension-notes.md](docs/audits/e5-round-5-metadata-extension-notes.md)
+  — inclui por que a contagem embutida (`"propagated_secret_redaction:3"`) foi
+  descartada, e um fixture que quase virou "bug" mas era a gulodice de alfabeto já
+  aceita em `E5-AUD4-001`.
+
+- Arquivos alterados:
+  - `api/app/context_engine/rendering.py` — `PROPAGATED_SECRET_REDACTION` novo, ao lado
+    de `CROSS_FRAGMENT_REDACTION`. `_redacted_text` passou a devolver
+    `tuple[str, bool]`: o texto é o mesmo de sempre, o booleano só relata se o laço de
+    propagação alterou aquele fragmento. `render_block_text` acrescenta o marcador
+    quando qualquer fragmento do bloco relatou `True`. `RENDERER_VERSION` **não**
+    avançou (o texto não mudou) — comentário registrando que `transformations` entra no
+    payload hasheado, então `rendered_context_hash` de blocos com propagação muda mesmo
+    sem bump de versão.
+  - `api/tests/test_context_redaction_e5_round5_metadata.py` — **novo**, 13 testes:
+    presença/ausência do marcador nos quatro cenários pedidos, os dois marcadores
+    coexistindo, prova de que nenhuma string de `transformations` contém segredo do
+    fixture (nas duas direções), e reconstrução independente do texto sem o booleano
+    para provar que nada além do metadado mudou.
+
+- Decisões tomadas:
+  - Sem contagem no marcador: uma string como `"propagated_secret_redaction:3"`
+    quebraria o idioma `MARCADOR in transformations` que a suíte inteira já usa para
+    `CROSS_FRAGMENT_REDACTION` (`in` e igualdade exata de lista), trocando comparação
+    simples por parsing em todo consumidor futuro — o ganho de diagnóstico não pareceu
+    justificar isso.
+
+- Gates: suíte de redação/determinismo das 5 rodadas (rounds 3, 4, 5, 5-metadata,
+  router) **132 passed**. Suíte completa: **1176 passed / 6 skipped (era 1163/6)**. `ruff` · `ruff format --check` ·
+  `mypy` limpos.
+
+- Pendências: rechecagem curta do Codex. Nada commitado. `E5-AUD5-001` segue como
+  política aceita — o marcador é diagnóstico, não correção.
+
+---
+
+## 2026-09-12 — Claude Sonnet 5 (effort low) — E5: `RENDERER_VERSION` → `e5.block.v6`
+
+Fecha a lacuna registrada no §6 das
+[notas da extensão de metadata](docs/audits/e5-round-5-metadata-extension-notes.md):
+`PROPAGATED_SECRET_REDACTION` entra em `transformations`, que participa do payload
+hasheado ([02] §5), então o bump segue o mesmo precedente já estabelecido nesta fase
+(`v1`→`v2` na troca de formato de `structured`, `v4`→`v5` na correção de
+`E5-AUD4-002`): qualquer mudança que afete o payload hasheado avança a constante, mesmo
+sem o texto visível mudar. **Nada commitado.**
+
+- Arquivos alterados:
+  - `api/app/context_engine/rendering.py` — `RENDERER_VERSION` = `"e5.block.v6"`.
+    Comentário reescrito: a nota "**não** avançou esta constante" saiu (não é mais
+    verdade); entrou a razão do bump e a referência ao precedente `v1`→`v2`.
+
+- Verificação:
+  - Nenhum teste fixava a string `"e5.block.v5"` (ou qualquer versão anterior) como
+    valor esperado — todos os consumidores (`manifest.py`, `test_context_router_e5.py`)
+    leem a constante `RENDERER_VERSION`, nunca o literal. Confirmado por busca antes de
+    editar; nenhum teste precisou de ajuste.
+  - Suíte completa: **1176 passed / 6 skipped**, igual à contagem anterior — o bump não
+    adiciona nem remove teste nenhum, só muda o valor gravado no manifest.
+  - `ruff` · `ruff format --check` · `mypy` limpos.
+
+- Pendências: nenhuma pendência nova. `E5-AUD5-001` segue como política aceita; o
+  marcador é diagnóstico, não correção. Nada commitado.
+
+---
+
+## 2026-09-12 — Codex — E5: rechecagem final de metadata e versão
+
+- Relatório: [docs/audits/e5-round-final.md](docs/audits/e5-round-final.md).
+- **GREEN — E5 pronta para commit e push.** Marcador de propagação presente nas 100
+  cópias, ausente sem propagação, coexistindo em ordem fixa com o de travessia.
+  Inspeção e ataques não encontraram dado sensível novo na metadata.
+- `e5.block.v6` confirmado. Diferencial de 31 entradas: texto integral UTF-8 idêntico
+  ao comportamento anterior reconstruído; só marcador/versão diferem no payload.
+- Suíte completa: **1176 passed / 6 skipped**, 532,31 s. Nove regressões direcionadas
+  dos findings Alta aprovadas; nove provas independentes aprovadas no agregado.
+- Fechamento: **5 rodadas + rechecagem final; 19 findings corrigidos**. E5-AUD3-001 é
+  política aceita; E5-AUD5-001 é risco residual aceito em [03 §4](docs/architecture/03-context-architecture.md),
+  limitado à mesma entrada/bloco e agora sinalizado, não corrigido.
+- Somente relatório e esta entrada alterados no repositório. Nenhum código corrigido,
+  commit ou push executado.

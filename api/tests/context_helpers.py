@@ -14,8 +14,15 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.db.enums import WorkspaceType
-from app.db.models import DevWorkspace
+from app.db.enums import (
+    ComplexityLevel,
+    ExecutionMode,
+    RiskLevel,
+    RiskSource,
+    TaskStatus,
+    WorkspaceType,
+)
+from app.db.models import DevWorkspace, WorkspaceTask
 from app.git_runtime import TreeListing, WorkingTreeListing
 from app.workspace import create_workspace
 
@@ -87,3 +94,43 @@ def readable(result: TreeListing | WorkingTreeListing | None) -> list[Any]:
     if isinstance(result, TreeListing):
         return list(result.files)
     return list(result.divergences)
+
+
+# --------------------------------------------------------------- E5: Context Router
+
+
+def make_task(session: Session, workspace: DevWorkspace, *, title: str = "task") -> WorkspaceTask:
+    """`WorkspaceTask` mínima criada **direto pela sessão de teste**, nunca pela API.
+
+    `ContextManifest.task_id` é FK obrigatória, e a E5 não introduz nenhum endpoint HTTP de
+    task: `freeze_manifest` é capacidade interna de `context_engine/`, consumida pelo
+    Orchestrator Planner só a partir da E6. Esta função existe **exclusivamente** para
+    satisfazer a FK nos testes e **não é caminho de produção** — nada aqui monta a máquina
+    de estados de [02] §4, que é assunto da E6.
+    """
+    task = WorkspaceTask(
+        workspace_id=workspace.id,
+        title=title,
+        goal="objetivo de teste",
+        status=TaskStatus.DRAFT,
+        risk=RiskLevel.LOW,
+        complexity=ComplexityLevel.LOW,
+        risk_source=RiskSource.HARD_RULE,
+        execution_mode=ExecutionMode.CLAUDE_ONLY,
+    )
+    session.add(task)
+    session.flush()
+    return task
+
+
+def head_of(root: Path) -> str:
+    """`HEAD` do repositório de teste, como SHA-1 completo."""
+    assert GIT is not None
+    result = subprocess.run(  # noqa: S603 — git de teste, argv literal, sem shell
+        [GIT, "rev-parse", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()

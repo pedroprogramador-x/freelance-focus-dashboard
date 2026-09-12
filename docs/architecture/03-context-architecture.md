@@ -389,6 +389,31 @@ inteiro. `recognition_span` decide participação/travessia; `replacement_span` 
 interseção por fragmento) decide o que efetivamente vira `«redigido»`. Um rótulo
 preservável (ex.: `password: `) fora da interseção nunca é apagado (`E5-AUD4-002`).
 
+**`E5-AUD5-001` — propagação cross-fragment pode causar over-redaction em escala.** Um
+recorte curto (6+ caracteres) nascido de uma fronteira entre fragmentos pode entrar no
+conjunto de propagação global e redigir toda ocorrência literal daquele texto dentro da
+**mesma** entrada/bloco — mesmo sendo conteúdo público sem relação com o segredo
+original. Confirmado por auditoria: uma frase pública repetida 100 vezes no mesmo bloco
+foi redigida nas 100 ocorrências.
+
+A V1 aceita esse risco conscientemente, pela mesma prioridade já declarada: falso
+positivo de redação (perda de qualidade do contexto) é aceitável; falso negativo
+(vazamento de segredo) não é. Excluir recortes cross-fragment da propagação removeria
+proteção real — confirmado por auditoria: um segredo partido entre corpo e uma folha
+distante só é protegido nessa cópia porque o recorte propaga.
+
+O raio de propagação é limitado à própria entrada/bloco — não existe propagação entre
+entradas diferentes nem pelo workspace inteiro.
+
+O efeito é sinalizado no metadado do artefato para diagnóstico: quando uma redação
+decorre de propagação (não de detecção direta no fragmento), o bloco registra um
+marcador em `transformations` (equivalente a `propagated_secret_redaction`), separado do
+marcador já existente de detecção cross-fragment (`CROSS_FRAGMENT_REDACTION`). O
+marcador nunca carrega o valor redigido, substring, posição, hash reversível ou qualquer
+dado que permita reconstruir o segredo — apenas o fato (e, se o formato suportar sem
+ampliar escopo, uma contagem numérica de substituições propagadas) de que o mecanismo
+foi acionado naquele bloco.
+
 **Explicabilidade planejada.** Quando um bloco sofre redação **especificamente por
 detecção cross-fragment** — um span de reconhecimento que atravessa a fronteira entre
 dois fragmentos —, o bloco registra essa transformação no metadado `transformations` que
