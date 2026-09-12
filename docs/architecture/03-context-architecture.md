@@ -317,6 +317,15 @@ cada uma resolvendo uma classe de vazamento que a anterior não cobre:
    leituras (`glued_hits > isolated_hits`) que as rodadas 1 e 2 reprovaram: um campo a
    mais ou uma folha interposta mascarava o número sem proteger nada. Um conjunto de
    marcas que só cresce, alimentado pelo mesmo motor de detecção, não tem essa falha.
+
+   **Os dois intervalos vêm do motor único.** `recognition_span` e `replacement_span`
+   são calculados juntos, no detector central (`safety.detect_secret_spans`), para
+   **todo** padrão do catálogo — incluindo os que usam lookbehind/lookahead (ex.:
+   `url_credentials`). `recognition_span` cobre o contexto completo exigido pela
+   detecção, inclusive o texto consumido só por asserções de largura zero, não apenas o
+   texto que `replacement_span` substitui. Esta distinção é responsabilidade do motor
+   único, não do renderer — nenhum padrão recebe tratamento especial fora de
+   `safety/redaction.py`.
 3. **Camada de propagação.** Depois das duas camadas acima, os valores textuais **já
    comprovadamente sensíveis** (pela estrutura ou pela posição) são reunidos num
    conjunto; qualquer ocorrência **literal** de um desses valores em `título`, `corpo`
@@ -362,6 +371,23 @@ credencial: qualquer uma das duas reabriria a classe que `E5-AUD2-001b` provou �
 segredo genuinamente partido entre fragmentos que a ordem canônica não deixa vizinhos.
 O registry autoral cru nunca é alterado; o que se perde é conhecimento naquele bloco
 específico, recuperável reeditando a entrada.
+
+**Extensão gulosa — a heurística que faltava foi removida, não substituída.**
+`_is_greedy_extension` foi removida (`E5-AUD4-001`). Ela tentava distinguir "segredo
+completo cuja extensão gulosa de regex avança sobre um fragmento vizinho legítimo" de
+"segredo genuinamente continuado no fragmento seguinte" usando um sinal (posição já era
+início de detecção isolada?) que se provou incapaz de diferenciar os dois casos sem
+heurística de confiança/comprimento — que a V1 explicitamente recusa introduzir.
+Consequência aceita: conteúdo adjacente a um segredo reconhecido que o padrão consumiria
+por gulodice de alfabeto agora **é** redigido, mesmo sendo conteúdo legítimo não
+relacionado. Isso estende a mesma prioridade já declarada para `E5-AUD3-001`:
+over-redaction é aceitável, vazamento parcial ou total de segredo não é.
+
+**Onde essa aceitação para — o rótulo preservável.** A emissão cross-fragment projeta a
+**interseção** do `replacement_span` com cada fragmento individual — nunca o fragmento
+inteiro. `recognition_span` decide participação/travessia; `replacement_span` (e sua
+interseção por fragmento) decide o que efetivamente vira `«redigido»`. Um rótulo
+preservável (ex.: `password: `) fora da interseção nunca é apagado (`E5-AUD4-002`).
 
 **Explicabilidade planejada.** Quando um bloco sofre redação **especificamente por
 detecção cross-fragment** — um span de reconhecimento que atravessa a fronteira entre

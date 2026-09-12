@@ -2697,3 +2697,96 @@ resposta à [rodada 3 de auditoria](docs/audits/e5-round-3.md); não é decisão
 - Nada commitado.
 
 ---
+
+## 2026-09-11 — Claude Opus 5 (effort high) — E5: correção de `E5-AUD3-002`/`E5-AUD3-003` + marcador de explicabilidade
+
+Fecha os dois defeitos de código da [rodada 3](docs/audits/e5-round-3.md) e acrescenta o
+marcador de explicabilidade que [03] §4 já documentava como planejado. `E5-AUD3-001`
+**não** foi corrigido — é o trade-off aceito e commitado em `9793c1a`. **Nada commitado**;
+segue para a quarta rodada do Codex.
+
+- **Relatório técnico completo:**
+  [docs/audits/e5-round-4-implementation-notes.md](docs/audits/e5-round-4-implementation-notes.md)
+  — inclui a decisão de §1.1 (manter marca inteira em vez de recorte cirúrgico) e o erro
+  que eu mesmo cometi na primeira versão da varredura de bytes.
+
+- Arquivos alterados:
+  - `api/app/safety/redaction.py` — `Interval` novo; `SecretSpan` passou a ter
+    `recognition_span` (match completo, com o contexto que prova a detecção) e
+    `replacement_span` (só o que vira `«redigido»`). `merge_spans`/`redact()` usam o
+    segundo e continuam **byte a byte idênticos** (7.552 casos, 0 divergências).
+  - `api/app/context_engine/rendering.py` — travessia de fronteira decidida por
+    `recognition_span` (fecha `E5-AUD3-002`); `propagatable` checado antes das **duas**
+    portas da propagação (fecha `E5-AUD3-003`); `CROSS_FRAGMENT_REDACTION` em
+    `transformations`, que passou a sair do renderizador. `RENDERER_VERSION` → `e5.block.v4`.
+  - `api/app/context_engine/selection.py` — consome `rendered.transformations` em vez de
+    montar a lista por conta própria.
+  - `api/tests/test_context_redaction_e5_round4.py` — **novo**, 35 testes (13 diretos +
+    22 cenários de varredura de bytes parametrizados).
+  - `api/tests/test_context_redaction_e5_round3.py` — 2 testes novos sobre a separação dos
+    dois intervalos; o teste que usava a API antiga foi atualizado.
+
+- Gates: **1119 passed / 6 skipped** (era 1080). `ruff` · `ruff format --check` · `mypy`
+  limpos. Os dois defeitos reproduzidos contra a lógica anterior, simulada fora do working
+  tree, antes de confirmar a correção.
+
+- **Nota sobre a varredura de bytes:** a primeira versão que escrevi falhou — e estava
+  errada, não o pipeline. A maioria dos valores sintéticos das auditorias (`hunter2`,
+  `7890ABCDEF`, `ABCDEFGHIJKLMNOP`) **não** é reconhecível por padrão nenhum isoladamente;
+  eles são segredo por estarem sob chave sensível, por serem cópia de um valor que está,
+  ou por completarem um padrão ao concatenar. Ao varrê-los fora dessa condição, eu testava
+  a afirmação errada. Reescrita como tabela de 22 cenários, cada um preservando a condição
+  que torna seu valor segredo. Detalhe no §4 do relatório.
+
+- Pendências: quarta rodada do Codex. Nada commitado.
+
+---
+
+## 2026-09-11 — Codex — auditoria E5 rodada 4
+
+- Relatório completo: [docs/audits/e5-round-4.md](docs/audits/e5-round-4.md).
+- Veredito: **NÃO GREEN** — E5-AUD4-001..003: cauda do segredo partido emitida (limite conhecido, contrário ao Foco 2), prefixo preservável apagado e vazamento novo por contexto de URL em lookaround. E5-AUD3-002/003 fechados nas reproduções exatas; E5-AUD3-001 respeitado como política aceita.
+- Suíte existente: 1117 aprovados/8 pulados no agregado da execução completa + repetição dos dois testes bloqueados pelo sandbox; ruff/formatação/mypy passaram. Provas independentes: 12 passaram/3 asserts de requisito falharam; complemento histórico com 2 aprovados.
+- Arquivos alterados somente: este log e o relatório. Nenhuma correção de código ou arquitetura; nenhum commit. Liberação de commit bloqueada pelos findings.
+
+---
+
+## 2026-09-12 — Claude Sonnet 5 (effort medium) — docs: normativa dos dois intervalos e dos limites de over-redaction (E5-AUD4-001/002/003)
+
+Tarefa **somente de documentação**, depois da [rodada 4](docs/audits/e5-round-4.md)
+(**NÃO GREEN**). Formaliza em [03](docs/architecture/03-context-architecture.md) §4 o que
+a correção de código ainda por vir deve satisfazer. **Nenhum código alterado, nada
+commitado.**
+
+- Arquivos alterados:
+  - `docs/architecture/03-context-architecture.md` — três adições, todas em §4:
+    1. **camada posicional** — `recognition_span` e `replacement_span` são calculados
+       juntos no motor único (`safety.detect_secret_spans`) para **todo** padrão do
+       catálogo, incluindo os de lookbehind/lookahead (`url_credentials`);
+       `recognition_span` cobre também o texto consultado por asserções de largura zero.
+       Nenhum padrão recebe tratamento especial fora de `safety/redaction.py`
+       (`E5-AUD4-003`);
+    2. **trade-off aceito na V1** — `_is_greedy_extension` removida (`E5-AUD4-001`): o
+       sinal que ela usava não distingue extensão gulosa de continuação genuína sem
+       heurística de confiança/comprimento, que a V1 recusa. Consequência aceita:
+       conteúdo adjacente legítimo passa a ser redigido;
+    3. **limite dessa aceitação** — a emissão cross-fragment projeta a **interseção** de
+       `replacement_span` com cada fragmento, nunca o fragmento inteiro; rótulo
+       preservável fora da interseção nunca é apagado (`E5-AUD4-002`).
+  - `AGENT_LOG.md` — esta entrada.
+
+- Decisões tomadas:
+  - O item 3 foi para a seção do trade-off, colado ao item 2, porque os dois formam um
+    par: o primeiro declara que over-redaction é aceitável, o segundo declara onde ela
+    **para**. Separá-los deixaria a aceitação sem limite escrito.
+  - Isso **reverte a decisão de §1.1** das
+    [notas da rodada 4](docs/audits/e5-round-4-implementation-notes.md) (manter marca
+    inteira em vez de recorte por interseção), que a auditoria recusou em `E5-AUD4-002`.
+    A norma agora exige a projeção por interseção.
+
+- Pendências:
+  - **Nada disso está implementado.** `_is_greedy_extension` ainda existe em
+    `api/app/context_engine/rendering.py`, a emissão cross-fragment ainda usa `whole`, e
+    `recognition_span` ainda não representa lookaround. A norma foi escrita primeiro,
+    de propósito: os três findings da rodada 4 seguem **abertos**.
+  - Nada commitado. Commit desta documentação depende de autorização do Pedro.
