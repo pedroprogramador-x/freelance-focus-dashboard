@@ -478,6 +478,13 @@ não instrução de prompt. `risk_source` registra qual prevaleceu.
 Falha ou timeout do provider de análise **não bloqueia**: usa as hard rules, assume
 `complexity = medium` por conservadorismo e segue. A degradação é para o lado seguro.
 
+A ausência, falha ou timeout do enriquecimento (incluindo quando nenhuma porta de
+enriquecimento está implementada) também eleva o piso de risco: `risk = max(hard_rule_risk,
+medium)`, `complexity = max(hard_rule_complexity, medium)`, `risk_source` permanece
+`hard_rule` — é uma regra de fallback determinística, não uma segunda fonte de risco. Nunca
+uma task fica `risk = low` só porque o enriquecimento estava indisponível e nenhuma hard rule
+específica bateu.
+
 ---
 
 ## 6. Resource Router

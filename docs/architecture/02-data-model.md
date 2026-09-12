@@ -303,7 +303,15 @@ final:
 
   "agents":               [ … ],          # ordem semanticamente relevante
 
-  "tool_profile_hash":     <sha256>,      # perfil de capability efetivo
+  "tool_profile_hash":     <sha256>,      # perfil de capability REQUERIDO/APROVADO para a
+                                           # execução futura — declarado e congelado na
+                                           # aprovação (E6), nunca provado nesse momento. A
+                                           # prova acontece em E7+, quando o adaptador declara
+                                           # effective_capabilities (05) e a guarda
+                                           # approved→executing exige que o perfil efetivo
+                                           # comprovado satisfaça exatamente este perfil
+                                           # aprovado — divergência ou incapacidade de provar
+                                           # é fail-closed.
   "safety_policy_hash":    <sha256>,      # política de segurança composta
   "workflow_policy_hash":  <sha256>,      # auditoria obrigatória, gates, rodadas
 
@@ -383,7 +391,7 @@ Um `Run` = **uma execução concreta** de um agente, provider ou runner.
 | `provider` / `model` | str / str? | |
 | `provider_adapter` / `adapter_version` | str / str? | |
 | `transport` | enum | `cli` · `api` · `process` |
-| `tool_profile_hash` | str? | perfil efetivo do run |
+| `tool_profile_hash` | str? | perfil de capability EFETIVAMENTE COMPROVADO pelo adaptador nesse Run específico (E7+) — distinto do perfil requerido/aprovado que vive no `execution_fingerprint` da task |
 | `status` | enum | `ok` · `error` · `timeout` · `cancelled` · `blocked` · `interrupted` |
 | `started_at` / `finished_at` / `duration_ms` | | |
 | `input_tokens` / `output_tokens` | int? | nulos quando indisponíveis |

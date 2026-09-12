@@ -2988,3 +2988,27 @@ sem o texto visível mudar. **Nada commitado.**
   limitado à mesma entrada/bloco e agora sinalizado, não corrigido.
 - Somente relatório e esta entrada alterados no repositório. Nenhum código corrigido,
   commit ou push executado.
+
+---
+
+## 2026-09-12 — Claude Sonnet 5 (effort: medium) — Correção de terminologia: tool_profile_hash e fallback de enriquecimento
+
+- Arquivos alterados:
+  - `docs/architecture/02-data-model.md` — dois comentários sobre `tool_profile_hash`
+    reescritos para distinguir os dois momentos do mesmo campo conceitual: o hash no
+    `execution_fingerprint` da task é o perfil de capability REQUERIDO/APROVADO,
+    declarado e congelado na aprovação (E6), nunca provado naquele momento; o hash no
+    `Run` é o perfil EFETIVAMENTE COMPROVADO pelo adaptador naquele Run específico
+    (E7+, quando `effective_capabilities` — 05 — é declarado e a guarda
+    approved→executing exige satisfação exata, fail-closed em divergência).
+  - `docs/architecture/03-context-architecture.md` §5 (Task Analyzer) — parágrafo
+    sobre falha/timeout do provider de análise estendido: ausência, falha ou timeout
+    do enriquecimento (incluindo nenhuma porta de enriquecimento implementada)
+    também eleva o piso de risco (`risk = max(hard_rule_risk, medium)`,
+    `complexity = max(hard_rule_complexity, medium)`), mantendo `risk_source =
+    hard_rule` — é fallback determinístico, não segunda fonte de risco.
+- Decisões tomadas: nenhum hash novo criado; apenas terminologia clarificada para
+  refletir que o mesmo campo (`tool_profile_hash`) representa coisas distintas em
+  momentos distintos do ciclo de vida (aprovado vs. comprovado).
+- Pendências: nenhuma. Tarefa somente-documentação, gate de diff já revisado.
+  Nada commitado — aguardando autorização do Pedro.
