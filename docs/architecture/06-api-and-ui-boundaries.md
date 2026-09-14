@@ -28,6 +28,10 @@ Network Access*, retries e ruído de console.
    exige headers CORS; somente a validação de `Origin` conhece a origem fixa do Vite.
    Nunca `*`.
 5. **`LocalSessionToken` obrigatório em todas as rotas exceto `GET /api/health`.**
+6. **Toda resposta é redigida por padrão** — o princípio fail-closed da Camada 3 de
+   [04](04-safety-and-git-runtime.md) §5. É essa garantia que fecha o outro lado da
+   segurança: as defesas 1–5 protegem *quem pode chamar* a API; a redação protege *o que a
+   resposta pode conter*, mesmo para um chamador legítimo e autenticado.
 
 ### `LocalSessionToken`
 
@@ -165,10 +169,48 @@ em E13 (três modos).
 - os agentes escolhidos, o perfil de capability e os limites;
 - o botão de aprovar, que envia o `execution_fingerprint` completo — e, quando a aprovação
   é invalidada, **qual campo mudou**;
+- **`approval_state`** — ver o quadro abaixo — para decidir se o botão certo é *Aprovar*
+  ou *Rejeitar e replanejar*, e para não confundir "foi aprovada" com "está aprovada";
 - progresso ao vivo por `phase`;
 - diff, findings da **auditoria vigente** (separando `workflow_audit` de
   `benchmark_evaluation`, com as auditorias superadas acessíveis como histórico) e runs com
   tokens, duração e **proveniência** das métricas.
+
+#### `approval_state` (E6-AUD3-004)
+
+Campo **somente leitura** de `GET /api/tasks/{id}` (e das respostas de `plan`/`approve`/
+`reject`/`cancel`). **Não** é o `status` da máquina de estados de [02](02-data-model.md)
+§4, não é persistido, e não é um décimo estado — é derivado, no momento da leitura, de
+três colunas já existentes (`approved_at`, `plan_hash`, `approved_manifest_id`) e do
+`status` atual. Ele existe porque `awaiting_approval`/`needs_fix` sozinhos não distinguem
+duas situações que pedem ações **opostas** do humano.
+
+| Valor | Significado | Ações válidas |
+| --- | --- | --- |
+| `not_planned` | Nenhuma decisão de aprovação pendente **e** nunca foi aprovada — `draft`/`planning`, ou terminal (`cancelled`/`failed`) alcançado sem aprovação | `POST /plan` quando em `draft` |
+| `pending` | Em `awaiting_approval`/`needs_fix` com candidato vigente, aguardando decisão | `POST /approve` ou `POST /reject` |
+| `approved` | `approved_at` preenchido — foi aprovada, **em algum momento**, e ainda não teve essa aprovação invalidada por replanejamento | depende do `status` atual (ver exemplo abaixo) |
+| `requires_replan` | Em `awaiting_approval`/`needs_fix`, mas a guarda de entrada invalidou a aprovação porque o `HEAD` divergiu do `base_commit` congelado; o plano exibido é **histórico** | `POST /reject` (nunca `approve` nem `plan` direto — `awaiting_approval → planning` não existe na máquina de [02] §4) |
+
+**Regra de derivação:** `approved_at` não nulo → `approved`, sempre, primeiro que qualquer
+outro teste. Só quando o `status` atual está em `awaiting_approval`/`needs_fix` — os dois
+estados de [02] §4 com decisão de aprovação pendente — é que a ausência de
+`approved_manifest_id` distingue `requires_replan` de `pending`. Fora desses dois estados
+(e sem `approved_at`), o valor é `not_planned` — inclusive uma task recém-`reject`ada, que
+tem `plan_hash` de um plano antigo mas nenhum candidato: ela não "precisa replanejar", ela
+está livre para planejar direto.
+
+**`status` e `approval_state` não são sinônimos**, e o exemplo que a auditoria pediu para
+registrar é exatamente isto: uma task planejada, aprovada e depois **cancelada** chega em
+`status = cancelled` **e** `approval_state = approved` — `approved_at` preserva o fato
+histórico de que ela foi aprovada antes de o usuário desistir. Nenhuma ação de aprovação
+ou planejamento é liberada por isso: `cancelled` é terminal ([02] §4), e `approve`/`plan`
+continuam recusados com `409` como para qualquer outra task terminal. `approval_state`
+informa a UI sobre a **história** da aprovação; `status` continua sendo a única fonte de
+verdade sobre o que pode ser feito agora.
+
+`approval_state` não carrega hash nem entra no `execution_fingerprint` — é projeção pura
+de leitura, e trocar seu valor não é uma escrita observável em lugar nenhum.
 
 Antes de uma purga de workspace ou task, a UI mostra a prévia com as contagens de
 workspaces, tasks, runs, findings, manifests e artefatos, e exige confirmação forte.

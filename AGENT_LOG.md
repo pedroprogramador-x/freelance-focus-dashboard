@@ -3012,3 +3012,609 @@ sem o texto visível mudar. **Nada commitado.**
   momentos distintos do ciclo de vida (aprovado vs. comprovado).
 - Pendências: nenhuma. Tarefa somente-documentação, gate de diff já revisado.
   Nada commitado — aguardando autorização do Pedro.
+
+---
+
+## 2026-09-12 — Claude Opus 5 (effort: high) — E6: Orchestrator Planner
+
+Analyzer, Resource Router, Planner, máquina de estados, endpoints e Task Detail.
+**Não commitado, não pushado.** Vai para auditoria independente do Codex.
+
+- Arquivos alterados:
+  - **Novos** — `api/app/orchestrator/` (10 arquivos: `analyzer`, `resource_router`,
+    `planner`, `execution_manager`, `state_machine`, `fingerprint`, `purge`, `errors`,
+    `__init__`), `api/app/safety/test_policy.py`, `api/app/workspace/policy.py`,
+    `api/app/api/tasks.py`, `api/migrations/versions/0002_workspace_test_config.py`,
+    `src/services/tasksApi.ts`, `src/pages/WorkspaceTasks.tsx`, e 5 arquivos de teste
+    (`test_orchestrator_{analyzer,router_and_fingerprint,state_machine,planner}.py`,
+    `test_api_tasks.py`, `src/test/task-detail-ui.test.tsx`).
+  - **Modificados** — `context_engine/source_ref_expansion.py` (+`compile_classification_pattern`
+    / `build_classification_matcher`), `db/models.py` (+`DevWorkspace.test_config`),
+    `api/workspaces.py` (`PATCH` aceita `test_config`), `main.py` (router de tasks,
+    handler de `OrchestratorError` com payload estruturado, lifespan com
+    `reconcile_on_startup`), `workspace/{service,errors,purge,purge_tokens,__init__}.py`,
+    `tests/test_architecture.py` (+4 regras), e o frontend (`WorkspaceDetail`,
+    `workspaceApi`, 2 fixtures de teste).
+
+- Inspeção obrigatória, os três pontos:
+  1. **`freeze_manifest` já chama `render_context`** (`manifest.py:323`). O Planner faz
+     exatamente **duas** chamadas — `select_context` e `freeze_manifest`.
+  2. **Hard rules não podem usar `build_matcher`.** O envelope (`validate_source_ref`)
+     aplica a denylist de segredos sobre o padrão tratado como literal, e a tabela de
+     [03] §5 **é** essa denylist (`.env*`, `secrets/**`, `*.pem`, `*.key`). Compilá-las
+     por lá negaria a regra mais importante do Analyzer — *fail-open* sobre risco. Função
+     nova no **dono da gramática**: `compile_classification_pattern` /
+     `build_classification_matcher` em `context_engine/source_ref_expansion.py`. Mesma
+     gramática (`compile_source_ref`), mesma normalização, **sem** envelope.
+     `orchestrator/` não implementa casamento próprio.
+  3. **`preflight(local_path) -> GitPreflight`** confirmado; chamado uma única vez, no
+     início do planejamento.
+
+- Decisões de implementação **não** 100% especificadas (para a auditoria):
+  1. **`candidate_paths` vêm do payload de `POST /plan`**, explícitos e opcionais. [06] §2
+     não define a origem. Tokenizar o objetivo em prosa faria toda palavra que não é
+     caminho virar `excluded(out_of_workspace)` no manifest — e o `manifest_hash` é
+     comparável entre tasks por desenho. Lista vazia é o caso normal.
+  2. **`plan_hash = sha256(canonical_json(plan))`** sobre o documento inteiro, não um
+     subconjunto: qualquer mudança no plano que o humano leu invalida a aprovação.
+  3. **`TestPolicy` mora em `safety/`**, não em `orchestrator/`. [04] §5 e [01] §2 a listam
+     entre as peças de `safety/`. É o que deixa `workspace/` (grava) e `orchestrator/`
+     (consome) compartilharem um schema só — `workspace/ → orchestrator/` não é aresta
+     permitida. Tentei primeiro pôr em `orchestrator/` com import local em `workspace/`;
+     isso contornava o `test_architecture.py` em vez de respeitá-lo, e foi desfeito.
+  4. **`test_config` entra no `PATCH /workspaces/{id}` existente**, não em rota dedicada:
+     [06] §2 fecha a tabela de rotas e criar uma exigiria mudar `docs/`. "Omitido" vs.
+     "`null` explícito" é distinguido por `model_fields_set` do Pydantic — nenhum segundo
+     sentinela `UNSET` nasceu.
+  5. **`network_policy` só aceita `"unrestricted"`.** [04] §6 declara a política de rede sem
+     impô-la; aceitar `"disabled"` gravaria no fingerprint a afirmação de uma propriedade
+     que nenhum código faz valer.
+  6. **`PurgeTokenStore` reaproveitado, com sujeito namespaced** (`workspace:<id>` /
+     `task:<id>`). Sem o prefixo, só um `workspace_id` nunca coincidir com um `task_id`
+     separaria os dois — verdade prática, invariante não imposta.
+  7. **Padrões de hard rule ganharam variantes `**/`** (`**/migrations/**`,
+     `**/alembic/**`, `**/.github/workflows/**`). A tabela de [03] §5 supõe repositório de
+     projeto único; neste monorepo as migrations vivem em `api/migrations/`, e o padrão
+     ancorado na raiz não as alcançava. Pego por teste, não por revisão.
+  8. **Coluna de override de política de segurança NÃO foi criada.** [02] §1 congela os
+     campos de `DevWorkspace` e não tem esse campo; só `test_config` foi autorizado nesta
+     conversa. `resolve_effective_policy` recebe o override por parâmetro e o mecanismo
+     real de [04] §5 (`SafetyPolicy.compose`) é exercitado em teste.
+  9. **`developer_binding` sai `null`** pelo mesmo motivo que [02] §7 dá para o auditor:
+     omitir a chave faria "sem developer" e "developer X" colidirem.
+  10. **`reconcile_on_startup` roda no lifespan do servidor**, não no `create_app` (que
+      segue sem efeito colateral). Tolera `OperationalError` — e só ele: banco ainda não
+      migrado é estado real, e falhar o startup impediria o operador de rodar a migration.
+  11. **`approved_manifest_id`/`approved_fingerprint` são preenchidos já no plano**, com
+      `approved_at = NULL`. `approved_at` é a única fonte de verdade de "aprovada"; os
+      outros três são o **candidato** até lá.
+  12. **`WorkspaceApiError` ganhou `details`** no frontend: o transporte descartava o corpo
+      do 409, e [06] §2 exige que ele carregue "qual campo divergiu".
+  13. **A trilha de auditoria é commitada antes de o 409 subir** (`_commit_audit_trail`).
+      Defeito encontrado em self-review e **confirmado por sonda**: `session_scope` faz
+      `rollback` em qualquer exceção, então o `SafetyEvent(approval_invalidated)` de
+      [ADR-0008] regra 5 e a atualização do fingerprint eram descartados assim que a
+      exceção atravessava a camada HTTP. Os testes de serviço não pegavam — eles usam a
+      sessão crua, sem a unidade de trabalho da API. A invalidação **é** a transição
+      `awaiting_approval → awaiting_approval` de [02] §4, e commitar é papel deste módulo
+      ([01] §2: "dono da transação"). Mesmo tratamento na guarda de entrada. Duas
+      regressões de ponta a ponta em `test_api_tasks.py` fecham o caso.
+  14. **`test_backend_nao_imprime_nada` passou a ser por AST.** Ele era
+      `"print(" not in source`, e `_recompute_fingerprint(` **contém** `print(` como
+      substring. "fingerprint" é termo central de [02] §7 e aparece em dezenas de
+      identificadores do Orchestrator; renomear a função para caber no detector seria
+      deformar o código por causa de um teste quebrado. A verificação por AST é **mais**
+      estrita (pega `print` em qualquer formatação) e ganhou contrafactual próprio. Mesma
+      justificativa de `test_expansor_e_o_unico_a_decidir_gramatica_dentro_do_safety`.
+  15. **`test_cria_workspace_e_aparece_na_listagem` passou a esperar `test_config`** no
+      conjunto exato de campos da resposta, e a afirmar que ele nasce `null`.
+
+- Gates verificados:
+  - **suíte completa do backend verde** — as duas regressões que a E6 introduziu
+    (`test_cria_workspace_e_aparece_na_listagem`, `test_backend_nao_imprime_nada`) foram
+    corrigidas, ver decisões 14 e 15. Registro honesto: reportei "verde" cedo demais numa
+    rodada anterior, lendo o `exit code` do `tail` no fim do *pipe* em vez do do pytest;
+  - migration aplica e reverte limpo (0002 ⇄ 0001 ⇄ base);
+  - `ruff check` / `ruff format --check` / `mypy`: limpos (94 arquivos);
+  - `npm run lint`, `npm run build`, `npm test`: 126 testes, 19 arquivos, verde;
+  - análise estática: `orchestrator/` importa só `db`/`context_engine`/`git_runtime`/
+    `safety`/`workspace`/`config`; **nenhum** `hashlib`/`json`/`re`/`fnmatch`/`importlib`;
+    `execution_manager.py` é o **único** construtor de `WorkspaceTask`/`SafetyEvent`;
+  - `approved → executing` recusada com 409 `capability_profile_proven` — com
+    contrafactual provando que a guarda não é `raise` incondicional;
+  - `reconcile_on_startup` idempotente; 81 pares da máquina de estados conferidos contra
+    transcrição independente do diagrama de [02] §4.
+
+- Pendências:
+  - **Nada commitado, nada pushado. E7 não iniciada.**
+  - `max_fix_rounds` carregado e inerte (E10). `auditor_binding`/`developer_binding`
+    `null` até E9/E8. Nenhum `Run` é criado nesta fase.
+  - Aguardando auditoria independente do Codex.
+
+---
+
+## 2026-09-13 — Codex — E6: primeira auditoria independente
+
+- Relatório e reproduções, fora do repositório:
+  [e6-audit-round-1.md](C:/Users/pedro/.codex/visualizations/2026/09/13/01a098b3-24ec-7202-b7c5-1deddf8aa9ec/e6-audit-round-1.md)
+  e `test_e6_audit.py` no mesmo diretório. Inventários completos de status, diff stat e
+  arquivos untracked também preservados ali.
+- **Sem GREEN.** E6-AUD-001–010: invalidação na entrada preserva approved; recusa de
+  contexto stale sem SafetyEvent; planning não durável/observável; corrida SQLite vira
+  HTTP 500; plano não reverifica fontes; detector AST perde builtins.print; test_config
+  expõe argv/credencial sem redação; startup silencia falhas operacionais de recuperação;
+  objetivo sobre .env classificado low/trivial; needs_fix→approved dá falso conflito.
+- E6-AUD-011–012: hard rules não reavaliam candidatos do enriquecimento e guarda aceita
+  hash efetivo de capability incompatível. Reproduzidos com portas de teste; sem chamador
+  de produção E6. Resolver antes de ativar E7/E8.
+- A correção original de commit antes do 409 foi confirmada por query independente.
+  Hashes reproduzíveis inclusive sob reinserção física inversa do registry; configuração
+  parcial/rede inválida recusadas; namespaces de purga resistem ao mesmo UUID; import
+  real de workspace não carrega orchestrator; gramática de glob permanece única.
+- Validação: **562 testes direcionados passaram**; **25 provas independentes aprovadas
+  no agregado**, incluindo crash em subprocesso e concorrência com duas sessões reais.
+  As provas afirmam o comportamento observado, inclusive defeitos. Não foi reexecutada
+  a suíte completa backend/frontend. Python 3.12.14 do runtime Codex e dependências
+  temporárias dentro das faixas do pyproject: o venv indicado no log não existe aqui.
+- Nenhuma correção funcional, alteração de arquitetura, commit ou push no projeto.
+  Somente esta entrada foi acrescentada ao repositório pela auditoria.
+
+---
+
+## 2026-09-13 — Claude Opus 5 — E6: correção dos 12 findings da primeira auditoria
+
+Rodada de correção de E6-AUD-001 a 012. Nenhum finding foi "aceito e documentado":
+todos os doze foram corrigidos. **Nada commitado, nada pushado** — vai para a segunda
+rodada do Codex.
+
+- Arquivos alterados:
+  - **novos**: `api/app/safety/objective_signals.py`,
+    `api/tests/test_e6_audit_round_1.py`;
+  - `api/app/orchestrator/execution_manager.py` — o grosso do Grupo A;
+  - `api/app/orchestrator/state_machine.py` — guarda de capability com hash efetivo,
+    `check_needs_fix_guard`;
+  - `api/app/orchestrator/analyzer.py` — sinal de objetivo, segunda passada de hard rules;
+  - `api/app/orchestrator/planner.py` — `reverify_context`, `stale_manifest_entry_ids`;
+  - `api/app/orchestrator/errors.py` — `TransitionGuardFailed` ganhou `diverged_fields` e
+    `requires_replan`;
+  - `api/app/safety/test_policy.py` — `redacted_document`;
+  - `api/app/safety/__init__.py` — exporta as duas peças novas;
+  - `api/app/api/workspaces.py` — projeção redigida de `test_config`;
+  - `api/app/main.py` — startup distingue schema ausente de falha operacional;
+  - `api/tests/test_auth_and_bootstrap.py`, `api/tests/test_architecture.py`,
+    `api/tests/test_orchestrator_state_machine.py`, `api/tests/test_api_tasks.py`.
+  - `src/` (frontend) — **não tocado**. Nenhum finding é de frontend, e a superfície HTTP
+    que mudou (`requires_replan` na guarda de entrada) não tem rota na E6.
+
+- Revisão sistemática dos pontos de saída do Execution Manager (pedido do Grupo A). Os
+  sete pontos, e o que cada um faz hoje:
+
+  | Saída | Trilha commitada antes da exceção? | Estado resultante |
+  | --- | --- | --- |
+  | `create_task` recusa | n/a — nada foi escrito | inalterado |
+  | `plan`, erro de domínio | sim (a transição) | `draft` (AUD-003) |
+  | `plan`, erro inesperado | sim (transição + evento) | `failed(internal_error)` (AUD-003) |
+  | `approve`, fingerprint divergente | sim (já era, decisão 13) | `awaiting_approval`/`needs_fix` com candidato novo |
+  | `approve`, guarda recusa | **sim, novo** (AUD-002) | origem preservada |
+  | `start_execution`, guarda invalidante | **sim, novo** — evento **e** transição (AUD-001) | `awaiting_approval` |
+  | `start_execution`, guarda não invalidante | sim (já era) | `approved` — é fila, não invalidação |
+  | qualquer CAS perdedor | não, e é correto | o vencedor mandou; o perdedor é no-op |
+
+- Decisões tomadas:
+  1. **AUD-001, dois desfechos distintos, não um.** Fingerprint divergente com `HEAD`
+     intacto rebaixa para `awaiting_approval` **atualizando** o candidato — reaprovar
+     resolve. `HEAD` alterado **limpa** o candidato inteiro (o mesmo conjunto que `reject`
+     limpa) e exige `POST /plan`. O motivo é que reaprovar não poderia funcionar: o
+     fingerprint cobre `base_commit`, que continua sendo o commit congelado — ele bateria
+     de novo, a guarda recusaria de novo, e o humano ficaria num laço. Substituir a base
+     congelada em silêncio era a outra saída, e [02] §6 a proíbe.
+  2. **Só duas das seis guardas de entrada invalidam a aprovação.** `slot_available` é a
+     fila de [ADR-0008], `workspace_is_git_repo` é ambiente, `attempts_below_max` é teto e
+     as duas de capability são a ausência de E7. Rebaixar a task em qualquer uma delas
+     faria o humano reaprovar um plano que não mudou — a correção de AUD-001 viraria um
+     defeito novo. Tem contrafactual próprio.
+  3. **O erro rico substitui o `TransitionGuardFailed` genérico** quando há invalidação:
+     `ApprovalFingerprintMismatch` com `diverged_fields` no caso do fingerprint,
+     `TransitionGuardFailed(requires_replan=True)` no caso do `HEAD`. [06] §2 pede "o
+     motivo e qual campo divergiu", e a entrada de execução era o único `409` que não
+     entregava o segundo.
+  4. **AUD-003: o commit fica entre a entrada em `planning` e o trabalho longo.** Separar
+     os dois CAS nunca foi suficiente — os dois estavam na mesma transação, e uma
+     transação aberta não existe para ninguém de fora. Efeito colateral desejável: o lock
+     de escrita fecha antes da análise, em vez de durar a operação inteira.
+  5. **Erro recuperável → `draft`; erro inesperado → `failed(internal_error)`.** É a
+     leitura literal de [02] §4 ("erro recuperável" / "erro de provider · limite"). O
+     critério é `isinstance(error, OrchestratorError)`: erro de domínio é, por definição, o
+     que o usuário pode corrigir e replanejar. Mandar um erro desconhecido para `draft`
+     afirmaria que replanejar resolve, sem ninguém ter verificado.
+  6. **`_abort_planning` nunca levanta.** Ela roda dentro de um `except` cujo trabalho é
+     deixar o erro original subir; trocá-lo por um `409` de concorrência levantado durante
+     a limpeza esconderia a causa. Quando a limpeza não pode acontecer, o estado já é de
+     outra transação e a reconciliação do próximo startup é a rede que sobra.
+  7. **AUD-004: o conjunto de códigos de conflito é fechado e vem de `sqlite_errorname`.**
+     Nada de casar substring de mensagem para decidir semântica transacional, e nada de
+     capturar `OperationalError` inteiro — um erro que o driver não sabe nomear **não** é
+     tratado como conflito esperado. Contrafactual: `no such table` continua subindo.
+  8. **O `rollback` vem antes de reler.** A sessão perdedora ainda segura o snapshot que o
+     SQLite recusou; qualquer releitura antes dele responderia com o estado velho.
+  9. **AUD-005 reaproveita `verify_workspace_entries`**, a API canônica da E4, recebendo o
+     `planning_base_commit` já congelado. Nenhuma segunda captura de `HEAD`: a função
+     aceita `verification_commit` explicitamente desde a E4 justamente para este caso, que
+     o docstring dela já antecipava ("o caso da E6, com o `planning_base_commit`
+     congelado").
+  10. **AUD-009 nasce em `safety/objective_signals.py`, não no Analyzer.** Ela compõe
+      `is_sensitive_key` (componentes de termo) com `classify_path_secrecy` (a denylist de
+      [04] §5). Escrevê-la no `orchestrator/` exigiria uma segunda lista de nomes e uma
+      segunda denylist — a classe de defeito que E2-AUD-003 fechou para glob.
+  11. **`_looks_like_path` decide qual classificador recebe cada token, e é ele que evita
+      os dois falsos positivos.** `classify_path_secrecy` não pode ver palavra solta: o
+      padrão `**/*secret*` casa o *basename* `secretary`. E `is_sensitive_key` não
+      reconhece `.env`, que é caminho e não nome de campo. Cada token vai para quem sabe
+      respondê-lo. Os seis exemplos do prompt são teste parametrizado.
+  12. **O sinal roda dentro de `evaluate_hard_rules`.** É o que torna o atalho trivial
+      impossível **por construção**: o passo 2 lê `hard_rule.risk`, que já veio `high`. Não
+      há uma segunda checagem a lembrar de fazer.
+  13. **O motivo nunca ecoa o texto.** Um objetivo é campo livre e pode ter uma credencial
+      colada por engano; devolvê-la no `rule_id` a reimprimiria no `plan`, no `plan_hash` e
+      na resposta HTTP. Viaja `rule_id` + categoria, e tem teste com credencial sintética.
+  14. **AUD-011: a segunda passada é a mesma `evaluate_hard_rules`, sobre a união.** Só
+      roda quando o enriquecimento de fato acrescentou caminho (`merged_paths == paths` a
+      dispensa), porque reclassificar à toa poderia produzir `matched` diferente e mudar o
+      `plan_hash` de planos idênticos. `risk_source` compara contra a **segunda** passada:
+      um `.env` sugerido pelo LLM eleva por hard rule, não por opinião de modelo.
+  15. **AUD-007: a redação é da projeção de saída, nunca dos bytes operacionais.**
+      `command_hash`/`policy_hash` continuam sobre o valor cru — redigir antes de hashear
+      faria o fingerprint deixar de identificar o comando real, e duas configurações cujo
+      segredo caísse na mesma máscara colidiriam. Tem teste dos dois lados: nenhuma rota
+      devolve o valor cru, e dois `argv` que só diferem no segredo produzem fingerprints
+      diferentes.
+  16. **`redacted_document` redige também o que não souber interpretar.** A coluna é JSON
+      livre; uma linha malformada gravada por uma versão anterior do schema não pode ser o
+      caminho pelo qual um valor cru escapa. Não conseguir interpretar não é estar seguro.
+  17. **AUD-008 vira uma pergunta, não um `except`.** `_schema_is_migrated` inspeciona a
+      tabela. `except OperationalError: pass` descrevia uma classe genérica de falha de
+      banco — lock contendido, tabela corrompida, gatilho que aborta — e todas eram
+      silenciadas junto com a condição legítima. Perguntar antes devolve toda falha
+      operacional ao *fail closed*, sem ampliar o `except` para `Exception`, conforme a
+      própria recomendação do Codex.
+  18. **AUD-010: `approve` passou a usar a origem real no CAS.** `expected_status` fixo em
+      `awaiting_approval` era o que transformava a aresta `needs_fix → approved` num
+      `409 concurrent_task_update` falso. A divergência de fingerprint vinda de `needs_fix`
+      **não** transiciona (`needs_fix → needs_fix` não é aresta): só atualiza os campos de
+      candidato no mesmo estado.
+  19. **"Contexto reverificado" em `needs_fix` só pode ser o estado de agora.** Em
+      `awaiting_approval` a guarda lê os estados congelados no manifest, porque a seleção
+      acabou de acontecer. Em `needs_fix` houve uma execução inteira desde o congelamento,
+      e reler o manifest responderia uma pergunta que já não é a certa. `reverify_context`
+      é o mesmo ponto de entrada do `plan`, contra o mesmo commit congelado.
+  20. **AUD-012: `proven` e hash são conferidos separadamente, nessa ordem.**
+      `proven = False` é conferido antes da comparação de hash — trocar a ordem daria ao
+      operador o diagnóstico errado sobre o que o adaptador fez. Os quatro desfechos são
+      teste parametrizado, mais um caso que prova que o provador recebe o hash **requerido**.
+  21. **AUD-006: o detector aceita `ast.Attribute` de qualquer receptor**, sem tentar provar
+      que é o módulo `builtins`. Um `.print(...)` de qualquer objeto escreve na saída do
+      mesmo jeito. A assimetria de custo decide: falso positivo custa uma conversa, falso
+      negativo custa um token em log. O contrafactual agora **executa** cada fonte e confere
+      o stdout — a tabela não pode mais afirmar uma premissa falsa sobre si mesma — e chama
+      o `_print_calls` real, que era exatamente a recomendação da auditoria.
+  22. **`SafetyEventKind` não ganhou valor novo.** O conjunto de [02] §12 é fechado e
+      `docs/` está congelado. O mapa por guarda escolhe o item mais próximo: `retry_limit`
+      para teto de tentativas, `capability_denied` para hash efetivo incompatível,
+      `approval_invalidated` para a recusa de conceder aprovação, `cancelled` para
+      "parou sem terminar" (que é o que `reconcile_on_startup` já usava).
+  23. **A projeção redigida é recusada na entrada.** Corolário de existir uma projeção
+      diferente do documento, encontrado em self-review: um cliente genérico que fizesse
+      `GET` e devolvesse o corpo num `PATCH` gravaria `«redigido»` no lugar do comando, e o
+      Test Runner "rodaria" a máscara — em silêncio, porque ela é uma string válida para o
+      schema. `parse_test_policy` recusa qualquer campo que a contenha. Não é checagem de
+      segurança, é de integridade, e o ponto de entrada é um só.
+  24. **Abort recuperável não deixa `SafetyEvent`.** [02] §4 pede trilha "quando a causa é
+      política", e "este workspace não tem git" é configuração, não política. O `409` já
+      carrega o motivo e a volta para `draft` é durável por si. Só o abort **inesperado**
+      registra.
+
+- Gates verificados:
+  - **suíte completa do backend verde** — ver a linha `PYTEST_EXIT` no relatório desta
+    sessão; o exit code lido é o do pytest, não o de um `tail` no fim do pipe;
+  - `ruff check` / `ruff format --check` / `mypy`: limpos (96 arquivos, 99 formatados);
+  - frontend: `npm run lint`, `npm test` (126 testes, 19 arquivos), `npm run build` verdes;
+  - **as sondas do próprio Codex viraram**: das 25, as 18 que afirmavam comportamento
+    defeituoso agora **falham**, e as 7 que afirmavam controles confirmados continuam
+    passando — incluindo `test_mismatch_is_durable` (a correção original da decisão 13),
+    `test_http_reproducibility`, `test_context_insertion_order` e `test_same_uuid_namespaces`.
+    A única falha que **não** é um defeito corrigido é `test_static_and_runtime_boundaries`:
+    a *allowlist* da própria sonda não previa `matched.extend`, irmão do `matched.append`
+    que ela já listava. A reverificação independente confirma: nenhum import de
+    `re`/`fnmatch`/`glob`/`importlib`/`hashlib`/`json` em `orchestrator/`, e as únicas
+    chamadas de casamento continuam sendo `build_classification_matcher` e `matcher.covers`;
+  - análise estática de dono único: `detect_sensitive_objective_signals` é definida em
+    **um** arquivo (`safety/objective_signals.py`), e nenhum módulo de `orchestrator/`
+    contém uma segunda lista de nomes sensíveis. As duas regras viraram teste permanente em
+    `test_architecture.py`.
+
+- Pendências:
+  - **Nada commitado, nada pushado. E7 não iniciada.**
+  - `max_fix_rounds` segue carregado e inerte (E10); `developer_binding`/`auditor_binding`
+    seguem `null` até E8/E9; nenhum `Run` é criado.
+  - A guarda de entrada continua sem rota HTTP na E6 — `requires_replan` e o
+    `diverged_fields` da entrada são exercitados pelo serviço, não por endpoint. A rota
+    chega na E7.
+  - Aguardando a segunda rodada de auditoria independente do Codex.
+
+---
+
+## 2026-09-13 — Codex — E6: segunda auditoria independente
+
+- Relatório e sondas, fora do repositório:
+  [e6-audit-round-2.md](C:/Users/pedro/.codex/visualizations/2026/09/13/01a098b3-24ec-7202-b7c5-1deddf8aa9ec/e6-audit-round-2.md)
+  e `test_e6_audit_round2.py` no mesmo diretório.
+- **Sem GREEN.** E6-AUD2-001 a 004 bloqueiam; 005 é achado adicional de baixa severidade,
+  condicionado a documento malformado já persistido. Os 12 findings da primeira rodada
+  foram reverificados um a um e confirmados corrigidos — com duas coberturas parciais
+  (AUD-007 deixou o `runner_id`; AUD-004 cobria só o CAS final).
+- 25 sondas próprias, escritas sem importar lógica das anteriores nem do módulo de
+  regressões da implementação. Suíte completa reexecutada: 1.571 passed, 6 skipped;
+  frontend 126 testes. `matched.extend` confirmado como falso positivo da sonda antiga.
+- Nenhuma correção, commit ou alteração de arquivo do projeto nesta rodada.
+
+---
+
+## 2026-09-13 — Claude Opus 5 — E6: correção dos 5 findings da segunda auditoria
+
+Todos os cinco corrigidos. **Nada commitado, nada pushado** — vai para a terceira rodada
+do Codex.
+
+**A leitura que organiza esta rodada:** quatro dos cinco findings são a *mesma correção da
+primeira rodada aplicada a uma superfície que ficou de fora*. AUD2-001 é a redação de
+AUD-007 numa segunda saída; AUD2-002 é o tratamento de conflito de AUD-004 numa segunda
+fronteira de escrita; AUD2-003 é a delegação ao Safety Kernel de AUD-009 aplicada aos
+candidatos e não só ao objetivo; AUD2-005 é o fallback da própria redação de AUD-007.
+Por isso nenhuma das correções é um patch pontual: em cada caso a pergunta foi "onde mais
+esta classe de problema existe?", e a resposta virou teste de análise estática.
+
+- Arquivos alterados:
+  - **novo**: `api/tests/test_e6_audit_round_2.py`;
+  - `api/app/safety/redaction.py` — `redact_document`, a caminhada recursiva canônica;
+  - `api/app/safety/test_policy.py` — fallback por *allowlist de valor*;
+  - `api/app/safety/__init__.py` — exporta `redact_document`;
+  - `api/app/api/tasks.py` — projeção redigida das partes, `approval_state`, `/context`
+    com o diagnóstico certo;
+  - `api/app/main.py` — o handler de erro passou a usar a caminhada canônica;
+  - `api/app/orchestrator/analyzer.py` — a categoria de segredo delega para `safety`;
+  - `api/app/orchestrator/planner.py` — resolve a política uma vez, para três consumidores;
+  - `api/app/orchestrator/execution_manager.py` — `approval_state`, tradução de conflito
+    no trabalho do plano, mensagem da guarda;
+  - `api/app/orchestrator/__init__.py`, `api/tests/test_orchestrator_analyzer.py`;
+  - `src/services/tasksApi.ts`, `src/pages/WorkspaceTasks.tsx`,
+    `src/test/task-detail-ui.test.tsx`.
+
+- Decisões tomadas:
+  1. **A recursão de redação virou uma só, em `safety/redaction.py`.** O defeito de
+     AUD2-001 não foi "esqueceram de redigir uma projeção" — foi **três cópias** da mesma
+     caminhada (`api.tasks._redact_tree`, `api.main._redact_payload`,
+     `safety.test_policy._redact_tree`). Com três, "aplicar a redação aqui" é uma decisão a
+     lembrar em cada ponto de saída, e o ponto que esquecer é indistinguível de mais uma
+     cópia. Com uma, ele é visível. O teste de análise estática afirma que existe
+     exatamente uma função que chama `redact` e a si mesma.
+  2. **`execution_fingerprint_parts` sai redigido; `execution_fingerprint` não.** O
+     segundo é um sha256 e o cliente precisa devolvê-lo no `approve` — redigi-lo quebraria
+     o fluxo. Os hashes dentro das partes atravessam o redator intactos (não há span a
+     detectar em hexadecimal), o que tem teste próprio: se isso deixasse de valer, a
+     correção quebraria a aprovação em silêncio.
+  3. **Hashear continua sendo sobre os bytes crus.** Dois `runner_id` distintos que caem na
+     mesma máscara produzem fingerprints **diferentes** — senão trocar o Test Runner
+     deixaria de invalidar a aprovação, que é o que [04] §7 exige que ele faça. Mesma
+     assimetria de AUD-007, agora com teste no lado do fingerprint.
+  4. **O `_redact_tree` de `api/tasks.py` virou um wrapper de uma linha, e ficou.** Podia
+     ter sumido; o nome local é onde mora o *porquê* desta camada (o `plan` carrega `goal` e
+     `acceptance_criteria`, texto livre do usuário), e apagá-lo levaria essa explicação
+     junto.
+  5. **AUD2-002: a tradução mora em `_abort_planning`, não no ponto de escrita.** Envolver
+     cada `flush` de `plan_task` num `try` espalharia a classificação por todo o Planner —
+     e o Planner não conhece `ConcurrentTaskUpdate`. `_abort_planning` já é o funil de
+     **todo** erro do trabalho longo e já fazia o `rollback` antes de reler; classificar ali
+     é uma linha e cobre qualquer escrita futura sem que ninguém precise lembrar.
+  6. **A tradução governa a classificação do desfecho, de graça.** Um conflito é um
+     `OrchestratorError`, logo recuperável, logo a task volta para `draft` — que é a
+     orientação certa, porque replanejar de fato resolve um lock que já passou. Não foi
+     preciso um ramo novo para isso.
+  7. **A vencedora continua intocada.** Quando o `cancel` concorrente já transicionou a
+     task, `_abort_planning` relê, encontra `cancelled` e **não** escreve — só o erro
+     traduzido sobe. É a metade do finding que já estava correta, e tem asserção própria
+     para que a correção não a quebre.
+  8. **`_is_write_conflict` continua sendo o único discriminador.** Um `RuntimeError` no
+     meio do plano continua levando a `failed(internal_error)`, e um `OperationalError` que
+     não seja um dos códigos de conflito continua subindo como está. Contrafactual próprio.
+  9. **AUD2-003: a categoria `"secrets"` do Analyzer foi removida, não corrigida.** A
+     tentação era acrescentar os cinco padrões que faltavam (`*.p12`, `*.pfx`, `id_rsa*`,
+     `id_ed25519*`, `.pypirc`). Isso consertaria a reprodução e preservaria o defeito: a
+     lista voltaria a divergir no próximo padrão que a denylist ganhasse. `is_secret_path`
+     é a mesma função que decide o que o Context Engine pode ler.
+  10. **A assimetria que a delegação torna explícita:** [04] §5 **nega leitura** de um path
+      de segredo; [03] §5 **eleva o risco** de uma task que o toca. Reconhecer é a mesma
+      operação; o que se faz com o veredito é que difere. Uma função, dois consumidores.
+  11. **O que ficou em `HIGH_RISK_PATH_RULES` é o que não é segredo.**
+      `migrations_schema`, `auth_permissions`, `ci_cd_deploy`, `dependencies` — nenhuma
+      responde "isto é um segredo"; todas respondem "mexer aqui é caro de errar", que é
+      semântica do Analyzer e não da denylist do Safety Kernel. Tem contrafactual: o teste
+      afirma o conjunto **exato** das quatro categorias restantes.
+  12. **A política que o Analyzer recebe é a efetiva do workspace, não o default global.**
+      `plan_task` resolve `resolve_effective_policy` **uma vez** e a passa para os três
+      consumidores (Analyzer, detector de objetivo, `select_context`). Resolver duas vezes
+      abriria a porta para as duas responderem diferente sobre o mesmo arquivo no mesmo
+      planejamento. Um override restritivo ([04] §5, "só restringe") passa a elevar o risco
+      pelo mesmo caminho — e isso tem teste, porque é o que torna a fonte única *útil* e não
+      só *menos duplicada*.
+  13. **O rótulo virou `path:secret_policy`.** Ele nomeia a **origem** do veredito — a
+      política de segredo de [04] §5 — e não uma linha de tabela que já não existe.
+  14. **AUD2-004: nenhuma aresta nova.** `awaiting_approval → planning` continua proibida,
+      e corretamente: replanejar é decisão de quem rejeitou o plano anterior. O que faltava
+      era coerência entre três consumidores que diziam coisas diferentes sobre o mesmo
+      estado.
+  15. **`approval_state` é derivado, não persistido.** Três colunas de [02] §3
+      (`approved_at`, `plan_hash`, `approved_manifest_id`) já contêm a resposta; uma coluna
+      nova exigiria mudar `docs/`, congelado. Ele existe porque `awaiting_approval`
+      significa duas situações que pedem ações **opostas** do humano: `pending` ("há plano
+      vigente, aprove") e `requires_replan` ("o plano exibido é histórico, rejeite e
+      replaneje"). `status` continua sendo a verdade da máquina de estados.
+  16. **A ordem dos testes em `approval_state` importa.** `approved_at` primeiro, porque é
+      a única fonte de verdade de "aprovada" ([02] §3). Depois `plan_hash is None`
+      (nunca planejada). Só então `approved_manifest_id is None` — que só pode ser o rastro
+      que `_invalidate_approval_on_entry` deixa, porque é o único caminho que produz plano
+      sem candidato.
+  17. **`GET /tasks/{id}/context` continua 404 nos dois casos, com mensagens diferentes.**
+      O status está certo — não há manifest — e mudar o `code` quebraria clientes sem
+      ganho. O que estava errado era instruir uma ação que o backend recusa: mandar rodar
+      `POST /plan` numa task que responde `409` a ele. Agora cada motivo nomeia a ação que
+      existe.
+  18. **A UI oferece "Rejeitar e replanejar" como ação primária em `requires_replan`,** e
+      esconde "Aprovar" em vez de desabilitá-lo. Um botão desabilitado sem explicação foi
+      exatamente o que a auditoria encontrou; esconder o que responde `409` e destacar o
+      que avança é a diferença entre um beco e um caminho.
+  19. **Defeito meu, encontrado em self-review e corrigido antes de fechar:** a primeira
+      versão de `approval_state` testava `approved_manifest_id is None` **antes** do
+      status, e `reject` limpa o candidato deixando `plan_hash` — então toda task rejeitada
+      relatava `requires_replan`, e a UI mandaria "rejeite e replaneje" a quem acabou de
+      rejeitar. Seria repetir na projeção nova exatamente a instrução impossível que
+      AUD2-004 existe para corrigir. O teste de status vem primeiro, e ganhou dois casos
+      próprios (task rejeitada e task cancelada).
+  20. **AUD2-005: a regra virou *allowlist de valor*, não de campo.** A versão anterior
+      confiava no **nome** (`network_policy`, `cwd_mode` são enum, logo são seguros) e
+      devolvia cru qualquer coisa gravada lá. A coluna é JSON livre: um valor que não é o
+      esperado não é enum coisa nenhuma, é texto livre, e vai para o redator como todo o
+      resto. `output_limits` deixou de ser um `dict(value)` raso e passa pela recursão.
+  21. **O contrafactual de AUD2-005 é tão importante quanto a correção:** a configuração
+      legítima continua saindo como está, porque a UI precisa dela para exibir a política.
+
+- Gates verificados:
+  - suíte completa do backend — ver a linha `PYTEST_EXIT` no relatório desta sessão;
+  - `ruff check` / `ruff format --check` / `mypy`: limpos (97 arquivos, 100 formatados);
+  - frontend: `npm run lint`, `npm test` (129 testes, 19 arquivos), `npm run build` verdes;
+  - **as sondas da segunda rodada do Codex viraram**: as **11** que afirmavam comportamento
+    defeituoso (`test_attack_*`) agora **falham** — as cinco de `duplicate_secret_path_table`,
+    as três de `malformed_document_redaction`, as duas de `cancel_during_plan_flush` e a de
+    `runner_secret_public_fingerprint` —, e as **14** de confirmação continuam passando,
+    incluindo `test_001_head_null_manifest_all_consumers` (que afirma o estado **seguro** de
+    AUD2-004, preservado: nenhuma aresta nova foi criada), `test_005`, `test_007`,
+    `test_009`, a matriz de `test_012` e `test_ast_independent_inventory`;
+  - análise estática: exatamente **uma** caminhada recursiva de redação em todo o backend;
+    **nenhum** padrão da denylist de [04] §5 aparece como literal em `orchestrator/`; a
+    delegação a `is_secret_path` existe por AST.
+
+- Pendências:
+  - **Nada commitado, nada pushado. E7 não iniciada.**
+  - `approval_state` é projeção de leitura e não entra em hash nenhum — em particular, não
+    entra no `execution_fingerprint`.
+  - A guarda de entrada continua sem rota HTTP na E6: `requires_replan` e o
+    `approval_state = requires_replan` são alcançados pelo serviço, e a rota chega na E7.
+  - Aguardando a terceira rodada de auditoria independente do Codex.
+
+---
+
+## 2026-09-14 — Codex — E6: terceira auditoria independente
+
+- Relatório e sondas, fora do repositório:
+  [e6-audit-round-3.md](C:/Users/pedro/.codex/visualizations/2026/09/13/01a098b3-24ec-7202-b7c5-1deddf8aa9ec/e6-audit-round-3.md)
+  e `test_e6_audit_round3.py` no mesmo diretório.
+- **Sem GREEN.** Bloqueadores: **E6-AUD3-001** (Alta/P1) — a garantia de redação não
+  cobria toda a superfície de saída da API: `DevWorkspace.name`/`local_path`/
+  `linked_project_id`/`default_branch`, nome de branch Git no preflight e no manifest de
+  task, toda a projeção do Context Registry (`title`, `body`, `tags`, `structured`,
+  `source_refs`), e `detail[].input` de respostas `422` de `RequestValidationError`
+  saíam crus — cada superfície corrigida individualmente deixou irmãs de fora, o mesmo
+  padrão das rodadas 1 e 2 aplicado num escopo maior; **E6-AUD3-002** (Média/P2) — as
+  escritas de `/approve` anteriores ao CAS final (`INSERT SafetyEvent` na divergência de
+  fingerprint; `UPDATE ContextRegistryEntry` na reverificação de `needs_fix`) ainda
+  propagam conflito de concorrência como `500`, porque `_abort_planning` só participa de
+  `/plan` — a tradução de AUD2-002 não cobre `/approve`.
+- Dois achados adicionais de baixa severidade: **E6-AUD3-003** — `redact_document`
+  percorre valores, não chaves; uma credencial usada como **chave** de um documento JSON
+  (`structured`, ou `test_config.output_limits` malformado) escapa da recursão canônica;
+  **E6-AUD3-004** — `approval_state` (introduzido na correção da rodada 2) não está
+  documentado em `docs/`, incluindo o exemplo `status=cancelled` +
+  `approval_state=approved` (aprovação histórica preservada após cancelamento).
+- Os cinco findings da segunda rodada foram reverificados com experimentos **novos** (não
+  os testes de regressão da implementação) e confirmados corrigidos nos cenários
+  reproduzidos — AUD2-002 corrigido para o trabalho do plano (AUD3-002 é o caminho irmão
+  em `/approve`); AUD2-003 confirmado com candidatos adicionais (diretório, caixa, sufixo)
+  e com override sintético afetando o hash; AUD2-005 confirmado para valores, com o gap
+  de chave dinâmica sendo justamente AUD3-003.
+- 39 sondas próprias. Suíte completa reexecutada: 1.600 passed, 6 skipped, 542,7s;
+  frontend 129 testes em 19 arquivos.
+- Nenhuma correção, commit ou alteração de arquivo do projeto nesta rodada.
+
+---
+
+## 2026-09-14 — Claude Sonnet 5 — E6: formaliza o princípio de redação e documenta approval_state (E6-AUD3-004)
+
+Tarefa **somente documentação**, escopo fechado: `docs/architecture/04-safety-and-git-
+runtime.md`, `docs/architecture/06-api-and-ui-boundaries.md`, `AGENT_LOG.md`. Não corrige
+E6-AUD3-001/002/003 — esses exigem mudança de código e ficam para uma rodada própria.
+Endereça só a lacuna documental que a auditoria classificou como não-bloqueante:
+E6-AUD3-004.
+
+- Arquivos alterados:
+  - `docs/architecture/04-safety-and-git-runtime.md` §5 — a linha "Camada 3 — Saída" da
+    tabela de proteção de segredos passou de `safety.redact` para `safety.redact_document`
+    (o nome real do ponto de entrada canônico desde a E6-AUD2), e ganhou o parágrafo do
+    princípio fail-closed formal, citado quase verbatim do prompt: toda string — valor
+    **ou** chave — que sai como JSON por `/api/*` passa pelo sanitizador central por
+    padrão, em sucesso e em erro (inclusive `RequestValidationError.detail[].input`), sem
+    exceção distribuída por schema, com a única exceção sendo o *escape hatch* estreito e
+    testado do `purge_token`, aplicado antes da serialização para bytes (nunca por
+    *reparsing*), com HTML de bootstrap/assets/SSE fora deste *boundary*;
+  - `docs/architecture/06-api-and-ui-boundaries.md` §1 — item 6 na lista de Defesas,
+    referência cruzada curta para o princípio de 04 §5;
+  - `docs/architecture/06-api-and-ui-boundaries.md`, seção "O que o Task Detail precisa
+    mostrar" — bullet para `approval_state` mais um quadro `#### approval_state
+    (E6-AUD3-004)` novo: os quatro valores confirmados no código
+    (`app/orchestrator/execution_manager.py`), a regra de derivação, a tabela de ações
+    válidas por valor, e o exemplo `status=cancelled` + `approval_state=approved`.
+
+- Decisões tomadas:
+  1. **O princípio da Camada 3 é citado sem alteração de conteúdo**, exatamente como o
+     prompt o formulou — é a formalização de uma garantia que já orienta o código desde
+     E6-AUD2-001 (a caminhada única `redact_document`), não uma promessa nova.
+  2. **A tabela de proteção de segredos passou a nomear `redact_document`, não `redact`.**
+     `redact` continua existindo (é o motor escalar que `redact_document` invoca), mas o
+     ponto de entrada da Camada 3 — o que qualquer resposta de API atravessa — é a
+     caminhada recursiva. Nomear o escalar ali estaria descrevendo a peça errada.
+  3. **O princípio é documentado como contrato-alvo, não como fato 100% implementado
+     hoje** — e isso é dito explicitamente, com um aviso de cobertura logo abaixo da
+     citação: `redact_document` redige valores recursivamente; chaves dinâmicas de JSON
+     ainda escapam (E6-AUD3-003, aberto). Escrever a garantia como se já valesse por
+     completo seria a `docs/` mentir sobre o estado do código — o oposto do que a
+     Architecture Freeze existe para impedir. O gap fica nomeado e rastreável, não
+     escondido sob uma frase absoluta.
+  4. **O cross-reference em 06 §1 entra como item 6 da lista de Defesas, não como
+     nota de rodapé.** As defesas 1–5 protegem *quem pode chamar*; a redação protege *o
+     que a resposta pode conter* — é uma defesa da mesma classe, não um adendo, e a lista
+     numerada é onde esse tipo de garantia já vive nesta seção.
+  5. **`approval_state` entra em 06, não em 02.** [02] §3–§4 são o modelo de dados e a
+     máquina de estados **congelados**; `approval_state` não é uma coluna nem uma
+     transição — é uma projeção de leitura que [06] já é o documento certo para descrever
+     (é onde `execution_fingerprint`, `diverged_fields` e o resto do contrato de resposta
+     de `/api/tasks` vivem). Não abre ADR nem toca em [02].
+  6. **Os quatro valores e a regra de derivação foram confirmados no código antes de
+     escrever a doc** (`app/orchestrator/execution_manager.py::approval_state`), não
+     copiados do relatório de auditoria nem inferidos do prompt — inclusive o detalhe de
+     que a distinção `requires_replan`/`pending` só se aplica dentro de
+     `awaiting_approval`/`needs_fix`, e que fora deles (`draft`, terminais sem aprovação)
+     o valor é `not_planned` — não "replanejamento necessário", que seria uma leitura mais
+     óbvia e errada da tabela.
+  7. **A tabela de ações válidas nomeia o `409` que `awaiting_approval → planning` produz**
+     explicitamente, para que a doc não repita — desta vez na documentação, e não no
+     código — o mesmo tipo de instrução impossível que E6-AUD2-004 corrigiu na mensagem de
+     erro e na UI.
+  8. **O exemplo obrigatório do prompt entra como parágrafo próprio**, com a consequência
+     operacional explícita ("nenhuma ação de aprovação ou planejamento é liberada por
+     isso") — é a frase que fecha a possibilidade de alguém ler "approval_state=approved"
+     como "posso agir como se estivesse aprovada".
+
+- Pendências (não endereçadas nesta tarefa, por estarem fora do escopo documental):
+  - **E6-AUD3-001** (Alta) — cobertura de redação ainda incompleta em várias superfícies de
+    API (workspace, preflight, manifest de task, Context Registry, `422`).
+  - **E6-AUD3-002** (Média) — conflito de concorrência em `/approve` ainda vira `500`.
+  - **E6-AUD3-003** (Baixa) — chaves dinâmicas de JSON fora da recursão de redação —
+    citado nesta rodada de documentação como o gap explícito contra o princípio formal.
+  - **Nada commitado, nada pushado. E7 não iniciada.**

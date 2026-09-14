@@ -288,9 +288,34 @@ instrução**: nada ali eleva permissão.
 | --- | --- | --- |
 | **1 — Seleção** | `context_engine` | Glob que casaria com arquivo secreto é rejeitado na escrita da entrada; no manifest, secretos entram em `excluded` com `reason = secret_policy` |
 | **2 — Acesso** | `safety` + `path_runtime` + `ToolExecutor` | Nega leitura e escrita de path da denylist, para qualquer operação mediada |
-| **3 — Saída** | `safety.redact` | Texto que sai do backend — resposta JSON, log, `summary`, `error_summary`, diff — passa pelo redator |
+| **3 — Saída** | `safety.redact_document` | Toda string que sai do backend — resposta JSON, log, `summary`, `error_summary`, diff — passa pelo redator |
 
-`safety/redaction.py` expõe, além de `redact(text)`, a API pura `is_sensitive_key(key)` e
+**Princípio fail-closed da Camada 3 (formalizado após E6-AUD3-001).** "O texto que sai
+passa pelo redator" não é orientação de estilo — é garantia estrutural:
+
+> Toda string (valor **ou** chave) que sai como JSON por `/api/*` passa pelo sanitizador
+> central por padrão — sucesso, erro, erro de domínio, e `RequestValidationError`
+> (inclusive `detail[].input`) — independente de rota, schema, profundidade ou origem do
+> campo. Não existe exceção distribuída por schema (nenhum
+> `Field(json_schema_extra={"redact": False})` ou equivalente). A única exceção é um
+> *escape hatch* estreito, explícito e testado (`purge_token`), nunca uma flag genérica
+> reaproveitável por outro campo. O *boundary* de sanitização acontece **antes** da
+> serialização para bytes, nunca por *reparsing* de JSON já serializado. HTML de
+> bootstrap, assets estáticos e o futuro SSE (E11) têm contrato próprio, fora deste
+> *boundary*.
+
+A garantia é **por padrão**, não por rota corrigida: cada superfície nova herda a proteção
+sem que quem a escreve precise lembrar de invocá-la. `redact_document` é a única
+caminhada recursiva que a implementa — nenhum segundo `_redact_tree` ad hoc por módulo.
+
+> **Cobertura atual vs. princípio.** `redact_document` hoje percorre **valores**
+> recursivamente; chaves dinâmicas de JSON (uma credencial usada como chave, não como
+> valor) ainda não são cobertas pela mesma caminhada — gap rastreado como E6-AUD3-003. O
+> princípio acima ("valor **ou** chave") é o contrato-alvo desta camada, e uma cobertura
+> parcial é um achado de auditoria a corrigir, não uma segunda forma válida da garantia.
+
+`safety/redaction.py` expõe, além de `redact(text)` (escalar) e `redact_document(value)`
+(documento, recursivo sobre valores), a API pura `is_sensitive_key(key)` e
 `detect_secret_spans(text)` — mesmo motor de detecção, reaproveitado pelo Context Engine
 (E5) para redação estrutural/posicional ([03](03-context-architecture.md) §4). Nenhuma
 segunda lista de nomes sensíveis ou segundo motor de regex existe.
