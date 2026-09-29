@@ -7084,3 +7084,55 @@ ruff 0.9.10, mypy 1.20.2 — todos dentro das faixas do `pyproject.toml`).
   `run3_full.log`, `static_*.log`).
 - As falhas/erros do Codex (3 failed, 622 errors) vieram de Python 3.14/pytest 9/FastAPI
   0.135 fora das faixas do projeto; não reproduzem no ambiente correto.
+
+## 2026-09-29 — Claude Sonnet 5.5 (effort: high) — E7.2: contratos do Agent Runtime
+
+Branch `e7/02-agent-runtime-contracts`, criada de `main` (`0aef0eb`, contém E7.1 `cf6d041`).
+Sem commit, push ou PR.
+
+- Arquivos criados:
+  - `api/app/tool_executor/{__init__,contracts,validation}.py` — só contratos: as 9 operações
+    (`ToolRequest` = união fechada), `ToolResult`, `MediatedUsage`, `ExecutionWorkspaceRef`,
+    `RunScope`, Protocols `MediatedTools`/`ToolExecutor`/`ToolExecutorFactory`.
+  - `api/app/agent_runtime/{__init__,dto,declaration,interfaces}.py` — requests/results,
+    `RunLimits`, `CancelToken`, Protocols `DeveloperProvider`/`AuditorProvider`/`TestRunner`,
+    `EnforcementMethod`/`EnforcementEvidence`/`CapabilityDeclaration`.
+  - `api/tests/test_agent_runtime_contracts_e7_2.py` (73 testes).
+- Arquivos alterados: `api/tests/test_architecture.py` (+5 testes de fronteira). `docs/`,
+  `state_machine.py`, `fingerprint.py`, `execution_manager.py`, `src/` intocados.
+- Decisões:
+  - Contratos de ferramenta em `tool_executor/contracts.py`; `agent_runtime` importa e
+    reexporta (`agent_runtime → tool_executor`, nunca o inverso).
+  - **Declaração ≠ prova**: `CapabilityDeclaration` não tem `proven`, não expõe
+    `effective_profile_hash` e não constrói `CapabilityProof`. Valida só coerência
+    (método sem evidência, `not_enforceable` com evidência, segredo na evidência) e calcula
+    `declaration_hash` para correlação. Prova real fica para E7.6/E8. Auditor não herda a
+    projeção do fingerprint v1.
+  - `TestRequest` reutiliza `safety.TestPolicy`; `command_hash`/`policy_hash` continuam
+    métodos dela, nada recalculado.
+  - `files_read=None` ⇔ `files_read_source=unavailable`; `()` é "leu zero".
+- Gates (venv oficial): novos 73 passed; novos + architecture + E7.1: 337 passed; suíte
+  completa **2097 passed, 6 skipped, 0 failed** (741 s, exit 0; skips = os 6 preexistentes
+  de symlink/volume no Windows). `ruff check` exit 0; `ruff format --check` exit 0 (126
+  arquivos); `mypy` exit 0 (123 arquivos, strict — confere assinaturas dos Protocols por
+  atribuição de fakes).
+- Pendências: auditoria independente (Codex); E7.3 não iniciada; conexão com
+  `start_execution`/`CapabilityProver` só na E7.6/E8.
+
+## 2026-09-29 — Claude Sonnet 5.5 (effort: medium) — E7.2: correção do P2 da auditoria
+
+Auditoria Codex da E7.2: BLOCKED por um único P2. Ainda sem commit.
+
+- Causa raiz: `_ref` em `tool_executor/contracts.py` recusava opção (`-`) e espaço, mas aceitava
+  `:`. `GitShow(ref="HEAD:.env")` passava na construção e, para o git, `<rev>:<caminho>`
+  lê um arquivo — contornaria a checagem de `path` se o executor validasse só esse campo.
+- Correção mínima: `_ref` recusa `:` (nome de ref git válido nunca o contém). `_ref` já é
+  usada por `GitShow.ref`, `GitDiff.ref` e `GitListTree.ref` — os únicos campos de ref.
+- Testes novos (+14): `HEAD:.env`, `HEAD:README.md`, `HEAD^{tree}:.env`, `:/.env`, `a:b`, `:`
+  recusados em `GitShow`/`GitDiff`/`GitListTree` na construção; `HEAD`, sha1/sha256,
+  `refs/heads/main`, `HEAD~2`, `v1.0`, `main^{tree}` continuam aceitas.
+- Gates: novos+architecture+E7.1 351 passed; ruff check/format --check e mypy exit 0;
+  suíte completa **2111 passed, 6 skipped, 0 failed** (776 s). Skips (preexistentes,
+  Windows): 1 "volumes distintos" e 2 "symlink indisponível" em `test_path_runtime.py`;
+  3 "symlink indisponível" em `test_security_regressions.py`.
+- Fora de escopo/inalterado: fingerprint v1, docs, arquitetura de pacotes.

@@ -1220,3 +1220,86 @@ def test_context_engine_nao_casa_regex_sobre_conteudo_autoral() -> None:
             "conteúdo autoral pertence a safety/redaction.py "
             "(`is_sensitive_key`/`detect_secret_spans`)"
         )
+
+
+# ------------------------------------------------------------------------------ E7.2
+
+_STDLIB_PERMITIDA_NOS_CONTRATOS = {
+    "__future__",
+    "dataclasses",
+    "enum",
+    "re",
+    "types",
+    "typing",
+}
+
+
+def _imports_do_projeto(pasta: str) -> dict[str, set[str]]:
+    resultado: dict[str, set[str]] = {}
+    for path in (APP_ROOT / pasta).rglob("*.py"):
+        resultado[path.name] = {i for i in _imports(path) if i.split(".")[0] == "app"}
+    return resultado
+
+
+def _externos(pasta: str) -> dict[str, set[str]]:
+    resultado: dict[str, set[str]] = {}
+    for path in (APP_ROOT / pasta).rglob("*.py"):
+        resultado[path.name] = {i for i in _imports(path) if i.split(".")[0] != "app"}
+    return resultado
+
+
+def test_tool_executor_so_depende_de_safety() -> None:
+    """[01] §3: `tool_executor → agent_runtime` criaria ciclo; `→ db`/`orchestrator` idem.
+
+    Na E7.2 o pacote só tem contratos, então nem `path_runtime`/`git_runtime` entram ainda.
+    """
+    for nome, importados in _imports_do_projeto("tool_executor").items():
+        for imported in importados:
+            assert imported.startswith(("app.safety", "app.tool_executor")), (
+                f"tool_executor/{nome} importa `{imported}`: só `safety` é permitido"
+            )
+
+
+def test_agent_runtime_so_depende_de_safety_e_tool_executor() -> None:
+    """[01] §2: `agent_runtime` pode importar `safety` e `tool_executor`; **não** `db`,
+    `orchestrator`, `context_engine`, `api`."""
+    for nome, importados in _imports_do_projeto("agent_runtime").items():
+        for imported in importados:
+            assert imported.startswith(("app.safety", "app.tool_executor", "app.agent_runtime")), (
+                f"agent_runtime/{nome} importa `{imported}`: [01] §2 proíbe"
+            )
+
+
+def test_contratos_usam_so_stdlib_de_tipos() -> None:
+    """Sem `os`, `subprocess`, `socket`, `pathlib`, SDK: os contratos não têm efeito."""
+    for pasta in ("agent_runtime", "tool_executor"):
+        for nome, externos in _externos(pasta).items():
+            for imported in externos:
+                assert imported.split(".")[0] in _STDLIB_PERMITIDA_NOS_CONTRATOS, (
+                    f"{pasta}/{nome} importa `{imported}`: contratos não têm IO nem SDK"
+                )
+
+
+def test_so_agent_runtime_importa_tool_executor_e_ninguem_importa_agent_runtime() -> None:
+    """Sem ciclo e sem atalho: camadas superiores recebem as portas por injeção."""
+    for path in ALL_FILES:
+        modulo = _module_name(path)
+        for imported in _imports(path):
+            if imported.startswith("app.agent_runtime"):
+                assert modulo.startswith("app.agent_runtime"), (
+                    f"{modulo} importa `{imported}`: só o composition root (E7.6+) poderá"
+                )
+            if imported.startswith("app.tool_executor"):
+                assert modulo.startswith(("app.tool_executor", "app.agent_runtime")), (
+                    f"{modulo} importa `{imported}`: fora do combinado em [01] §3"
+                )
+
+
+def test_nao_ha_adaptador_concreto_nem_executor_concreto_na_e7_2() -> None:
+    """Adaptadores (`agent_runtime/adapters/`) e o executor são E7.5+/E8+."""
+    assert not (APP_ROOT / "agent_runtime" / "adapters").exists()
+    assert {p.name for p in (APP_ROOT / "tool_executor").glob("*.py")} == {
+        "__init__.py",
+        "contracts.py",
+        "validation.py",
+    }
