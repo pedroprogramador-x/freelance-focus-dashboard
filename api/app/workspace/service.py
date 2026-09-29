@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -38,10 +39,12 @@ from app.git_runtime import GitPreflight
 from app.git_runtime import preflight as _git_preflight_read
 from app.path_runtime import inspect
 from app.safety import SafetyPolicy, decide_path, prevalidate_path_syntax
+from app.safety.test_policy import InvalidTestPolicy, parse_test_policy
 from app.workspace.errors import (
     DuplicateLocalPath,
     InvalidLocalPath,
     InvalidStatusTransition,
+    InvalidTestConfig,
     InvalidWorkspaceName,
     WorkspaceNotFound,
 )
@@ -169,6 +172,38 @@ def update_workspace_status(
         raise InvalidStatusTransition(f"workspace já está em '{new_status.value}'")
 
     workspace.status = new_status
+    workspace.updated_at = utcnow()
+    session.flush()
+    return workspace
+
+
+def set_test_config(
+    session: Session, workspace_id: str, config: dict[str, Any] | None
+) -> DevWorkspace:
+    """Configura ou **limpa** a `TestPolicy` do workspace ([04] §6).
+
+    `None` limpa: é o estado legítimo "sem Test Runner configurado" ([02] §7), não um erro.
+
+    A validação de forma roda **aqui**, antes de gravar, e é a **mesma** função que o
+    Planner usa para ler (`safety.test_policy.parse_test_policy` — [04] §5 põe a
+    `TestPolicy` em `safety/`, e é por isso que `workspace/` e `orchestrator/` podem
+    compartilhá-la sem nenhuma aresta de import nova). Um documento inválido é recusado com
+    `422` na escrita, em vez de virar uma linha que só quebraria no `POST /plan`.
+
+    O valor gravado é a forma **normalizada** que `parse_test_policy` produziu, não o
+    dicionário cru: gravar o cru deixaria `{"argv": [" -q "]}` e `{"argv": ["-q"]}` como
+    duas linhas textualmente distintas que produzem o mesmo `command_hash` — e a UI, ao
+    comparar documentos para dizer o que mudou, acusaria uma mudança que o fingerprint não
+    vê.
+    """
+    workspace = get_workspace(session, workspace_id)
+
+    try:
+        parsed = parse_test_policy(config)
+    except InvalidTestPolicy as error:
+        raise InvalidTestConfig(str(error)) from error
+
+    workspace.test_config = parsed.as_document() if parsed else None
     workspace.updated_at = utcnow()
     session.flush()
     return workspace

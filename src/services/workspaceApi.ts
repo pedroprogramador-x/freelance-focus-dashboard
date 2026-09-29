@@ -24,6 +24,10 @@ export interface Workspace {
   repository_url: string | null
   default_branch: string | null
   status: WorkspaceStatus
+  // A `TestPolicy` deste workspace (docs/architecture/04 §6), normalizada pelo backend.
+  // `null` = sem Test Runner configurado, e nesse caso o `test_binding` do fingerprint tem
+  // os três campos nulos (docs/architecture/02 §7).
+  test_config: Record<string, unknown> | null
   created_at: string
   updated_at: string
 }
@@ -60,12 +64,25 @@ export interface PurgePreview extends PurgeCounts {
 export class WorkspaceApiError extends Error {
   readonly code: string
   readonly status: number | null
+  // Campos de diagnóstico que o corpo do erro trouxe além de `{code, message}`.
+  //
+  // docs/architecture/06 §2 exige que um 409 venha "sempre com o motivo e **qual campo
+  // divergiu**", e o backend responde isso como dado estruturado (`diverged_fields`,
+  // `guard`, `current_status`…). Descartá-lo aqui obrigaria a UI a extrair o diagnóstico
+  // da mensagem em prosa — que é exatamente o que o campo estruturado existe para evitar.
+  readonly details: Record<string, unknown>
 
-  constructor(code: string, message: string, status: number | null = null) {
+  constructor(
+    code: string,
+    message: string,
+    status: number | null = null,
+    details: Record<string, unknown> = {},
+  ) {
     super(message)
     this.name = 'WorkspaceApiError'
     this.code = code
     this.status = status
+    this.details = details
   }
 }
 
@@ -117,11 +134,13 @@ export async function apiRequest<T>(path: string, init?: RequestInit): Promise<T
   const body: unknown = raw ? JSON.parse(raw) : null
 
   if (!response.ok) {
-    const detail = (body ?? {}) as { code?: string; message?: string }
+    const detail = (body ?? {}) as Record<string, unknown>
+    const { code, message, ...rest } = detail
     throw new WorkspaceApiError(
-      detail.code ?? 'error',
-      detail.message ?? `HTTP ${response.status}`,
+      typeof code === 'string' ? code : 'error',
+      typeof message === 'string' ? message : `HTTP ${response.status}`,
       response.status,
+      rest,
     )
   }
 

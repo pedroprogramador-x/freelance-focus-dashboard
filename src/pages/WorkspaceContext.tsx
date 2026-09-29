@@ -20,6 +20,7 @@ import { useOptionalApp } from '../context/AppContext'
 import {
   createContextEntry,
   deleteContextEntry,
+  fetchContextEditView,
   importPlanning,
   listContextEntries,
   updateContextEntry,
@@ -31,6 +32,7 @@ import {
 } from '../services/contextApi'
 import {
   buildEntryPatch,
+  editFormOf,
   emptyEntryForm,
   entryFormOf,
   isFormDirty,
@@ -156,11 +158,41 @@ function ContextEntryEditor({
   onSaved: (saved: ContextEntry) => void
   onClose: () => void
 }) {
-  const baseline = useMemo(() => (entry ? entryFormOf(entry) : emptyEntryForm()), [entry])
-  const [form, setForm] = useState<EntryForm>(baseline)
+  // A projeção que a lista carrega sai **redigida** (docs/architecture/04 §5). Ela serve
+  // de ponto de partida imediato para a tela não piscar, e é substituída pelo conteúdo cru
+  // assim que `edit-view` responde — salvar a projeção persistiria `«redigido»` no lugar do
+  // trecho escondido, e o backend recusa esse PATCH.
+  const projecao = useMemo(() => (entry ? entryFormOf(entry) : emptyEntryForm()), [entry])
+  const [baseline, setBaseline] = useState<EntryForm>(projecao)
+  const [form, setForm] = useState<EntryForm>(projecao)
+  const [expectedHash, setExpectedHash] = useState('')
+  const [loadingRaw, setLoadingRaw] = useState(Boolean(entry))
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [confirmingExit, setConfirmingExit] = useState(false)
+
+  useEffect(() => {
+    if (!entry) return
+    let cancelado = false
+    setLoadingRaw(true)
+    fetchContextEditView(entry.id)
+      .then((view) => {
+        if (cancelado) return
+        const cru = editFormOf(projecao, view)
+        setBaseline(cru)
+        setForm(cru)
+        setExpectedHash(view.edit_hash)
+      })
+      .catch((caught: unknown) => {
+        if (!cancelado) setError(messageOf(caught))
+      })
+      .finally(() => {
+        if (!cancelado) setLoadingRaw(false)
+      })
+    return () => {
+      cancelado = true
+    }
+  }, [entry, projecao])
 
   const dirty = isFormDirty(form, baseline)
   const set = <K extends keyof EntryForm>(key: K, value: EntryForm[K]) =>
@@ -193,7 +225,12 @@ function ContextEntryEditor({
       } else {
         // Campo ausente ≠ campo nulo (docs/architecture/03 §3): `source_refs` só vai no
         // corpo quando **mudou** — ver `buildEntryPatch`.
-        onSaved(await updateContextEntry(entry.id, buildEntryPatch(form, baseline, structured.value)))
+        onSaved(
+          await updateContextEntry(
+            entry.id,
+            buildEntryPatch(form, baseline, structured.value, expectedHash),
+          ),
+        )
       }
       onClose()
     } catch (caught) {
@@ -294,8 +331,9 @@ function ContextEntryEditor({
           <button type="button" className="button secondary" onClick={requestClose} disabled={busy}>
             Cancelar
           </button>
-          <button className="button primary" disabled={busy}>
-            <Save size={16} /> {busy ? 'Salvando…' : 'Salvar entrada'}
+          <button className="button primary" disabled={busy || loadingRaw}>
+            <Save size={16} />{' '}
+            {busy ? 'Salvando…' : loadingRaw ? 'Carregando conteúdo…' : 'Salvar entrada'}
           </button>
         </div>
       </form>

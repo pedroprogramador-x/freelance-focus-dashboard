@@ -20,16 +20,18 @@ middleware de `app.main` — nenhuma rota aqui a reimplementa.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.orm import Session
 
+from app.api.responses import RedactingJSONResponse
 from app.db.enums import WorkspaceStatus, WorkspaceType
 from app.db.models import DevWorkspace
 from app.db.session import session_scope
 from app.safety import redact
+from app.safety.test_policy import redacted_document
 from app.workspace import (
     PurgeCounts,
     PurgeTokenStore,
@@ -39,7 +41,9 @@ from app.workspace import (
     git_preflight,
     list_workspaces,
     purge_preview,
+    set_test_config,
     update_workspace_status,
+    workspace_subject,
 )
 
 router = APIRouter(tags=["workspaces"])
@@ -90,16 +94,46 @@ class WorkspaceResponse(BaseModel):
     repository_url: str | None
     default_branch: str | None
     status: WorkspaceStatus
+    #: A `TestPolicy` ([04] §6), **normalizada e redigida** (E6-AUD-007). `null` = "sem
+    #: Test Runner configurado".
+    #:
+    #: `env_allowlist` de fato guarda só **nomes** de variáveis ([04] §5), mas `runner_id`,
+    #: `executable` e `argv` são texto livre — `argv: ["--token", "sk-…"]` é uma
+    #: configuração perfeitamente aceitável para o schema e devolvia a credencial inteira
+    #: ao browser. A projeção de saída passa por `redacted_document`; os bytes crus
+    #: continuam na coluna e continuam sendo o que `command_hash`/`policy_hash` afirmam.
+    test_config: dict[str, Any] | None
     created_at: str
     updated_at: str
 
 
-class WorkspaceStatusUpdate(BaseModel):
-    """Corpo de `PATCH /api/workspaces/{id}` — só o `status` alterna ([02] §1)."""
+class WorkspaceUpdate(BaseModel):
+    """Corpo de `PATCH /api/workspaces/{id}`: `status` e/ou `test_config`.
+
+    ## Por que `test_config` entra aqui, e não numa rota dedicada (decisão da E6)
+
+    [06] §2 lista `PATCH /api/workspaces/{id}` como "detalhe e edição" — editar o agregado
+    é literalmente o papel do verbo. Uma rota dedicada (`PUT .../test-config`) seria uma
+    **superfície de API nova** para um campo do mesmo agregado, e [06] §2 fecha a tabela de
+    rotas de propósito; acrescentar uma exigiria mudar `docs/`, que está congelado.
+
+    Os dois campos são **opcionais e independentes**: omitir um o deixa intacto. É o que
+    torna "arquivar" (só `status`) e "configurar o Test Runner" (só `test_config`) duas
+    chamadas que não interferem uma na outra.
+
+    ## `null` significa "limpar", e é distinguido de "omitido" por `model_fields_set`
+
+    `test_config: null` é um valor legítimo — "este workspace não tem Test Runner" ([02]
+    §7) — e precisa ser distinto de *não informado*. Quem responde isso é
+    `model_fields_set` do próprio Pydantic, que registra as chaves **presentes no corpo**:
+    nenhum sentinela é necessário na borda HTTP, e nenhum segundo `UNSET` nasce ao lado do
+    que `app.context_engine.service` já tem para o seu próprio `PATCH`.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    status: WorkspaceStatus
+    status: WorkspaceStatus | None = None
+    test_config: dict[str, Any] | None = None
 
 
 class GitPreflightResponse(BaseModel):
@@ -191,7 +225,13 @@ def _counts_payload(counts: PurgeCounts) -> dict[str, int]:
 
 
 def _to_response(workspace: DevWorkspace) -> WorkspaceResponse:
-    """Serializa redigindo `repository_url` ([01] §4: remote com credencial não vaza)."""
+    """Serializa redigindo `repository_url` e `test_config` ([01] §4, [06] §2).
+
+    Os dois pelo mesmo motivo: são campos de texto livre que o usuário preenche e que
+    podem carregar credencial — um remote `https://user:token@host`, um
+    `argv: ["--api-key", "…"]`. Nenhum middleware corrige a projeção depois; redigir é
+    responsabilidade de quem serializa.
+    """
     return WorkspaceResponse(
         id=workspace.id,
         name=workspace.name,
@@ -201,6 +241,7 @@ def _to_response(workspace: DevWorkspace) -> WorkspaceResponse:
         repository_url=redact(workspace.repository_url) if workspace.repository_url else None,
         default_branch=workspace.default_branch,
         status=workspace.status,
+        test_config=redacted_document(workspace.test_config),
         created_at=workspace.created_at.isoformat(),
         updated_at=workspace.updated_at.isoformat(),
     )
@@ -248,14 +289,24 @@ def show(workspace_id: str, session: SessionDep) -> WorkspaceResponse:
 @router.patch(
     "/workspaces/{workspace_id}",
     response_model=WorkspaceResponse,
-    summary="Arquivar ou reativar (active ⇄ archived)",
+    summary="Arquivar/reativar (active ⇄ archived) e/ou configurar o Test Runner",
 )
 def patch(
     workspace_id: str,
-    payload: WorkspaceStatusUpdate,
+    payload: WorkspaceUpdate,
     session: SessionDep,
 ) -> WorkspaceResponse:
-    return _to_response(update_workspace_status(session, workspace_id, payload.status))
+    informed = payload.model_fields_set
+
+    workspace = get_workspace(session, workspace_id)
+
+    if "status" in informed and payload.status is not None:
+        workspace = update_workspace_status(session, workspace_id, payload.status)
+
+    if "test_config" in informed:
+        workspace = set_test_config(session, workspace_id, payload.test_config)
+
+    return _to_response(workspace)
 
 
 @router.get(
@@ -275,18 +326,34 @@ def git(workspace_id: str, session: SessionDep) -> GitPreflightResponse:
 
 @router.get(
     "/workspaces/{workspace_id}/purge-preview",
-    response_model=PurgePreviewResponse,
+    # `response_model=None`: a rota devolve o `RedactingJSONResponse` já montado — ver
+    # o docstring dela. `PurgePreviewResponse` continua validando a forma, no corpo da função.
+    response_model=None,
     summary="Contagens da purga e emissão do purge_token",
 )
 def purge_preview_route(
     workspace_id: str, session: SessionDep, store: PurgeStoreDep
-) -> PurgePreviewResponse:
+) -> RedactingJSONResponse:
+    """Contagens + o `purge_token`, que é o **único** valor a atravessar sem redação.
+
+    A resposta é montada pelo `RedactingJSONResponse` diretamente, e não devolvida como
+    modelo. O motivo é mecânico e vale registrar, porque é contraintuitivo: o Pydantic
+    **descarta subclasses de `str`** no `model_dump`, então um `Unredacted` devolvido dentro
+    de um modelo chega ao boundary já rebaixado a `str` comum — e seria redigido como
+    qualquer outra string. Verificado, não suposto.
+
+    A validação de forma continua acontecendo: o modelo é construído (com `extra="forbid"`
+    e os tipos declarados), e só o `model_dump` dele é que vira o corpo, com o token
+    reinserido como `Unredacted`. Nada aqui é uma rota sem schema.
+    """
     counts = purge_preview(session, workspace_id)
-    return PurgePreviewResponse(
+    token = store.issue(workspace_subject(workspace_id))
+    payload = PurgePreviewResponse(
         **_counts_payload(counts),
         benchmark_protected=counts.benchmark_protected,
-        purge_token=store.issue(workspace_id),
+        purge_token=token,
     )
+    return RedactingJSONResponse(content={**payload.model_dump(), "purge_token": token})
 
 
 @router.post(

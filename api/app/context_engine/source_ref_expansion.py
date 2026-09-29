@@ -92,6 +92,7 @@ Contrato de importação ([01] §2 + regra de módulo da E4): este pacote import
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -99,7 +100,7 @@ from app.git_runtime import TreeListing, list_tree
 from app.safety.canonical import canonical_sha256
 from app.safety.policy import SafetyPolicy
 from app.safety.secrets import SecretVerdict, classify_path_secrecy
-from app.safety.source_refs import validate_source_ref
+from app.safety.source_refs import normalize_source_ref, validate_source_ref
 from app.safety.types import SafetyDecision
 
 #: Caracteres cujo significado **não** está definido nesta gramática. Recusados, nunca
@@ -603,13 +604,18 @@ def _may_cover(ref: CompiledSourceRef, raw: bytes) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class SourceRefMatcher:
-    """Os `source_refs` compilados, para perguntar "este caminho é coberto?".
+    """Padrões compilados, para perguntar "este caminho é coberto?".
 
     Existe para a **Parte B** de [03] §3: a divergência do working tree precisa ser cruzada
     com a cobertura, e a cobertura tem de ser calculada pela **mesma** gramática que a
     Parte A usou. Um arquivo `untracked` novo em `src/` é coberto por `src/**` mesmo sem
     existir na árvore do `verification_commit` — comparar apenas com a lista já expandida
     perderia exatamente esse caso, que é o mais comum de todos.
+
+    A E6 reaproveita **este mesmo tipo** para as hard rules do Task Analyzer, por
+    `build_classification_matcher`. O que muda lá é só a procedência dos padrões (constante
+    do sistema, não entrada do usuário) e, por isso, a validação de envelope que se aplica
+    antes de compilar — `covers` é literalmente o mesmo código nos dois casos.
     """
 
     compiled: tuple[CompiledSourceRef, ...]
@@ -637,6 +643,74 @@ def build_matcher(
     if isinstance(compiled, SafetyDecision):
         return compiled
     return SourceRefMatcher(compiled=compiled)
+
+
+class ClassificationPatternError(ValueError):
+    """Padrão de classificação malformado. **Erro de programação, não de entrada.**
+
+    Os padrões de classificação são constantes do sistema (a tabela de hard rules de
+    [03] §5), então um padrão que não compila é um defeito no código-fonte, não um dado
+    inválido que chegou de fora. Levantar — em vez de devolver uma `SafetyDecision` que o
+    chamador pode ignorar — faz o defeito parar a suíte no import, em vez de virar uma
+    hard rule que silenciosamente não casa nada. Uma hard rule que não casa nada é
+    *fail-open* sobre classificação de risco, que é o oposto do que ela existe para fazer.
+    """
+
+
+def compile_classification_pattern(pattern: str) -> CompiledSourceRef | SafetyDecision:
+    """Compila um padrão de **classificação** — mesma gramática, **sem envelope**.
+
+    ## Por que `validate_and_compile` não serve aqui (decisão da E6)
+
+    Um `source_ref` é entrada do **usuário** e por isso passa por `validate_source_ref`,
+    que — entre outras coisas — aplica a **denylist de segredos** sobre o padrão tratado
+    como literal. Isso é exatamente certo para um `source_ref`: ninguém aponta uma entrada
+    de contexto para `.env*`.
+
+    Um padrão de **hard rule** do Task Analyzer ([03] §5) é o caso oposto em todos os
+    eixos:
+
+    | | `source_ref` | padrão de hard rule |
+    | --- | --- | --- |
+    | Procedência | usuário, via HTTP | **constante do código**, congelada |
+    | O que faz com um segredo | não pode apontar para um | **existe para reconhecer um** |
+    | Falha ao compilar | recusa a entrada (fail-closed) | *fail-open* sobre risco |
+
+    A tabela de [03] §5 lista literalmente `.env*`, `secrets/**`, `*.pem`, `*.key`,
+    `.npmrc` e `.git-credentials` — que **é** a denylist de [04] §5. Compilá-los por
+    `validate_and_compile` faria a regra mais importante do Analyzer ser negada pelo
+    envelope e nunca chegar a casar: um objetivo que toca `.env` deixaria de ser `high`
+    porque o padrão que reconhece `.env` foi recusado por apontar para `.env`.
+
+    O que **não** muda: a gramática. `compile_source_ref` é a mesma função, e o
+    `CompiledSourceRef` devolvido responde `covers()` pelo mesmo `_matches`. Esta função
+    existe aqui, no dono único da gramática, precisamente para que `orchestrator/` não
+    tenha nenhum motivo para escrever casamento de padrão próprio.
+
+    A normalização continua sendo a de `safety.source_refs.normalize_source_ref` — a mesma
+    que `validate_source_ref` aplica antes de compilar. Só o **envelope de segurança** fica
+    de fora; a forma canônica do padrão não.
+    """
+    return compile_source_ref(normalize_source_ref(pattern))
+
+
+def build_classification_matcher(patterns: Iterable[str]) -> SourceRefMatcher:
+    """Compila padrões de classificação num `SourceRefMatcher`. Ver
+    `compile_classification_pattern`.
+
+    Levanta `ClassificationPatternError` se algum padrão não compilar: são constantes do
+    sistema, e um defeito nelas precisa quebrar no import, não degradar em silêncio.
+    """
+    compiled: list[CompiledSourceRef] = []
+    for pattern in patterns:
+        result = compile_classification_pattern(pattern)
+        if isinstance(result, SafetyDecision):
+            raise ClassificationPatternError(
+                f"padrão de classificação `{pattern}` não compila na gramática de glob: "
+                f"{result.reason} ({result.rule_id})"
+            )
+        compiled.append(result)
+    return SourceRefMatcher(compiled=tuple(compiled))
 
 
 def validate_and_compile(

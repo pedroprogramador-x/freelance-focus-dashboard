@@ -30,6 +30,7 @@ from __future__ import annotations
 import unicodedata
 from typing import Any
 
+from app.context_engine.file_map import encode_path_identity
 from app.safety.canonical import CanonicalizationError, canonical_sha256
 
 #: Versão da fórmula. Muda só se [03] §2 mudar — e aí todo `content_hash` gravado passa a
@@ -122,9 +123,52 @@ def compute_content_hash(
     )
 
 
+#: Versão do `edit_hash`. Separada de `CONTENT_HASH_VERSION` de propósito: são duas
+#: perguntas com ciclos de vida diferentes, e [03] §2 é normativa sobre o que entra no
+#: `content_hash`. Mudar o conjunto de campos editáveis avança esta, não aquela.
+EDIT_HASH_VERSION = 1
+
+
+def compute_edit_hash(
+    *,
+    content_hash: str,
+    tags: list[str] | tuple[str, ...],
+    source_refs: list[str] | tuple[str, ...],
+) -> str:
+    """A **versão de edição** de uma entrada: tudo que um `PATCH` pode mudar (E6-AUD5-004).
+
+    `content_hash` cobre `domain`/`title`/`body`/`structured` ([03] §2) e **não** cobre
+    `tags` nem `source_refs`. Usá-lo como controle de concorrência deixava passar a perda de
+    atualização nesses dois campos: dois editores com a mesma leitura mandavam `tags`
+    diferentes, os dois recebiam `200`, e o segundo apagava o primeiro sem que ninguém visse.
+
+    Este hash **reaproveita** `content_hash` em vez de recalcular a fórmula de
+    título/corpo/estruturado. Duas fórmulas para a mesma pergunta divergiriam na primeira vez
+    que uma delas mudasse — é o mesmo motivo pelo qual só existe um detector de segredo.
+
+    `source_refs` entra por `encode_path_identity`: `canonical_json` normaliza texto em NFC,
+    e dois caminhos grafados em NFC e NFD são **arquivos diferentes** ([02] §7). Colapsá-los
+    aqui faria duas edições genuinamente distintas parecerem a mesma, que é precisamente o
+    contrário do que uma versão de edição existe para detectar.
+
+    A ordem de `tags` e `source_refs` é preservada como está na entrada: reordenar é uma
+    edição, e o serviço já normaliza `tags` antes de gravar.
+    """
+    return canonical_sha256(
+        {
+            "v": EDIT_HASH_VERSION,
+            "content_hash": content_hash,
+            "tags": list(tags),
+            "source_refs": [encode_path_identity(ref) for ref in source_refs],
+        }
+    )
+
+
 __all__ = [
     "CONTENT_HASH_VERSION",
+    "EDIT_HASH_VERSION",
     "CanonicalizationError",
     "compute_content_hash",
+    "compute_edit_hash",
     "normalize_text",
 ]

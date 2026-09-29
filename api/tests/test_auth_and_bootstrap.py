@@ -7,6 +7,9 @@ como uma segunda superfície aberta.
 
 from __future__ import annotations
 
+import ast
+import contextlib
+import io
 from pathlib import Path
 
 import pytest
@@ -314,11 +317,118 @@ def test_token_nao_aparece_em_erro_de_autenticacao(client: TestClient, session_t
     assert "errado" not in response.text, "o erro não pode ecoar o que foi apresentado"
 
 
+def _print_aliases(tree: ast.Module) -> frozenset[str]:
+    """Nomes locais que um `import` ligou a `print`.
+
+    `from builtins import print as escrever` faz `escrever(...)` ser `print(...)` com outro
+    nome. Sem resolver o alias, o detector só reconheceria a grafia literal — e a grafia
+    literal é justamente a que quem quer contornar o teste não usaria.
+    """
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "builtins":
+            aliases.update(
+                alias.asname or alias.name for alias in node.names if alias.name == "print"
+            )
+    return frozenset(aliases)
+
+
+def _calls_print(func: ast.expr, aliases: frozenset[str]) -> bool:
+    """Esta expressão chamada escreve em stdout?
+
+    Duas formas, e a segunda é o que E6-AUD-006 encontrou faltando:
+
+    * `ast.Name` — `print(...)`, e qualquer alias de import resolvido para ele;
+    * `ast.Attribute` com `attr == "print"` — `builtins.print(...)`, `b.print(...)` depois
+      de `import builtins as b`, e qualquer outro receptor.
+
+    O segundo caso é deliberadamente amplo: **não** se tenta provar que o receptor é o
+    módulo `builtins`. Um `.print(...)` de qualquer objeto — um `Console` de biblioteca, um
+    logger que alguém chamou assim — escreve na saída do mesmo jeito, que é a propriedade
+    que este teste protege. A assimetria de custo decide: um falso positivo custa uma
+    conversa e um `noqa` deliberado; um falso negativo custa um token em log.
+
+    Continua **não** sendo busca por substring: `_recompute_fingerprint(` não casa nem como
+    `Name` nem como `Attribute`, que era o falso positivo que motivou a troca.
+    """
+    if isinstance(func, ast.Name):
+        return func.id == "print" or func.id in aliases
+    return isinstance(func, ast.Attribute) and func.attr == "print"
+
+
+def _print_calls(path: Path) -> list[int]:
+    """Linhas em que `print(...)` é de fato **chamado**. Por AST, não por substring.
+
+    A verificação era `"print(" not in source`, e ela passou a acusar falso positivo na E6:
+    `_recompute_fingerprint(` **contém** `print(` como substring. O termo "fingerprint" é
+    central em [02] §7 e aparece em dezenas de identificadores do Orchestrator, então
+    contornar o detector renomeando a função seria deformar o código para caber num teste
+    quebrado.
+
+    Mesma correção — e mesma justificativa — de
+    `test_architecture.test_expansor_e_o_unico_a_decidir_gramatica_dentro_do_safety`: "a
+    verificação é por AST, não por substring", porque o módulo *fala* sobre o que não pode
+    fazer.
+
+    **E6-AUD-006:** a primeira versão só reconhecia `ast.Name`, e por isso deixou de pegar
+    `builtins.print(...)` — que a busca por substring antiga pegava. A afirmação "mais
+    estrito" só passou a ser verdadeira com `_calls_print`, que cobre as duas formas.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    aliases = _print_aliases(tree)
+    return [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _calls_print(node.func, aliases)
+    ]
+
+
 def test_backend_nao_imprime_nada() -> None:
     """`print` é o caminho mais curto para um token acabar em log."""
     for path in APP_ROOT.rglob("*.py"):
-        source = path.read_text(encoding="utf-8")
-        assert "print(" not in source, f"{path.name} usa print()"
+        linhas = _print_calls(path)
+        assert not linhas, f"{path.name} chama print() na(s) linha(s) {linhas}"
+
+
+#: Cada caso é `(fonte, o detector antigo por substring pegava?, deve imprimir "probe")`.
+#: As três primeiras linhas são literalmente a tabela de E6-AUD-006; as duas últimas cobrem
+#: o alias de import e o nome que só *parece* um print.
+_CASOS_DE_PRINT: tuple[tuple[str, bool, bool], ...] = (
+    ('print("probe")', True, True),
+    ('print ("probe")', False, True),
+    ('import builtins\nbuiltins.print("probe")', True, True),
+    ('from builtins import print as escrever\nescrever("probe")', False, True),
+    ("def _recompute_fingerprint(x):\n    return x\n", True, False),
+)
+
+
+@pytest.mark.parametrize(("fonte", "substring_pegava", "imprime"), _CASOS_DE_PRINT)
+def test_o_detector_de_print_reconhece_toda_forma_que_de_fato_imprime(
+    tmp_path: Path, fonte: str, substring_pegava: bool, imprime: bool
+) -> None:
+    """Contrafactual do detector, pelo **próprio** `_print_calls`.
+
+    O caso anterior reimplementava o predicado dentro do teste, e foi por isso que ele
+    continuou verde enquanto o detector real perdia `builtins.print` (E6-AUD-006): o teste
+    não exercitava o código que estava errado. Aqui o arquivo é escrito em disco e passa
+    pela mesma função que a suíte usa contra `app/`.
+
+    Cada caso também é **executado**, e a saída conferida: `imprime` não é uma anotação do
+    autor sobre o que a linha deveria fazer, é o que o Python de fato faz com ela. É o que
+    impede a tabela de afirmar uma premissa falsa sobre o próprio contrafactual.
+    """
+    arquivo = tmp_path / "caso.py"
+    arquivo.write_text(fonte, encoding="utf-8")
+
+    saida = io.StringIO()
+    with contextlib.redirect_stdout(saida):
+        exec(compile(fonte, "<caso>", "exec"), {})  # noqa: S102 — fonte literal desta tabela
+    assert (saida.getvalue() == "probe\n") is imprime, "a premissa do caso está errada"
+
+    assert bool(_print_calls(arquivo)) is imprime, (
+        f"o detector discorda do que a fonte realmente faz (substring antiga: "
+        f"{substring_pegava}); {fonte!r}"
+    )
 
 
 # -------------------------------------------------------------- bootstrap

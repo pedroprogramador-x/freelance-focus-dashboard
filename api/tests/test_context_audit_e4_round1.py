@@ -25,6 +25,7 @@ from app.context_engine import (
     create_entry,
     update_entry,
 )
+from app.context_engine.service import edit_hash_of
 from app.context_engine.source_ref_expansion import (
     CompiledSourceRef,
     ExpansionStatus,
@@ -47,6 +48,20 @@ from app.git_runtime import (
 )
 from app.workspace import create_workspace
 from tests.context_helpers import GIT, commit_all, git, init_repo, readable, write
+
+
+def _update(
+    session: Session, entry: ContextRegistryEntry, **campos: object
+) -> ContextRegistryEntry:
+    """`update_entry` com o `expected_edit_hash` **atual** da entrada.
+
+    Desde E6-AUD4-004 o hash lido é obrigatório: é o que faz uma escrita concorrente virar
+    `409` em vez de apagar a anterior em silêncio. Estes ensaios são sobre outra coisa —
+    baseline, hash de conteúdo, atomicidade —, e o conflito tem testes próprios em
+    `test_e6_audit_round_4.py`. O ajudante mantém os dois assuntos separados.
+    """
+    return update_entry(session, entry, expected_edit_hash=edit_hash_of(entry), **campos)  # type: ignore[arg-type]
+
 
 pytestmark = pytest.mark.skipif(GIT is None, reason="git indisponível no PATH")
 
@@ -471,7 +486,7 @@ def test_aud004_patch_sem_git_tambem_valida(
     entry = _entry(session, workspace_sem_git, ["src/**"])
 
     with pytest.raises(InvalidSourceRefs):
-        update_entry(session, entry, source_refs=["../fora/**"])
+        _update(session, entry, source_refs=["../fora/**"])
 
     assert entry.source_refs == ["src/**"], "nada foi alterado pela metade"
 
@@ -667,7 +682,7 @@ def test_aud007_colisao_tambem_e_recusada_no_patch(
     antes = entry.content_hash
 
     with pytest.raises(InvalidContextEntry):
-        update_entry(session, entry, structured={"x": 1, "x ": 2})
+        _update(session, entry, structured={"x": 1, "x ": 2})
 
     assert entry.content_hash == antes, "nada foi alterado pela metade"
 
@@ -745,6 +760,6 @@ def test_aud010_um_patch_de_verdade_continua_atualizando_updated_at(
     entry = _entry(session, workspace, [])
     antes = entry.updated_at
 
-    update_entry(session, entry, body="corpo revisado\n")
+    _update(session, entry, body="corpo revisado\n")
 
     assert entry.updated_at >= antes

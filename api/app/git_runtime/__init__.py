@@ -5,6 +5,8 @@ Git e o ciclo de vida de worktree. Até aqui existem **três leituras**, todas s
 
 * `preflight` (E3) — dado um caminho absoluto, responde se é repositório, qual o `HEAD`, o
   branch e quantos arquivos divergem da árvore de trabalho.
+* `probe_head` (E6-CONS4) — a parte do preflight que o planejamento consome, sem `status`,
+  e distinguindo "não é repositório", "sem `HEAD`" e "git não pôde ser consultado".
 * `list_tree` (E4) — `(path, blob_sha)` de **um commit**, a Parte A da verificação dupla de
   [03](../../../docs/architecture/03-context-architecture.md) §3.
 * `working_tree_diff_against` (E4, E4-AUD-003) — divergências entre a árvore de trabalho
@@ -95,9 +97,11 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 
 # git de LEITURA apenas; verbos mutantes proibidos (ver docstring + test_architecture.py).
 import subprocess
+import zlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -325,6 +329,417 @@ def preflight(local_path: str) -> GitPreflight:
         branch=branch,
         dirty_file_count=dirty_file_count,
     )
+
+
+#: Os desfechos que `probe_head` distingue (E6-CONS4, decisão D3). `preflight` colapsa
+#: os três primeiros em `is_git_repo=False` — correto para a UI de Overview, errado para o
+#: planejamento, que precisa dizer ao humano **qual** pré-condição falta: `git init` (fora do
+#: backend), o primeiro commit, ou só tentar de novo quando o git voltar a responder.
+PROBE_OK = "ok"
+PROBE_NOT_A_REPO = "not_a_repo"
+PROBE_WITHOUT_HEAD = "no_head"
+PROBE_UNVERIFIABLE = "unverifiable"
+
+
+@dataclass(frozen=True, slots=True)
+class HeadProbe:
+    """Resultado de `probe_head`. ``head`` só é preenchido quando ``state == "ok"``.
+
+    ``unverifiable`` é "o git não pôde ser consultado, ou respondeu de um jeito que não dá
+    para confiar" — `git` ausente do `PATH`, `timeout`, falha de IO ao executar o processo,
+    ou uma leitura que falhou sem que o disco confirme a explicação mais simples (ver
+    `_has_git_marker`/`_has_confirmed_history`, E6-CONS5-001, E6-CONS5V-001). É diferente de
+    ``not_a_repo`` (confirmado: nem o git nem o disco veem repositório algum) e de
+    ``no_head`` (confirmado: repositório real, sem nenhum commit ainda). Um diretório
+    removido cai em ``not_a_repo``:
+    não há `.git` para encontrar, no git nem no disco, e a condição é persistente, não
+    transitória.
+    """
+
+    state: str
+    head: str | None = None
+    branch: str | None = None
+
+
+def _git_marker_at(path: str) -> str | None:
+    """`_resolve_git_dir`, sem busca de ancestrais — só o `.git` de `path` em si.
+
+    `None` quando não há `.git` (arquivo ou diretório) exatamente em `path`.
+    """
+    marker = os.path.join(path, ".git")
+    if os.path.isdir(marker):
+        return marker
+    if not os.path.isfile(marker):
+        return None
+    try:
+        with open(marker, encoding="utf-8", errors="strict") as handle:
+            content = handle.read()
+    except (OSError, UnicodeDecodeError):
+        return marker  # existe, ilegível -- ainda assim confirma "há um .git"
+    prefix = "gitdir:"
+    line = content.strip()
+    if not line.startswith(prefix):
+        return marker
+    target = line[len(prefix) :].strip()
+    return target if os.path.isabs(target) else os.path.join(path, target)
+
+
+def _resolve_git_dir(local_path: str) -> str | None:
+    """Caminho real do diretório `.git` que o git **enxergaria** a partir de `local_path`,
+    só no sistema de arquivos — nenhum comando `git`.
+
+    Existe para os casos em que o git **falhou** ao responder (E6-CONS5-001): sem ele, a
+    única informação disponível seria o retorno de um processo que não completou, e "não
+    é repositório" e "é um repositório corrompido demais para o git nem confirmar isso" dão
+    exatamente o mesmo retorno — mesmo código de saída, mesmo stdout vazio, e mesmo stderr
+    quando o `.git/HEAD` tem conteúdo inválido (git recusa reconhecer o diretório como
+    repositório de jeito nenhum, não só recusa resolver `HEAD`).
+
+    **Busca ancestrais** (E6-CONS5V-001): um `DevWorkspace` pode ser um subdiretório de um
+    repositório cuja raiz está mais acima — o próprio git já faz essa descoberta ao subir a
+    árvore de diretórios a partir de `-C local_path`, e `_has_git_marker`/`_has_confirmed_history`
+    precisam enxergar o mesmo `.git` que o git enxergaria, ou "não há `.git` em `local_path`"
+    vira falso positivo de "não é repositório" para um workspace que o git reconhece — o
+    diretório pai é que está corrompido, não a ausência de repositório. A busca é **limitada
+    do mesmo jeito que a do git por padrão**: para na raiz do sistema de arquivos e nunca
+    atravessa uma fronteira de dispositivo/montagem (o git só faz isso com
+    `GIT_DISCOVERY_ACROSS_FILESYSTEM=true`, que `_git_env` nunca define) — não é uma busca
+    sem limites, é a mesma que `rev-parse --is-inside-work-tree` já faria se pudesse
+    responder. Segue o arquivo `gitdir:` de um worktree/submódulo por completude; não abre
+    nem interpreta mais nada do conteúdo. `None` só quando nenhum ancestral, até a raiz ou a
+    fronteira de dispositivo, tem `.git`.
+    """
+    current = os.path.abspath(local_path)
+    try:
+        boundary_dev: int | None = os.stat(current).st_dev
+    except OSError:
+        boundary_dev = None
+
+    while True:
+        found = _git_marker_at(current)
+        if found is not None:
+            return found
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None  # raiz do sistema de arquivos: fim da busca
+        if boundary_dev is not None:
+            try:
+                parent_dev = os.stat(parent).st_dev
+            except OSError:
+                return None
+            if parent_dev != boundary_dev:
+                return None  # fronteira de dispositivo/montagem: git também pararia aqui
+        current = parent
+
+
+def _has_git_marker(local_path: str) -> bool:
+    """`not_a_repo` (confirmado) vs `unverifiable` (git falhou, mas há um `.git` no disco).
+
+    Não depende de texto de stderr do git, que é localizável e muda entre versões
+    (E6-CONS5-001) — só de `.git` existir ou não em `local_path` ou num ancestral que o git
+    alcançaria (E6-CONS5V-001, ver `_resolve_git_dir`).
+    """
+    return _resolve_git_dir(local_path) is not None
+
+
+class _ObjectInspectionUnverifiable(Exception):
+    """Uma falha de E/S impediu concluir a inspeção de histórico — nem "achei", nem "não
+    achei" (E6-CONS5V4-001, E6-CONS5V4-002). Interna deste módulo: levantada por
+    `_stat_or_raise`, `_common_git_dir` e `_has_commit_or_tag_object`, e capturada **só** em
+    `_has_confirmed_history` — a única fronteira. Nunca atravessa até `probe_head`, e nunca é
+    confundida com um `OSError` comum: **não** herda dele de propósito, para que um
+    `except OSError:` mais externo (como os de `_has_commit_or_tag_object`) não a intercepte
+    por engano — cada `OSError` real vira esta exceção exatamente uma vez, na fronteira mais
+    próxima de onde ocorreu, e depois disso viaja como o tipo próprio até ser capturada.
+    """
+
+
+def _stat_or_raise(path: str) -> os.stat_result | None:
+    """`os.stat(path)`, ou `None` quando `path` está **comprovadamente** ausente.
+
+    A peça central da regra única de E/S desta família de correções (E6-CONS5V4-001):
+    `os.path.isdir`/`os.path.isfile`/`os.path.exists` (as versões anteriores) engolem
+    **todo** `OSError` — `FileNotFoundError` (confirmado: não existe) e `PermissionError`
+    (não confirmado: pode existir, só não deu para ler) viram o mesmo `False`, e quem chama
+    depois não tem como saber qual dos dois aconteceu. Aqui os dois se separam: ausência
+    **confirmada** (`FileNotFoundError`, ou `NotADirectoryError` quando um componente do
+    caminho não é diretório) devolve `None`; qualquer outra falha de E/S levanta
+    `_ObjectInspectionUnverifiable` em vez de devolver um valor que pareça "ausente".
+    """
+    try:
+        return os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        raise _ObjectInspectionUnverifiable(path) from exc
+
+
+def _confirmed_dir_exists(path: str) -> bool:
+    """`True` só quando `path` é comprovadamente um diretório; `False` só quando está
+    comprovadamente ausente (ou existe como outra coisa que não diretório). Ver
+    `_stat_or_raise` — qualquer falha de E/S ambígua levanta, nunca vira `False`.
+    """
+    result = _stat_or_raise(path)
+    return result is not None and stat.S_ISDIR(result.st_mode)
+
+
+def _common_git_dir(git_dir: str) -> str:
+    """O Git dir **comum** de `git_dir` — segue `commondir` de um worktree vinculado.
+
+    `objects/`, `refs/` e `config` são sempre compartilhados entre um repositório principal
+    e seus worktrees vinculados — nunca "por worktree" (E6-CONS5V2-001). Só `HEAD`, `index`
+    e `logs/HEAD` são específicos de cada worktree. Sem seguir `commondir`, um worktree
+    vinculado cujo `git_dir` é `<principal>/.git/worktrees/<nome>` nunca vê os objetos do
+    commit, porque eles vivem só em `<principal>/.git`.
+
+    `commondir` **comprovadamente ausente** (`FileNotFoundError`/`NotADirectoryError`, nunca
+    um `PermissionError` disfarçado — E6-CONS5V4-002) significa que `git_dir` já é o comum
+    (repositório principal, ou sem nenhum worktree vinculado) — devolvido sem alteração. Uma
+    falha de E/S que não confirma ausência levanta `_ObjectInspectionUnverifiable`: cair de
+    volta no `git_dir` do próprio worktree silenciosamente, como a versão anterior fazia,
+    perde o armazenamento comum sem avisar ninguém — o mesmo commit que existe no repositório
+    principal deixa de ser visto. Conteúdo ilegível como UTF-8 continua melhor esforço (cai de
+    volta no próprio `git_dir`) — fora do escopo desta correção, que é só sobre falha de E/S,
+    não sobre formato de conteúdo.
+    """
+    commondir_file = os.path.join(git_dir, "commondir")
+    try:
+        with open(commondir_file, encoding="utf-8", errors="strict") as handle:
+            content = handle.read()
+    except (FileNotFoundError, NotADirectoryError):
+        return git_dir
+    except UnicodeDecodeError:
+        return git_dir
+    except OSError as exc:
+        raise _ObjectInspectionUnverifiable(commondir_file) from exc
+    target = content.strip()
+    if not target:
+        return git_dir
+    return target if os.path.isabs(target) else os.path.normpath(os.path.join(git_dir, target))
+
+
+#: Objetos soltos inspecionados por sondagem, no máximo (E6-CONS5V2-002). Um repositório
+#: genuinamente sem commit tem poucos objetos — todos vieram de `add`/`stash` antes do
+#: primeiro commit. Mais que isto sem decidir já é incomum o bastante para não valer a pena
+#: continuar contando: a resposta seca é tratar como não confirmado (ver
+#: `_has_commit_or_tag_object`), o mesmo que a presença de um pacote já faz.
+_MAX_LOOSE_OBJECTS_SCANNED = 512
+
+
+def _loose_object_type(path: str) -> str | None:
+    """Tipo (`blob`, `tree`, `commit`, `tag`) de um objeto solto do git, sem `git`.
+
+    Um objeto solto é `zlib(b"<tipo> <tamanho>\\0<conteúdo>")`. Descomprime só os primeiros
+    bytes — nunca o conteúdo inteiro do objeto — para ler o cabeçalho. `None` para qualquer
+    formato inesperado (arquivo ilegível, não é zlib válido, cabeçalho sem espaço, tipo não
+    alfabético): o chamador trata isso como "não é evidência de nada", nunca como
+    confirmação de tipo nenhum.
+    """
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(64)
+    except OSError:
+        return None
+    try:
+        header = zlib.decompressobj().decompress(raw, 32)
+    except zlib.error:
+        return None
+    type_bytes = header.split(b" ", 1)[0]
+    if not type_bytes or not type_bytes.isalpha():
+        return None
+    try:
+        return type_bytes.decode("ascii", errors="strict")
+    except UnicodeDecodeError:
+        return None
+
+
+#: Tipos de objeto solto que, sozinhos, **não** provam commit algum (E6-CONS5V2-002). Um
+#: `git add` sem nenhum commit grava um objeto `blob` por arquivo staged; nada mais. Um
+#: `tree` também não implica commit por si (é possível escrever uma árvore sem um commit em
+#: cima, embora nenhum verbo deste módulo faça isso) — incluído aqui só por serem os dois
+#: tipos que um estado "genuinamente sem commit" pode conter, nunca por uma lista do que
+#: *conta*: qualquer tipo **fora** deste conjunto (inclusive um tipo que este módulo não
+#: reconhece, ou uma leitura que falhou) é tratado como evidência, não o contrário — a
+#: allowlist é dos tipos seguros, não dos que "provam" história, de propósito (ver
+#: `_has_commit_or_tag_object`).
+_LOOSE_OBJECT_TYPES_WITHOUT_HISTORY_EVIDENCE = frozenset(("blob", "tree"))
+
+
+def _has_commit_or_tag_object(objects_dir: str) -> bool:
+    """`objects_dir` tem algum objeto **além** de `blob`/`tree` — solto ou empacotado? Ou a
+    inspeção não pôde ser concluída?
+
+    E6-CONS5V2-002: contar "qualquer arquivo em objects/" como evidência de commit (a versão
+    anterior) confundia "algo foi staged" com "algo foi commitado" — um `git add` sem commit
+    grava só objetos que ficam em
+    `_LOOSE_OBJECT_TYPES_WITHOUT_HISTORY_EVIDENCE`, nunca um objeto de commit de verdade.
+
+    Só devolve `False` quando a inspeção **termina** sem achar nada fora da allowlist. `True`
+    é evidência encontrada — pacote presente (`objects/pack/*`, sem abrir o formato: poderia
+    conter um commit, e decodificá-lo para descartar essa possibilidade custaria muito mais
+    do que esta sondagem paga), mais de `_MAX_LOOSE_OBJECTS_SCANNED` objetos soltos sem achar
+    nenhum fora da allowlist (não terminar de olhar não é o mesmo que confirmar que não há
+    nenhum), ou um objeto de tipo fora da allowlist de verdade. Qualquer falha de E/S — no
+    `os.stat` do diretório de pacotes, no `os.scandir` do diretório principal ou de um
+    subdiretório, ou levantada no meio da iteração de qualquer um dos dois — levanta
+    `_ObjectInspectionUnverifiable` em vez de `True`/`False` (E6-CONS5V3-001,
+    E6-CONS5V4-001): o objeto que provaria história pode estar exatamente no pedaço que não
+    deu para ler, e "não terminei" não pode virar nem "achei" nem "não achei". Nenhuma
+    exceção **comum** (`OSError`) atravessa esta função — todas viram
+    `_ObjectInspectionUnverifiable` na fronteira mais próxima de onde ocorrem; quem captura é
+    só `_has_confirmed_history`.
+    """
+    pack_dir = os.path.join(objects_dir, "pack")
+    if _confirmed_dir_exists(pack_dir):
+        try:
+            with os.scandir(pack_dir) as pack_entries:
+                if any(True for _entry in pack_entries):
+                    return True
+        except OSError as exc:
+            raise _ObjectInspectionUnverifiable(pack_dir) from exc
+
+    scanned = 0
+    try:
+        with os.scandir(objects_dir) as fanout_entries:
+            for fanout in fanout_entries:
+                if not fanout.is_dir() or len(fanout.name) != 2 or fanout.name in ("info", "pack"):
+                    continue
+                try:
+                    with os.scandir(fanout.path) as loose_entries:
+                        for loose in loose_entries:
+                            if not loose.is_file():
+                                continue
+                            scanned += 1
+                            if scanned > _MAX_LOOSE_OBJECTS_SCANNED:
+                                return True
+                            object_type = _loose_object_type(loose.path)
+                            if object_type not in _LOOSE_OBJECT_TYPES_WITHOUT_HISTORY_EVIDENCE:
+                                return True
+                except OSError as exc:
+                    raise _ObjectInspectionUnverifiable(fanout.path) from exc
+    except OSError as exc:
+        raise _ObjectInspectionUnverifiable(objects_dir) from exc
+    return False
+
+
+def _has_object_evidence(git_dir: str) -> bool:
+    """Existe evidência de **commit** no armazenamento comum de `git_dir`?
+
+    Segue `commondir` até o repositório principal antes de olhar `objects/`
+    (E6-CONS5V2-001), e só conta objetos de tipo `commit`/`tag`, não qualquer arquivo
+    (E6-CONS5V2-002). A checagem de existência de `objects/` usa `_confirmed_dir_exists`
+    (E6-CONS5V4-001), não `os.path.isdir` — a mesma regra de `_common_git_dir` e
+    `_has_commit_or_tag_object`, propagada por `_ObjectInspectionUnverifiable` quando a
+    inspeção não pode ser concluída com confiança.
+    """
+    objects_dir = os.path.join(_common_git_dir(git_dir), "objects")
+    if not _confirmed_dir_exists(objects_dir):
+        return False
+    return _has_commit_or_tag_object(objects_dir)
+
+
+def _has_confirmed_history(local_path: str) -> bool:
+    """`no_head` (legitimamente sem commit) vs `unverifiable` (histórico existiu, quebrou, ou
+    não deu para confirmar).
+
+    Dois sinais independentes, os dois só de sistema de arquivos, nunca de texto de stderr
+    do git (E6-CONS5-001):
+
+    * `.git/logs/HEAD` — criado na primeira atualização de uma referência (primeiro commit,
+      checkout, merge). Específico de cada worktree — nunca precisa seguir `commondir`: é a
+      pergunta "este HEAD, o de `local_path`, já se moveu alguma vez", não "existe commit em
+      algum lugar do repositório".
+    * `_has_object_evidence` — objeto de commit/tag em `.git/objects` (E6-CONS5V-001,
+      E6-CONS5V2-001/002): um commit feito com `core.logAllRefUpdates=false` não deixa
+      `logs/HEAD`, mas deixa os objetos do commit mesmo assim, no armazenamento comum —
+      inclusive quando `local_path` é um worktree vinculado. Um `git add` sem commit também
+      grava objeto, mas nenhum de tipo `commit`/`tag` — não conta.
+
+    A presença de **qualquer um** dos dois confirma que o repositório não é "genuinamente
+    recém-inicializado" — a resposta correta é `unverifiable`, não `no_head`. Só a ausência
+    **comprovada** dos dois confirma "nunca teve um commit".
+
+    **Fronteira única** (E6-CONS5V4-001, E6-CONS5V4-002): a checagem de `logs/HEAD` usa
+    `_stat_or_raise` (não `os.path.exists`), e o restante da inspeção —
+    `_has_object_evidence`, `_common_git_dir`, `_has_commit_or_tag_object` — propaga
+    `_ObjectInspectionUnverifiable` sempre que uma falha de E/S impede confirmar ausência.
+    Esta função é a **única** fronteira que a captura, convertendo em `True` — a mesma
+    resposta de "achei evidência": os dois significam "não posso dizer `no_head`". A exceção
+    nunca atravessa até `probe_head`.
+    """
+    git_dir = _resolve_git_dir(local_path)
+    if git_dir is None:
+        return False
+    try:
+        if _stat_or_raise(os.path.join(git_dir, "logs", "HEAD")) is not None:
+            return True
+        return _has_object_evidence(git_dir)
+    except _ObjectInspectionUnverifiable:
+        return True
+
+
+def probe_head(local_path: str, *, resolve_branch: bool = True) -> HeadProbe:
+    """Sondagem **leve** do `HEAD`: 2 leituras (3 com o branch), sem `status`. Nunca lança.
+
+    É a leitura que o Planner usa para congelar `planning_base_commit` e a mesma que a
+    elegibilidade de planejamento usa para prevê-lo — uma só implementação, para que as
+    duas perguntas não divirjam. Os mesmos verbos e o mesmo critério de SHA do `preflight`,
+    com o mesmo timeout fixo por leitura.
+
+    E6-CONS5-001: um retorno não-zero do git, sozinho, não confirma "não é repositório" nem
+    "sem HEAD" — ele também é o que sai quando `.git/config` está corrompido, ou quando
+    `.git/HEAD` tem conteúdo que o git não reconhece como ref nem como SHA. Cada uma das
+    duas categorias confirmadas exige um segundo sinal, puramente de disco, que não muda
+    com a mensagem de erro do git nem com o idioma do sistema.
+    """
+    git = shutil.which("git")
+    if git is None:
+        return HeadProbe(PROBE_UNVERIFIABLE)
+
+    inside = _run_git(git, local_path, "rev-parse", "--is-inside-work-tree")
+    if inside is None:
+        return HeadProbe(PROBE_UNVERIFIABLE)
+    if inside.returncode != 0:
+        # O git falhou ao rodar. "Não é repositório" e "há um .git, mas está corrompido
+        # demais pro git nem confirmar isso" dão o mesmo retorno aqui — só a existência de
+        # `.git` no disco separa os dois.
+        return HeadProbe(PROBE_UNVERIFIABLE if _has_git_marker(local_path) else PROBE_NOT_A_REPO)
+    inside_value = _stdout_if_ok(inside)
+    if inside_value is None:
+        # rc == 0 mas a saída não pôde ser lida (decodificação falhou) -- o processo
+        # terminou bem, então isto não é "não é repositório": é uma leitura que não deu
+        # para confiar.
+        return HeadProbe(PROBE_UNVERIFIABLE)
+    if inside_value != "true":
+        # rc == 0 e o git respondeu com sucesso algo diferente de "true" (por exemplo
+        # "false", num repositório bare) -- confirmado, sem ambiguidade nenhuma.
+        return HeadProbe(PROBE_NOT_A_REPO)
+
+    head_result = _run_git(git, local_path, "rev-parse", "HEAD")
+    if head_result is None:
+        return HeadProbe(PROBE_UNVERIFIABLE)
+    if head_result.returncode != 0:
+        # Confirmado que é uma árvore de trabalho (bloco acima); `HEAD` não resolveu. Um
+        # repositório recém-criado, sem primeiro commit, dá exatamente essa falha -- e é o
+        # único caso em que `no_head` é a resposta certa. Uma referência que existiu e foi
+        # corrompida ou apagada dá a MESMA falha, mas não é "legitimamente sem commit"
+        # (E6-CONS5-001, E6-CONS5V-001): reflog ausente sozinho não prova isso -- um commit
+        # com reflog desligado também não deixa `logs/HEAD`, mas deixa os objetos do commit.
+        return HeadProbe(
+            PROBE_UNVERIFIABLE if _has_confirmed_history(local_path) else PROBE_WITHOUT_HEAD
+        )
+    head = _stdout_if_ok(head_result)
+    if head is None or not _SHA1_RE.fullmatch(head):
+        # rc == 0 mas a saída não é um SHA-1 -- git respondeu com sucesso algo que não
+        # esperávamos. Não é "confirmadamente sem commit": é uma leitura ambígua.
+        return HeadProbe(PROBE_UNVERIFIABLE)
+
+    branch = (
+        _stdout_if_ok(_run_git(git, local_path, "symbolic-ref", "--quiet", "--short", "HEAD"))
+        if resolve_branch
+        else None
+    )
+    return HeadProbe(PROBE_OK, head=head, branch=branch)
 
 
 def _workspace_prefix(git: str, local_path: str) -> str | None:

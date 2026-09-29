@@ -35,6 +35,7 @@ const workspaceFixture = (over: Partial<Workspace> = {}): Workspace => ({
   repository_url: null,
   default_branch: null,
   status: 'active',
+  test_config: null,
   created_at: '2026-09-03T10:00:00+00:00',
   updated_at: '2026-09-03T10:00:00+00:00',
   ...over,

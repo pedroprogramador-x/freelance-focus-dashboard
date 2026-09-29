@@ -7,6 +7,11 @@
 >
 > **Revisado na Fase 1B.3** (REAUD-001 P0, REAUD-004, REAUD-006).
 >
+> **Esclarecido após a E6 Rodada 7** — §5 apenas: precisão da âncora (E6-AUD7-003), risco
+> residual de *over-redaction* aceito (E6-AUD7-004), as duas classes de escape da fronteira
+> JSON, e as duas garantias que a implementação ainda deve (E6-AUD7-001, E6-AUD7-002).
+> Nenhuma decisão anterior foi reescrita: a afirmação superada está marcada no lugar.
+>
 > **Este é o documento mais crítico da V1.**
 
 ---
@@ -297,28 +302,156 @@ passa pelo redator" não é orientação de estilo — é garantia estrutural:
 > central por padrão — sucesso, erro, erro de domínio, e `RequestValidationError`
 > (inclusive `detail[].input`) — independente de rota, schema, profundidade ou origem do
 > campo. Não existe exceção distribuída por schema (nenhum
-> `Field(json_schema_extra={"redact": False})` ou equivalente). A única exceção é um
-> *escape hatch* estreito, explícito e testado (`purge_token`), nunca uma flag genérica
-> reaproveitável por outro campo. O *boundary* de sanitização acontece **antes** da
-> serialização para bytes, nunca por *reparsing* de JSON já serializado. HTML de
-> bootstrap, assets estáticos e o futuro SSE (E11) têm contrato próprio, fora deste
-> *boundary*.
+> `Field(json_schema_extra={"redact": False})` ou equivalente). As exceções são *escape
+> hatches* estreitos, explícitos e testados — hoje **exatamente dois**, enumerados abaixo —,
+> nunca uma flag genérica reaproveitável por outro campo. O *boundary* de sanitização
+> acontece **antes** da serialização para bytes, nunca por *reparsing* de JSON já
+> serializado. HTML de bootstrap, assets estáticos e o futuro SSE (E11) têm contrato
+> próprio, fora deste *boundary*.
+
+> **As duas classes de escape deliberado** *(corrigido após E6 Rodada 7; a redação
+> anterior deste documento dizia "a única exceção … (`purge_token`)", o que já não
+> descrevia a implementação desde E6-AUD4-004)*. São duas, e só duas:
+>
+> | Escape | Granularidade | Onde é construído | O que autoriza |
+> | --- | --- | --- | --- |
+> | `Unredacted` no `purge_token` | **um valor** | `workspace/purge_tokens.py`, um ponto | o segredo de autorização que a prévia de purga existe para entregar ([02] §11) |
+> | `EditViewJSONResponse` | **a resposta inteira** | `api/context.py`, uma rota | o conteúdo cru de uma entrada do Context Registry, para que quem edita não salve `«redigido»` por cima do que ele escondia (E6-AUD4-004) |
+>
+> Os dois são a mesma decisão em granularidades diferentes, e ambos continuam obrigados a
+> ser **tipados**, **localizados** (um ponto de construção cada), **testados** e **não
+> reaproveitáveis como bypass genérico**. `test_architecture.py` enumera o conjunto e
+> falha na definição de qualquer terceira classe de resposta — não no uso dela, na
+> definição. Uma terceira exceção exige decisão e documentação explícitas, aqui, antes de
+> existir em código.
 
 A garantia é **por padrão**, não por rota corrigida: cada superfície nova herda a proteção
 sem que quem a escreve precise lembrar de invocá-la. `redact_document` é a única
 caminhada recursiva que a implementa — nenhum segundo `_redact_tree` ad hoc por módulo.
 
-> **Cobertura atual vs. princípio.** `redact_document` hoje percorre **valores**
-> recursivamente; chaves dinâmicas de JSON (uma credencial usada como chave, não como
-> valor) ainda não são cobertas pela mesma caminhada — gap rastreado como E6-AUD3-003. O
-> princípio acima ("valor **ou** chave") é o contrato-alvo desta camada, e uma cobertura
-> parcial é um achado de auditoria a corrigir, não uma segunda forma válida da garantia.
+> **Cobertura de chaves e valores (E6-AUD3-003).** `redact_document` percorre
+> recursivamente **valores e chaves** de JSON. Chaves que contêm segredo reconhecido pelo
+> detector são substituídas por placeholders opacos numerados. Antes de alocá-los, a
+> caminhada reserva os números já usados por chaves literais, inclusive em outros níveis,
+> evitando a colisão identificada em E6-AUD4-002. A cobertura depende do reconhecimento
+> pelo detector central; percorrer todas as strings não prova reconhecer todo segredo.
 
 `safety/redaction.py` expõe, além de `redact(text)` (escalar) e `redact_document(value)`
-(documento, recursivo sobre valores), a API pura `is_sensitive_key(key)` e
+(documento, recursivo sobre valores e chaves), a API pura `is_sensitive_key(key)` e
 `detect_secret_spans(text)` — mesmo motor de detecção, reaproveitado pelo Context Engine
 (E5) para redação estrutural/posicional ([03](03-context-architecture.md) §4). Nenhuma
 segunda lista de nomes sensíveis ou segundo motor de regex existe.
+
+> **Fronteira de palavra e segredos colados** *(E6-AUD4-001)*. Os padrões de token opaco
+> (`ghp_…`, `sk-…`, `AKIA…`) são ancorados em fronteira de palavra. Entre dois segredos
+> colados sem separador não existe fronteira nenhuma, e a âncora deixava passar o segundo —
+> e, na *access key* AWS, que tinha âncora dos dois lados, também o primeiro. A âncora passa
+> a ser satisfeita de **duas** formas: pela fronteira de palavra, ou pelo início/fim de
+> outra ocorrência reconhecida pelo **mesmo** catálogo. ~~O relaxamento é ancorado em
+> segredo e só nele: um segredo colado a uma palavra comum continua fora do alcance da
+> âncora, como sempre esteve.~~ **(afirmação superada por E6-AUD7-003 — ver "Precisão da
+> âncora", logo abaixo. Ela descrevia a fronteira da *esquerda* e foi lida como se valesse
+> para os dois lados; a da direita é relaxada em toda âncora.)** A decisão é do motor único
+> — nenhum padrão recebe tratamento especial fora de `safety/redaction.py`.
+
+> **Precisão da âncora — o que as variantes derivadas relaxam** *(E6-AUD7-003; decisão
+> tomada nesta rodada, não retroativa)*. Durante a convergência, o motor reexecuta o
+> catálogo a partir de **âncoras**, usando variantes das expressões com as fronteiras de
+> palavra recortadas. As âncoras são de duas origens, e só duas: o **início de uma corrida
+> de caracteres de palavra**, e toda posição **dentro ou no fim de uma região já coberta**.
+>
+> A partir de uma âncora, **as duas** fronteiras da expressão são recortadas — não só a da
+> esquerda. As consequências são assimétricas, e é essa assimetria que o texto anterior
+> não dizia:
+>
+> * **à esquerda**, o relaxamento só tem efeito em âncora de região coberta, porque no
+>   início de uma corrida de palavra a fronteira já estaria satisfeita. Por isso um segredo
+>   colado **depois** de uma palavra comum continua fora de alcance: `tokenizerghp_…` e
+>   `xAKIA…` não são reconhecidos, e não há âncora no meio de uma palavra comum;
+> * **à direita**, o relaxamento vale em **qualquer** âncora. Um token reconhecido a partir
+>   dela é redigido mesmo quando o que vem imediatamente depois é texto comum. Observado:
+>   `AKIA0123456789ABCDEFx` → `«redigido»x`, que a expressão canônica isolada não
+>   reconheceria por causa da fronteira final.
+>
+> Hoje o efeito da direita é observável **apenas** em `aws_access_key`, o único padrão do
+> catálogo com fronteira de palavra à direita; um padrão novo com fronteira final herdaria
+> o mesmo comportamento por construção.
+>
+> **Este comportamento é mantido deliberadamente.** Ele redige de mais, nunca de menos, e
+> neste sistema falso positivo é preferível a falso negativo — a mesma ordem de prioridade
+> que [ADR-0009](../adr/0009-provider-capability-enforcement.md) fixa para ausência de
+> prova. **A garantia é sobre as variantes derivadas `_ANCHORED` especificamente, não sobre
+> o redator como um todo**: elas podem produzir *over-redaction* em relação ao que a
+> expressão canônica reconheceria isolada naquela posição, mas não podem cobrir **menos**
+> que a passada canônica cobriria. Isto não afirma que qualquer outro caminho ou otimização
+> do redator hoje cumpre essa mesma equivalência — `E6-AUD7-001` é um contraexemplo
+> conhecido e continua **P1 aberto**, tratado à parte em "Duas garantias abertas", abaixo.
+
+> **Risco residual aceito: precisão da redação** *(E6-AUD7-004; decisão tomada nesta
+> rodada)*. O ensaio diferencial que protege o detector (o "GATE 1") garante três coisas
+> sobre a emissão — nada deixa de ser escondido em relação à cascata histórica, nada
+> reconhecível sobrevive parcialmente, e a divergência de bytes acontece exatamente nos
+> casos em que a emissão histórica era insegura — mais a preservação, **por posição**, do
+> que o catálogo classifica como rótulo e nunca como carga (`Bearer `, `password: `).
+>
+> Ele **não** garante que todo caractere público — pontuação, separador, resto de texto
+> comum — de uma entrada já autorizada a divergir permaneça visível. Essa entrada pode
+> acabar mais coberta do que o estritamente necessário.
+>
+> A limitação é consciente. Fechá-la exigiria mais uma camada de oráculo, cuja única função
+> seria impedir *over-redaction* de pontuação, sem melhorar em nada a garantia de
+> confidencialidade. O que a aceitação **não** autoriza, e continua proibido: falso
+> negativo de qualquer espécie, apagar rótulo protegido, e qualquer afrouxamento da
+> prioridade *fail-closed*.
+
+> **Duas garantias — histórico e fechamento** *(originalmente E6 Rodada 7, findings P1 em
+> aberto; a rodada terminou BLOCKED por causa delas. Texto original das duas obrigações
+> preservado abaixo sem alteração, como registro histórico de quando estavam abertas)*.
+>
+> * **Caminho otimizado do bloco PEM** *(E6-AUD7-001)*. A varredura linear do `pem_block`
+>   é uma otimização de custo, e otimização de custo não pode mover a fronteira do que se
+>   reconhece. Ela precisa preservar a semântica do reconhecimento canônico **em todos os
+>   aspectos observáveis** — o conjunto de matches, a ordem deles, os intervalos de
+>   `recognition_span`/`replacement_span`, os grupos, e o comportamento em aberturas
+>   sobrepostas —, e fazer isso **sem** reintroduzir custo superlinear, que é o que
+>   E6-AUD6-001 corrigiu. Enquanto essa equivalência não estiver demonstrada, material PEM
+>   visível na saída é um defeito, nunca um comportamento documentado.
+> * **Chave estruturalmente sensível** *(E6-AUD7-002)*. `is_sensitive_key` é a resposta do
+>   sistema para "não existe adjacência textual que um regex veja": `{"token": "x"}` não
+>   contém `token: x` em lugar nenhum até alguém linearizar. A projeção pública precisa
+>   tratar uma chave assim como classificação estrutural: **o valor sob ela — escalar,
+>   objeto ou lista inteira — é sensível, e a subárvore é projetada *fail-closed***, sem
+>   depender de o detector reconhecer forma de segredo no conteúdo. Hoje a Camada 3 aplica
+>   `is_sensitive_key` às **chaves** e o detector aos **valores**; a classificação
+>   estrutural não atravessa para o valor, e é essa travessia que a implementação deve.
+>
+> **Decisão de fechamento** *(2026-09-22, autorizada por Pedro nesta sessão — não é
+> reescrita silenciosa de documento congelado)*. As duas obrigações acima estão
+> **`VERIFIED RESOLVED`**:
+>
+> * **`E6-AUD7-001 VERIFIED RESOLVED — FROZEN`** — o localizador do corpo PEM
+>   (`_localizar_corpos_pem`) substituiu o quantificador guloso por duas primitivas sem
+>   retrocesso, preservando a equivalência com o reconhecimento canônico em todos os
+>   aspectos observáveis; a prova de custo linear usa a agregação por tripletas
+>   intercaladas (`_ORDEM_DAS_TRIPLAS`), que sobreviveu a reverificação independente sob
+>   perturbação de carga. Ver `docs/audits/e6-round-7.md`, `e6-round-7v.md`,
+>   `e6-round-7v2.md`, `e6-round-7v3.md` (veredito GREEN).
+> * **`E6-AUD7-002 VERIFIED RESOLVED`** — `redact_document` passou a aplicar
+>   `is_sensitive_key` também à travessia do **valor**: uma chave sensível marca a
+>   subárvore inteira, e todo descendente — escalar, objeto, lista, ou contêiner vazio
+>   (`E6-AUD7-002V-001`, achado numa reverificação seguinte e corrigido na mesma rodada) —
+>   sai como `«redigido»`, sem depender do detector textual reconhecer o conteúdo. Ver
+>   `docs/audits/e6-aud7-002-round-1.md` (BLOCKED, achou o caso de contêiner vazio) e
+>   `e6-aud7-002-round-2.md` (GREEN).
+>
+> **A aprovação da E6 inteira permanece pendente de auditoria consolidada.** Estas duas
+> garantias resolvidas não substituem uma revisão de conjunto da rodada — outros achados
+> de severidade menor (`E6-AUD7-003`, `E6-AUD7-004`, `E6-AUD7-005`, adiante) podem
+> continuar abertos, e nenhum commit ou merge da E6 está autorizado só por esta decisão.
+>
+> As duas exceções JSON deliberadas — `Unredacted` no `purge_token` e
+> `EditViewJSONResponse` no edit-view (ver a tabela acima) — não foram alteradas por
+> nenhuma das duas correções e continuam exatamente como descritas.
 
 **Denylist inicial** `.env*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`, `id_ed25519*`,
 `.npmrc`, `.pypirc`, `.git-credentials`, `.aws/**`, `.ssh/**`, `secrets/**`,

@@ -39,6 +39,16 @@ class DevWorkspace(Base):
 
     repository_url: Mapped[str | None] = mapped_column(sa.String(2048), nullable=True)
     default_branch: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
+
+    #: `TestPolicy` deste workspace ([04] §6), em JSON **estruturado** — nunca string de
+    #: shell. `NULL` significa "sem Test Runner configurado", e nesse caso o `test_binding`
+    #: do `execution_fingerprint` tem os três campos `null` ([02] §7).
+    #:
+    #: A forma é validada por `app.safety.test_policy.parse_test_policy` — [04] §5 põe a
+    #: `TestPolicy` entre as peças de `safety/`, o que deixa `workspace/` (que grava) e
+    #: `orchestrator/` (que consome) compartilharem um schema só.
+    test_config: Mapped[dict[str, Any] | None] = mapped_column(nullable_json(), nullable=True)
+
     status: Mapped[enums.WorkspaceStatus] = mapped_column(
         enum_column(enums.WorkspaceStatus, "workspace_status"),
         nullable=False,

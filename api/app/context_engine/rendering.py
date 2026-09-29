@@ -86,7 +86,13 @@ from app.safety.redaction import (
 #: hasheado ([02] §5), então o bump segue o mesmo precedente de `v1`→`v2` (troca de
 #: formato de `structured`): qualquer mudança que afete o payload hasheado avança esta
 #: constante, mesmo quando o texto visível não muda.
-RENDERER_VERSION = "e5.block.v6"
+#: `v7`: o detector central passou a convergir por reprojeção iterativa (E6-AUD4-001,
+#: E6-AUD5-001/002). O conteúdo redigido muda em entradas com segredos adjacentes, logo o
+#: `text` dos blocos muda, logo o payload hasheado muda. Manter `v6` faria duas semânticas
+#: diferentes de redação compartilharem o mesmo identificador de renderer — que é
+#: exatamente o que E6-AUD5-006 apontou: a reprodutibilidade **dentro** de uma revisão
+#: continua valendo, a equivalência **entre** revisões não.
+RENDERER_VERSION = "e5.block.v7"
 
 #: Divisor da estimativa de tokens. Inteiro, e a divisão arredonda para cima: nenhum
 #: `float` participa de decisão de orçamento.

@@ -18,6 +18,14 @@ from fastapi.testclient import TestClient
 
 from tests.context_helpers import GIT, commit_all, write
 
+
+def _edit_hash(client: TestClient, entry_id: str) -> str:
+    """O `edit_hash` corrente, lido pelo caminho que o contrato define: `POST edit-view`."""
+    resposta = client.post(f"/api/context/{entry_id}/edit-view")
+    assert resposta.status_code == 200, resposta.text
+    return str(resposta.json()["edit_hash"])
+
+
 pytestmark = pytest.mark.skipif(GIT is None, reason="git indisponível no PATH")
 
 #: `Origin` que casa com o `Host` servido pelo `TestClient` — a guarda de mesma origem da
@@ -229,7 +237,12 @@ def test_patch_de_conteudo_nao_toca_o_baseline(
 
     resposta = auth_api_client.patch(
         f"/api/context/{criada['id']}",
-        json={"title": "Outro título", "body": "Outro corpo.", "tags": ["z", "a"]},
+        json={
+            "expected_edit_hash": _edit_hash(auth_api_client, criada["id"]),
+            "title": "Outro título",
+            "body": "Outro corpo.",
+            "tags": ["z", "a"],
+        },
         headers=SAME_ORIGIN,
     )
 
@@ -251,7 +264,10 @@ def test_patch_de_source_refs_move_o_baseline(auth_api_client: TestClient, repo_
 
     resposta = auth_api_client.patch(
         f"/api/context/{criada['id']}",
-        json={"source_refs": ["src/**"]},
+        json={
+            "expected_edit_hash": _edit_hash(auth_api_client, criada["id"]),
+            "source_refs": ["src/**"],
+        },
         headers=SAME_ORIGIN,
     )
 
@@ -270,7 +286,9 @@ def test_patch_com_source_refs_vazio_zera_o_baseline(
     _status, criada = _create(auth_api_client, workspace_id, source_refs=["src/**"])
 
     resposta = auth_api_client.patch(
-        f"/api/context/{criada['id']}", json={"source_refs": []}, headers=SAME_ORIGIN
+        f"/api/context/{criada['id']}",
+        json={"expected_edit_hash": _edit_hash(auth_api_client, criada["id"]), "source_refs": []},
+        headers=SAME_ORIGIN,
     )
 
     corpo = resposta.json()
@@ -285,7 +303,11 @@ def test_patch_vazio_e_inofensivo(auth_api_client: TestClient, repo_path: Path) 
     workspace_id = _workspace(auth_api_client, repo_path)
     _status, criada = _create(auth_api_client, workspace_id, source_refs=["src/**"])
 
-    resposta = auth_api_client.patch(f"/api/context/{criada['id']}", json={}, headers=SAME_ORIGIN)
+    resposta = auth_api_client.patch(
+        f"/api/context/{criada['id']}",
+        json={"expected_edit_hash": _edit_hash(auth_api_client, criada["id"])},
+        headers=SAME_ORIGIN,
+    )
 
     corpo = resposta.json()
     assert resposta.status_code == 200
@@ -295,7 +317,9 @@ def test_patch_vazio_e_inofensivo(auth_api_client: TestClient, repo_path: Path) 
 
 def test_patch_de_entrada_inexistente_e_404(auth_api_client: TestClient) -> None:
     resposta = auth_api_client.patch(
-        "/api/context/nao-existe", json={"title": "x"}, headers=SAME_ORIGIN
+        "/api/context/nao-existe",
+        json={"expected_edit_hash": "x" * 64, "title": "x"},
+        headers=SAME_ORIGIN,
     )
 
     assert resposta.status_code == 404
@@ -309,7 +333,12 @@ def test_patch_com_source_ref_recusado_e_422(auth_api_client: TestClient, repo_p
     _status, criada = _create(auth_api_client, workspace_id, source_refs=["src/**"])
 
     resposta = auth_api_client.patch(
-        f"/api/context/{criada['id']}", json={"source_refs": ["config/*"]}, headers=SAME_ORIGIN
+        f"/api/context/{criada['id']}",
+        json={
+            "expected_edit_hash": _edit_hash(auth_api_client, criada["id"]),
+            "source_refs": ["config/*"],
+        },
+        headers=SAME_ORIGIN,
     )
 
     assert resposta.status_code == 422
@@ -523,7 +552,12 @@ def test_reimportar_cria_um_segundo_conjunto_e_nao_sobrescreve(
     # uma entrada do primeiro conjunto é editada à mão
     alvo = next(item for item in primeiro["entries"] if item["domain"] == "stack")
     auth_api_client.patch(
-        f"/api/context/{alvo['id']}", json={"body": "Editado à mão."}, headers=SAME_ORIGIN
+        f"/api/context/{alvo['id']}",
+        json={
+            "expected_edit_hash": _edit_hash(auth_api_client, alvo["id"]),
+            "body": "Editado à mão.",
+        },
+        headers=SAME_ORIGIN,
     )
 
     segundo = _import(auth_api_client, workspace_id, SEED)

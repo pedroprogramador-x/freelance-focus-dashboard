@@ -11,6 +11,7 @@ conhece status de erro: levanta-se `ContextError` tipado e a tradução mora em 
 | --- | --- | --- |
 | `GET` `POST` | `/api/workspaces/{id}/context` | Listar e criar entradas |
 | `PATCH` `DELETE` | `/api/context/{entry_id}` | Editar e remover |
+| `POST` | `/api/context/{entry_id}/edit-view` | Conteúdo cru, para edição |
 | `POST` | `/api/workspaces/{id}/context/verify` | Recalcular `fresh`/`stale`/`unknown` |
 | `POST` | `/api/workspaces/{id}/context/import` | Seed de planejamento |
 
@@ -33,10 +34,12 @@ from collections.abc import Iterator
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Request, Response
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy.orm import Session
 
+from app.api.responses import EditViewJSONResponse
 from app.context_engine import (
+    ContextEntryUnreadable,
     PlanningSeed,
     PlanningSeedDecision,
     PlanningSeedRisk,
@@ -48,7 +51,7 @@ from app.context_engine import (
     update_entry,
     verify_workspace_entries,
 )
-from app.context_engine.service import UNSET
+from app.context_engine.service import UNSET, edit_hash_of
 from app.db.enums import ContextDomain, ContextOrigin, ContextState, StaleReason
 from app.db.models import ContextRegistryEntry
 from app.db.session import session_scope
@@ -60,6 +63,8 @@ MAX_TITLE = 255
 MAX_BODY = 200_000
 MAX_REF = 4096
 MAX_LIST = 200
+#: `content_hash` é um SHA-256 em hexa; a folga cobre um prefixo de versão futuro.
+MAX_HASH = 128
 
 
 # ------------------------------------------------------------------ schemas
@@ -110,6 +115,16 @@ class ContextEntryUpdate(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    #: O `edit_hash` que o editor leu ao abrir a entrada, em `POST .../edit-view`.
+    #: **Obrigatório**, e substituiu `expected_content_hash` em E6-AUD5-004: aquele cobria
+    #: só `domain`/`title`/`body`/`structured`, então dois editores podiam sobrescrever
+    #: `tags` ou `source_refs` um do outro recebendo `200` os dois.
+    #:
+    #: `expected_content_hash` foi **removido** do contrato em vez de mantido como
+    #: redundância: `edit_hash` já contém o `content_hash`, então nenhuma divergência de
+    #: conteúdo escapa do novo campo, e um segundo controle estritamente mais fraco só
+    #: serviria para alguém mandar o fraco e achar que está protegido.
+    expected_edit_hash: str = Field(min_length=1, max_length=MAX_HASH)
     title: str | None = Field(default=None, min_length=1, max_length=MAX_TITLE)
     body: str | None = Field(default=None, min_length=1, max_length=MAX_BODY)
     structured: dict[str, Any] | None = None
@@ -148,6 +163,31 @@ class ContextEntryResponse(BaseModel):
     last_verified_commit: str | None
     created_at: str
     updated_at: str
+
+
+class ContextEditViewResponse(BaseModel):
+    """Conteúdo **cru** de uma entrada, para edição. Tipo estreito e de uso único.
+
+    Não é `ContextEntryResponse` com outro nome: carrega só os três campos editáveis mais
+    o `content_hash` que vira o `expected_content_hash` do `PATCH` seguinte. Reaproveitar a
+    projeção de leitura aumentaria a superfície que escapa da redação sem nenhum ganho —
+    `state`, `origin`, `source_hash` e as datas já saem redigidos pela rota normal, e não
+    há motivo para uma segunda cópia deles fora do boundary.
+
+    Nenhum campo desta resposta pode ser logado, virar `SafetyEvent` ou entrar em mensagem
+    de erro — ver `EditViewJSONResponse`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    entry_id: str
+    title: str
+    body: str
+    structured: dict[str, Any] | None
+    content_hash: str
+    #: A versão de edição desta leitura, que volta no `PATCH` como `expected_edit_hash`.
+    #: Derivada, nunca persistida — ver `edit_hash_of`.
+    edit_hash: str
 
 
 class WorkingTreeDivergence(BaseModel):
@@ -360,6 +400,7 @@ def patch(entry_id: str, payload: ContextEntryUpdate, session: SessionDep) -> Co
     updated = update_entry(
         session,
         entry,
+        expected_edit_hash=payload.expected_edit_hash,
         # `UNSET` para o que não veio no corpo. É aqui que "ausente" e "nulo" deixam de
         # poder ser confundidos: só um `source_refs` **informado** escreve baseline.
         title=payload.title if "title" in informados and payload.title is not None else UNSET,
@@ -369,6 +410,72 @@ def patch(entry_id: str, payload: ContextEntryUpdate, session: SessionDep) -> Co
         source_refs=(payload.source_refs or []) if "source_refs" in informados else UNSET,
     )
     return _to_response(updated)
+
+
+@router.post(
+    "/context/{entry_id}/edit-view",
+    # A **única** rota de `/api/*` fora do boundary de redação de [04] §5. Ver
+    # `EditViewJSONResponse` e `test_o_conjunto_de_respostas_sem_redacao_e_fechado`.
+    response_class=EditViewJSONResponse,
+    response_model=ContextEditViewResponse,
+    summary="Conteúdo cru da entrada, para edição",
+)
+def edit_view(entry_id: str, session: SessionDep, response: Response) -> ContextEditViewResponse:
+    """O conteúdo **como está gravado**, para quem vai editá-lo (E6-AUD4-004).
+
+    ## Por que esta rota existe
+
+    A projeção de leitura sai redigida, como toda resposta ([04] §5). Um editor que carregue
+    `GET .../context`, mostre o texto e salve de volta persiste `«redigido»` no lugar do
+    trecho escondido: a redação, que é uma projeção de saída, viraria conteúdo. O `PATCH`
+    recusa esse texto (`RedactedContentRejected`), e esta rota é o caminho que a recusa
+    pressupõe.
+
+    ## Por que `POST`, e não `GET`
+
+    Não por ter efeito — ela não escreve nada. `POST` é o que a coloca sob a guarda de mesma
+    origem de [01] §4, que o middleware aplica só a métodos mutantes: uma aba de terceiro não
+    consegue disparar esta leitura e ler a resposta. Um `GET` equivalente seria alcançável
+    por navegação simples, e o que ele devolve é o conteúdo **não redigido**.
+
+    `Cache-Control: no-store` pelo mesmo motivo: nada disto pode sobrar em cache de disco.
+
+    ## O que esta função deliberadamente não faz
+
+    Não registra `SafetyEvent`, não escreve log, não emite métrica e não compõe mensagem de
+    erro com o conteúdo. Um `404` daqui carrega o `entry_id` e nada mais — ele vem de
+    `get_entry`, antes de qualquer campo ser lido. É a rota mais curta da API de propósito:
+    cada linha a mais é uma chance de o conteúdo cru vazar para um canal que não passa pelo
+    boundary.
+
+    O `try` em volta da projeção é a outra metade disso (E6-AUD5-007): um documento gravado
+    numa forma que o modelo recusa faria o Pydantic levantar uma `ValidationError` **com o
+    valor recusado dentro**, e ela chegaria ao `uvicorn.error` inteira.
+    """
+    entry = get_entry(session, entry_id)
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return ContextEditViewResponse(
+            entry_id=entry.id,
+            title=entry.title,
+            body=entry.body,
+            structured=entry.structured,
+            content_hash=entry.content_hash,
+            edit_hash=edit_hash_of(entry),
+        )
+    except ValidationError as error:
+        # E6-AUD5-007: uma `ValidationError` que sobe daqui chega ao canal de exceções do
+        # servidor **com o `input_value` junto** — isto é, com o conteúdo autoral cru num log
+        # que não passa pelo boundary de [04] §5. O erro tipado tem mensagem constante, é
+        # servido pelo handler de domínio e não gera *traceback*.
+        #
+        # `from None` é deliberado: encadear preservaria a `ValidationError` original como
+        # `__cause__`, e qualquer formatador que imprimisse a cadeia traria o valor de volta.
+        campos = ", ".join(str(item["loc"][-1]) for item in error.errors()) or "desconhecido"
+        raise ContextEntryUnreadable(
+            f"a entrada '{entry.id}' está gravada numa forma que a projeção de edição não "
+            f"consegue ler (campo: {campos})"
+        ) from None
 
 
 @router.delete(

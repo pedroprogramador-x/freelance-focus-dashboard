@@ -3618,3 +3618,3343 @@ E6-AUD3-004.
   - **E6-AUD3-003** (Baixa) — chaves dinâmicas de JSON fora da recursão de redação —
     citado nesta rodada de documentação como o gap explícito contra o princípio formal.
   - **Nada commitado, nada pushado. E7 não iniciada.**
+
+---
+
+## 2026-09-14 — Claude Opus 5 — E6: boundary de redação por padrão e unidade de trabalho de conflito (E6-AUD3-001/002/003)
+
+Dois redesenhos estruturais, não patches. **Nada commitado, nada pushado** — vai para a
+quarta rodada do Codex.
+
+**A leitura que organiza esta rodada.** Os três findings são o mesmo defeito visto de
+ângulos diferentes, e o defeito não é nenhum dos campos citados: é o **modelo estar
+invertido**. A garantia de redação era *opt-in* — cada projeção chamava o redator por conta
+própria —, então toda superfície nova nascia desprotegida e o esquecimento era silencioso.
+Três rodadas encontraram três recortes disso (`test_config`, `runner_id`, meia API), e as
+duas correções anteriores fecharam o caso citado deixando os irmãos vivos. O mesmo vale
+para AUD3-002: o tratamento de conflito morava dentro de `_abort_planning`, que só participa
+do `plan`.
+
+Esta rodada inverte os dois modelos em vez de acrescentar um quarto recorte.
+
+- Arquivos alterados:
+  - **novos**: `api/app/api/responses.py`, `api/app/db/conflicts.py`,
+    `api/tests/test_e6_audit_round_3.py`, `api/tests/test_api_redaction_boundary.py`;
+  - `api/app/safety/redaction.py` — `Unredacted`, redação de chave, `redact_document`;
+  - `api/app/main.py` — `default_response_class`, handler de `RequestValidationError`,
+    handlers e middleware pelo boundary;
+  - `api/app/api/web.py` — o `404` de bootstrap saiu do bypass;
+  - `api/app/api/workspaces.py`, `api/app/api/tasks.py` — as duas prévias de purga;
+  - `api/app/db/session.py` — conflito no `COMMIT` final;
+  - `api/app/orchestrator/execution_manager.py` — `@command` + unidade de trabalho;
+  - `api/app/orchestrator/purge.py`, `api/app/workspace/purge_tokens.py`;
+  - `api/tests/test_architecture.py` — seis regras novas.
+  - `src/` (frontend) — **não tocado**. Nenhum finding é de frontend, e o contrato HTTP não
+    mudou de forma (só de conteúdo).
+
+### Parte 1 — boundary de saída (fecha E6-AUD3-001)
+
+`RedactingJSONResponse` sobrescreve `render()`, que é onde o FastAPI entrega o conteúdo
+ainda como `dict`/`list`/escalar, **antes** do `json.dumps`. É `default_response_class` da
+aplicação e a classe de todo *exception handler*.
+
+### Parte 2 — escape hatch do `purge_token` (tipo, não flag)
+
+`Unredacted(str)`, construído em **um** ponto (`PurgeTokenStore.issue`), reconhecido por
+`isinstance` na caminhada.
+
+### Parte 3 — chaves redigidas sem colisão (fecha E6-AUD3-003)
+
+Chave que carrega segredo vira `«chave redigida N»`, opaco e único.
+
+### Parte 4 — unidade de trabalho de conflito (fecha E6-AUD3-002)
+
+Decorador `@command` em todos os oito comandos, mais tradução no `COMMIT` final de
+`session_scope`.
+
+- Decisões de implementação **não** 100% especificadas no prompt:
+  1. **O contador de chaves é por documento, não por `dict` nem por nível.** Por nível
+     bastaria para o requisito (duas chaves do mesmo `dict` nunca colidem em nenhum dos dois
+     escopos), mas leria pior: dois `«chave redigida 1»` em ramos diferentes do JSON
+     pareceriam a mesma chave, e não são. Custa um inteiro e remove a ambiguidade.
+  2. **A numeração é posicional, não derivada do conteúdo.** A mesma chave secreta que
+     aparecer duas vezes recebe dois números. Derivar o placeholder do valor (hash, prefixo)
+     daria a quem observa um **oráculo de igualdade** sobre o segredo — "estas duas chaves
+     são a mesma" é informação que não precisa vazar. O preço é não poder correlacionar
+     ocorrências, que é o que se quer.
+  3. **O gatilho de mascaramento é `redact(key) != key`, e não `is_sensitive_key(key)`.**
+     São perguntas diferentes: `is_sensitive_key` classifica um **nome** ("o valor ao lado é
+     segredo"), e mascarar por ela transformaria `{"password": "x"}` em
+     `{"«chave redigida 1»": "x"}` — destruindo a legibilidade sem proteger nada, porque o
+     nome `password` não é o segredo. O que AUD3-003 encontrou foi o caso oposto: a chave
+     **contendo** uma credencial.
+  4. **A chave sensível é substituída por inteiro, não por span.** `"prefixo-sk-…-sufixo"`
+     não vira `"prefixo-«redigido»-sufixo"`: o que sobraria ainda é substring do nome
+     original, e duas chaves que compartilhassem o mesmo segredo colapsariam no **mesmo**
+     texto — num `dict` uma apagaria a outra, e um campo sumiria da resposta sem rastro.
+  5. **`Unredacted` mora em `safety/redaction.py`, não em `api/`.** O tipo existe para ser
+     reconhecido pela caminhada, e quem reconhece é o dono do redator. Em `api/` ele seria
+     uma segunda autoridade sobre o que escapa da Camada 3.
+  6. **As duas rotas de prévia de purga montam a resposta pelo response class, com
+     `response_model=None`.** Descoberto empiricamente e não suposto: **o Pydantic descarta
+     subclasses de `str` no `model_dump`**, então um `Unredacted` devolvido dentro de um
+     modelo chega ao boundary já rebaixado a `str` e seria redigido como qualquer outra
+     string. Testei `any_schema`, `is_instance_schema` e serializador plano — nenhum
+     preserva. A validação de forma continua acontecendo: o modelo é construído e só o
+     `model_dump` dele vira o corpo, com o token reinserido.
+  7. **`is_write_conflict` mudou de `orchestrator/` para `db/conflicts.py`.** Ele nasceu no
+     Orchestrator (E6-AUD-004), e **ficar lá foi o que permitiu AUD3-002**: `session_scope`,
+     que é quem de fato commita, não podia consultá-lo sem inverter a direção das
+     dependências. Duas cópias divergiriam pelo mesmo mecanismo que fez nascer a segunda
+     lista de segredo do Analyzer.
+  8. **`session_scope` também traduz — e isso o prompt não pediu.** O `COMMIT` final
+     acontece depois de o comando retornar, fora de qualquer `try` do Orchestrator; um
+     conflito ali continuaria virando `500`. É a superfície irmã do finding, e deixá-la
+     aberta seria repetir pela quarta vez o padrão que esta rodada existe para quebrar.
+     Erro novo: `WriteConflict` (409, `write_conflict`), servido pelo handler único.
+  9. **Um decorador, e não `try` em cada ponto de escrita.** Envolver os dois pontos que o
+     auditor citou consertaria as duas reproduções e deixaria o terceiro ponto — o que
+     ninguém escreveu ainda — descoberto. O decorador mais o teste de AST fazem o comando da
+     E7 nascer coberto ou quebrar a suíte.
+  10. **`record_safety_event` **não** é comando, e está na lista explícita de exceções.** Ele
+      escreve, mas sempre **dentro** de um comando já envolvido; um segundo boundary ali
+      capturaria o conflito no nível errado — quem precisa decidir o que fazer com a
+      transação é o comando, não o `INSERT`. As outras quatro exceções (`get_task`,
+      `list_tasks`, `latest_manifest`, `workspace_of`) são leitura pura.
+  11. **`execute_purge` do `orchestrator/purge.py` também foi decorado.** O prompt lista os
+      comandos do Execution Manager; este vive noutro módulo e escreve igual. Oito comandos
+      guardados no total.
+  12. **Os handlers deixaram de chamar `redact` por conta própria.** Redigir duas vezes é
+      inofensivo, mas deixa a dúvida sobre qual das duas é a garantia — e é a dúvida que
+      produziu a redação distribuída. Uma só.
+  13. **O `422` preserva a forma `detail` do FastAPI** e acrescenta `code`/`message`. Um
+      cliente que já interpreta `detail` continua funcionando, e a resposta ganha o par
+      estável de [06] §2. Tem contrafactual: um teste afirma que o `422` continua dizendo
+      **qual** campo foi recusado — sem ele, trocar o corpo por `{"code": …}` passaria.
+  14. **`204` e o HTML de bootstrap continuam fora do boundary**, nomeados na allowlist do
+      teste de arquitetura. Um corpo vazio não tem string para redigir, e forçá-lo produziria
+      o `null` que o status proíbe.
+
+- Encontrado pelos **meus próprios** testes, durante esta rodada:
+  - **`api/web.py` estava fora do boundary.** O `404 web_ui_unavailable` construía
+    `JSONResponse` cru. Corpo constante, risco baixo — e exatamente o raciocínio ("o
+    conteúdo aqui é seguro") que AUD3-001 encontrou errado em seis superfícies. Corrigido; a
+    regra de AST é o que o pegou.
+  - **Duas das minhas primeiras regras de arquitetura eram largas demais** e acusavam
+    leitura pura (`get_task`) e prosa de docstring (`SQLITE_BUSY_SNAPSHOT` citado numa
+    explicação). Ambas foram precisadas — a segunda por AST, distinguindo literal executável
+    de docstring.
+
+- **Gap descoberto e NÃO corrigido, reportado de propósito:**
+  O boundary cobre toda resposta; o **detector** tem um limite que ele herda. O padrão de
+  token do GitHub começa com `\b`, e um marcador **repetido e colado em si mesmo**
+  (`ghp_Xghp_Xghp_X`) só é redigido na primeira ocorrência — a partir da segunda não há
+  fronteira de palavra (`…789ghp_…` tem `9` antes de `g`). Consequência concreta: a sonda
+  `test_new_validation_error_echo` do Codex usa `MARK*5`/`MARK*9` para estourar limites de
+  tamanho, e **vai continuar encontrando o marcador** em três das quatro variantes. A
+  resposta atravessou o boundary (a redação parcial é visível no corpo); o que faltou foi
+  reconhecimento.
+  Não corrigi porque é uma mudança na semântica de `detect_secret_spans` — o arquivo que a
+  E5 auditou em cinco rodadas, com decisões próprias sobre *lookaround* e a separação entre
+  span de reconhecimento e de substituição —, e está fora dos três findings desta tarefa.
+  Registrado em teste (`test_o_boundary_aplica_o_detector_e_herda_os_limites_dele`), que
+  afirma o que é verdade (o boundary rodou) em vez de fingir que o texto saiu limpo.
+
+- Gates verificados:
+  - suíte completa do backend — ver a linha `PYTEST_EXIT` no relatório desta sessão;
+  - `ruff check` / `ruff format --check` / `mypy`: limpos (101 arquivos);
+  - frontend: `npm run lint`, `npm test` (129 testes, 19 arquivos), `npm run build` verdes;
+  - **sondas do Codex das três rodadas** reexecutadas — ver o relatório desta sessão para a
+    contagem exata de quais viraram e quais continuam confirmando controles;
+  - inventário exaustivo da rodada 3 varrido campo a campo em
+    `test_api_redaction_boundary.py`: `DevWorkspace` (4 escalares), preflight Git, Context
+    Registry (título, corpo, tags, valor **e chave** de `structured`, `source_refs`), import
+    de seed, `WorkspaceTask`, `ContextManifest`, prévia de purga e respostas de erro.
+
+- Pendências:
+  - **Nada commitado, nada pushado. E7 não iniciada.**
+  - O gap de detector descrito acima, aberto por decisão.
+  - `safety/test_policy.redacted_document` continua existindo e agora é redundante com o
+    boundary (o corpo inteiro passa pelo redator de todo modo). Mantido por ser defesa em
+    profundidade barata e ter testes próprios; removê-lo é limpeza, não correção.
+  - Aguardando a quarta rodada de auditoria independente do Codex.
+
+---
+
+## 2026-09-14 — Claude Opus 5 — E6: fronteira de segredo no detector e contrato de edição do Context Registry (E6-AUD4-001/002/003/004)
+
+Os quatro findings da quarta auditoria, corrigidos. Nenhum aceito como risco residual — o
+relatório pede explicitamente para **não** aceitar AUD4-001 por analogia com os riscos de
+*over-redaction* da E5, e a assimetria que ele aponta é correta: o que a E5 aceitou foi
+redigir demais; aqui redigia-se de menos. **Nada commitado, nada pushado** — vai para a
+quinta rodada do Codex.
+
+- Arquivos alterados:
+  - `api/app/safety/redaction.py` — fronteira de segredo (AUD4-001), reserva de placeholder
+    (AUD4-002), `contains_redaction_marker` (AUD4-004);
+  - `api/app/main.py` — handler de `HTTPException` do Starlette (AUD4-003);
+  - `api/app/api/responses.py` — `EditViewJSONResponse`;
+  - `api/app/api/context.py` — rota `edit-view`, `ContextEditViewResponse`,
+    `expected_content_hash` no `PATCH`;
+  - `api/app/context_engine/errors.py` + `__init__.py` — `RedactedContentRejected` (422) e
+    `ContextChanged` (409);
+  - `api/app/context_engine/service.py` — recusa de marcador nos limpadores, concorrência
+    otimista em `update_entry`;
+  - `api/app/safety/__init__.py` — reexporta o reconhecedor de marcador;
+  - **novo**: `api/tests/test_e6_audit_round_4.py`;
+  - `api/tests/test_architecture.py` — o conjunto fechado de saídas sem redação;
+  - `api/tests/test_context_redaction_e5_round5.py` — **GATE 1 mudou de forma** (ver abaixo);
+  - `src/services/contextApi.ts`, `src/utils/contextEntries.ts`,
+    `src/pages/WorkspaceContext.tsx` e dois módulos de teste — o fluxo de edição do lado do
+    cliente, que é onde AUD4-004 foi observado;
+  - `docs/architecture/04-safety-and-git-runtime.md` — nota curta sobre a fronteira, com a
+    autorização explícita do prompt desta tarefa.
+
+### E6-AUD4-001 — a fronteira de palavra ganha uma segunda forma de ser satisfeita
+
+O `\b` que abre os padrões de token opaco existe para não casar no meio de uma palavra. Ele
+falha quando o vizinho **também é segredo** — e aí a premissa dele ("o que está ao lado é
+uma palavra comum") é simplesmente falsa. Em `AKIA`, que tinha fronteira dos dois lados,
+duas chaves coladas não eram reconhecidas **nenhuma** das duas.
+
+A correção não remove fronteira nenhuma: acrescenta uma segunda maneira de satisfazê-la —
+**o início ou o fim de outra ocorrência do mesmo catálogo**. Três peças, todas no dono
+único:
+
+1. *tempering* condicionado a uma ocorrência **completa**: o match guloso para onde um
+   segredo inteiro começa, e só aí;
+2. variantes **encadeadas**, derivadas do padrão principal por remoção do `\b` inicial, que
+   o motor só ancora no fim de uma região já reconhecida;
+3. a fronteira à direita da AWS saiu do regex e virou regra do motor, que a satisfaz
+   consultando o catálogo inteiro.
+
+Mais um **fecho de adjacência** que repete até estabilizar, porque a segunda ocorrência abre
+a terceira.
+
+### E6-AUD4-002 — reservar antes de alocar
+
+O contador garantia unicidade entre os nomes que ele mesmo emitia, e nada contra os que já
+estavam no documento. Agora uma varredura prévia coleta os números já ocupados por chave
+literal, em qualquer profundidade, e o contador os pula.
+
+### E6-AUD4-003 — o caminho de erro do framework
+
+`default_response_class` cobre o retorno normal de `APIRoute` e não substitui o handler de
+`HTTPException` embutido do Starlette — que é o caminho de todo `404` de rota e `405` de
+método, e de qualquer `HTTPException` que uma dependência levante. Registrado handler
+próprio, pelo boundary, preservando `status_code` e `headers` verbatim.
+
+### E6-AUD4-004 — projeção de saída não é conteúdo autoral
+
+Quatro peças, que só funcionam juntas: recusa de marcador em **toda** escrita do registry,
+rota `edit-view` com o conteúdo cru, `expected_content_hash` obrigatório no `PATCH`, e o
+editor do frontend lendo o cru em vez da projeção.
+
+- Decisões de implementação **não** 100% especificadas no prompt:
+  1. **O relaxamento de fronteira é ancorado em segredo, e só nele.** Um segredo colado a
+     uma palavra comum (`tokenizerghp_…`) **continua** não sendo reconhecido. Remover o `\b`
+     em geral transformaria o detector num casador de substring e alargaria a over-redaction
+     numa superfície que ninguém mediu; o finding fala de segredo encostado em segredo, e é
+     essa a classe fechada. Está afirmado em teste
+     (`test_a_fronteira_de_palavra_continua_valendo_contra_texto_comum`), para que a decisão
+     fique visível em vez de implícita.
+  2. **O *tempering* exige uma ocorrência completa à frente, não só o prefixo.** É o que
+     torna a correção **provadamente aditiva**: o match só encurta onde o fecho vai cobrir
+     mais do que ele largou. Com a condição fraca (só o prefixo), `ghp_` + 16 seguido de um
+     `ghp_` curto demais passaria a redigir **menos** que a cascata histórica.
+  3. **A fronteira à direita virou regra do motor, não lookahead no regex.** Expressá-la
+     como `(?=…)` funcionaria para AWS-seguida-de-AWS e não para AWS-seguida-de-GitHub, e
+     obrigaria a declarar um lookahead que a construção de `recognition_span` ampliaria em
+     todo match. Como regra do motor ela consulta o **catálogo inteiro** — sem segunda
+     lista — e o `recognition_span` só se amplia quando o vizinho de fato foi lido.
+  4. **`anthropic_key` ganhou encadeamento, mas não *tempering*.** A classe do valor já
+     inclui `-` e `.`, então cópias coladas são engolidas por uma correspondência só;
+     *temperá-la* trocaria um `«redigido»` por N sem fechar nada.
+  5. **O GATE 1 da E5 (rodada 5) mudou de forma, e isto é o item que mais merece olhar.**
+     Ele afirmava **igualdade de bytes** com a cascata histórica para um corpus de 5.564
+     concatenações. A afirmação protegia algo real (a ampliação de `recognition_span` não
+     vazou para quem substitui texto) e, como definição de correção, congelava o defeito:
+     as 8 divergências que apareceram são exatamente os casos de segredo colado em segredo.
+     O gate passa a afirmar duas coisas mais fortes — **monotonicidade** caractere a
+     caractere (nada que era redigido deixou de ser) e **divergência só por adjacência** —,
+     com a máscara histórica calculada por simulação caractere a caractere, algoritmo
+     diferente do que está sob teste.
+  6. **A reserva coleta só os nomes com *forma* de placeholder.** Qualquer outro nome é
+     incapaz de colidir com o que o contador emite; varrer por igualdade custaria uma
+     chamada a `redact` por chave e não responderia nada a mais.
+  7. **`expected_content_hash` é obrigatório, não opcional.** Opcional seria a mesma
+     inversão de modelo que E6-AUD3-001 encontrou na redação: a garantia existiria só para
+     quem lembrasse de pedi-la, e o esquecimento seria silencioso — uma escrita apagando a
+     outra sem rastro. O preço foi tocar **todo** chamador de `PATCH`, no backend e no
+     frontend, o que é o que torna a decisão visível.
+  8. **A recusa de marcador mora nos limpadores do serviço**, não na borda HTTP. `POST`,
+     `PATCH` e o seed de importação passam pelos mesmos limpadores, então as três nascem
+     cobertas; e um chamador interno não passa pelo Pydantic (a razão de E3-AUD-007).
+  9. **Recusar é a única resposta correta, e ela tem um preço aceito.** Um texto que
+     legitimamente contenha `«redigido»` — alguém documentando este mecanismo — é recusado.
+     O modo de falha do outro lado é silencioso e destrutivo; este é ruidoso e reversível.
+  10. **`EditViewJSONResponse` é uma classe de resposta, não `Unredacted` campo a campo.**
+      Envolver cada campo transformaria o *escape hatch* de um construtor rastreável num
+      idioma reutilizável, e a regra "existe exatamente um `Unredacted(...)`" perderia o
+      sentido no dia em que fossem quatro. Duas exceções, dois tipos, um ponto de uso cada,
+      enumerados em `test_o_conjunto_de_respostas_sem_redacao_e_fechado`.
+  11. **`ContextEditViewResponse` carrega os quatro campos que o prompt declarou, e só.**
+      Consequência: `tags` e `source_refs` continuam vindo da projeção redigida. Como o
+      `PATCH` só envia o que mudou, isso só aparece se alguém editar uma `tag` cujo texto
+      redigido carregue marcador — e aí a escrita é recusada, não corrompida. Registrado
+      aqui porque é o canto que sobrou do contrato, não um descuido.
+  12. **O frontend foi religado, e o prompt não pediu.** Sem isso a rota existiria sem
+      consumidor e o hash obrigatório quebraria o editor — ou seja, a correção estaria pela
+      metade exatamente na superfície onde o finding foi observado (`contextEntries.ts`).
+  13. **O corpo do erro de `HTTPException` preserva `detail` e acrescenta `code`/`message`.**
+      Mesmo desenho do `422` da rodada 3: o cliente que já lê `detail` continua funcionando,
+      e a resposta ganha o par estável de [06] §2.
+  14. **A nota em `docs/` ficou em [04] §5 e em nenhum outro lugar**, e diz o que mudou na
+      garantia normativa do detector. Autorizada pelo prompt desta tarefa, condicionada à
+      minha avaliação de que a garantia mudou — ela mudou: a fronteira passou a ter duas
+      formas de ser satisfeita.
+
+- Encontrado por mim durante a rodada, e **não** corrigido por falta de autorização:
+  - **[04] §5 tem um bloco "Cobertura atual vs. princípio" que ficou falso.** Ele afirma que
+    `redact_document` percorre só **valores** e que chaves dinâmicas "ainda não são
+    cobertas", rastreando E6-AUD3-003 como gap aberto. O gap foi fechado na rodada 3 (a
+    implementação entrou **depois** do commit de documentação `8c493a8`), e a mesma seção
+    descreve `redact_document` como "recursivo sobre valores". Um auditor que leia só o
+    documento conclui o contrário do que o código faz. `docs/` é *Architecture Freeze*, e a
+    autorização desta tarefa cobre a nota de AUD4-001 — não esta correção. **Precisa da
+    decisão do Pedro.**
+  - O relatório da rodada 4 recomenda "não resolver devolvendo credenciais cruas ao
+    browser". O prompt desta tarefa decide o contrário de forma explícita, com as mitigações
+    nomeadas (`LocalSessionToken`, `POST` sob mesma origem, `no-store`, tipo estreito, sem
+    log nem `SafetyEvent`). Registrado porque é uma divergência deliberada entre auditor e
+    dono do projeto, e a quinta rodada vai reencontrá-la.
+
+- **O gap declarado na rodada 3 está fechado.** Era este mesmo: o `\b` do padrão do GitHub
+  só casava a primeira ocorrência colada, e a sonda `test_new_validation_error_echo` do
+  Codex encontrava o marcador em três das quatro variantes. `redact(M * n)` para n = 2, 3, 5
+  e 9 não deixa cópia nenhuma, nas quatro famílias de token.
+
+- Gates verificados: ver o relatório desta sessão para as contagens exatas — suíte completa
+  do backend com `PYTEST_EXIT` lido do pytest (e não do fim do *pipe*), `ruff check`,
+  `ruff format --check`, `mypy`, e frontend `npm run lint` / `npm test` / `npm run build`.
+
+- Pendências:
+  - **Nada commitado, nada pushado. E7 não iniciada.**
+  - O bloco estagnado de [04] §5 descrito acima, aguardando decisão.
+  - Aguardando a quinta rodada de auditoria independente do Codex.
+
+---
+
+## 2026-09-17 — Claude Opus 5 — E6: motor de convergência no detector, `edit_hash` e as barreiras da quinta rodada (E6-AUD5-001 a 007)
+
+Os sete findings da quinta auditoria. O detector deixou de ter adjacência **dentro** dos
+padrões e passou a ter um ponto fixo **em volta** deles. **Nada commitado, nada pushado** —
+vai para a sexta rodada do Codex.
+
+### A leitura que organiza esta rodada
+
+E6-AUD5-001 é o finding que importa entender, porque ele reprova o raciocínio da rodada 4,
+não só o código. Eu tinha argumentado que o *tempering* era "provadamente aditivo": o match
+só encurtaria onde o fecho cobriria mais. A prova tinha um furo que o corpus de 5.564
+entradas não continha — quando o payload antes do vizinho é **menor que o mínimo da
+expressão**, o match não encurta: ele **desaparece**. `ghp_` + 13 A + `ghp_` + 24 B deixava
+de ser reconhecido inteiramente, e `redact(s) == s`. Cobertura histórica perdida, no arquivo
+cuja regra número um é nunca perder cobertura.
+
+A lição não é "faltou um caso no corpus". É que **mexer no padrão muda o que ele reconhece
+isoladamente**, e nenhuma quantidade de fecho posterior desfaz isso. Mexer no motor não.
+
+- Arquivos alterados:
+  - `api/app/safety/redaction.py` — catálogo de volta ao canônico, motor de convergência;
+  - `api/app/context_engine/content_hash.py` — `compute_edit_hash`;
+  - `api/app/context_engine/service.py` — `edit_hash_of`, `expected_edit_hash`;
+  - `api/app/context_engine/errors.py` + `__init__.py` — `ContextEntryUnreadable`;
+  - `api/app/api/context.py` — `edit_hash` na resposta, erro tipado no `edit-view`;
+  - `api/app/context_engine/rendering.py` — `RENDERER_VERSION` → `e5.block.v7`;
+  - **novo**: `api/tests/test_e6_audit_round_5.py`;
+  - `api/tests/test_architecture.py` — duas regras novas contra subclasse de `Response`;
+  - `api/tests/test_context_redaction_e5_round5.py` — GATE 1 com oráculo de emissão;
+  - `src/services/contextApi.ts`, `src/utils/contextEntries.ts`,
+    `src/pages/WorkspaceContext.tsx` e dois módulos de teste — `expected_edit_hash`.
+
+### Parte 1 — o motor de convergência (fecha 001, 002 e o gate de adjacência)
+
+Removidos: *tempering* condicionado, variantes `_CHAINED`, `right_word_boundary`. O catálogo
+é o histórico, byte a byte.
+
+O motor trabalha em coordenadas do **original**, imutável: cascata canônica → reprojeção →
+catálogo de novo, e o catálogo reexecutado a partir de cada **âncora** como se ali começasse
+uma string nova. Repete enquanto a união de regiões **crescer**; uma volta que só reencontra
+o que já estava coberto encerra o laço. `MAX_REDACTION_PASSES = 8`; atingir o teto **com
+progresso** redige o campo inteiro (`UNCONVERGED`), nunca um resultado parcial.
+
+Terminação é aritmética: cada volta aumenta o número de caracteres cobertos, limitado por
+`len(text)`.
+
+### Parte 2 — `edit_hash` (fecha 004)
+
+`sha256(canonical_json({v, content_hash, tags, source_refs}))`, com `source_refs` passando
+por `encode_path_identity` para que NFC e NFD não colapsem. Derivado, nunca coluna.
+
+### Partes 3, 4, 5
+
+Duas regras de arquitetura novas, `e5.block.v7`, e erro tipado no `edit-view`.
+
+- Decisões de implementação **não** 100% especificadas no prompt:
+  1. **O algoritmo literal da Parte 1 não fecha o gate da Parte 1, e eu medi isso antes de
+     escrever qualquer linha no repositório.** Uma bancada fora do repo implementou o
+     algoritmo exatamente como especificado (cascata canônica + reprojeção + laço) e rodou a
+     matriz de 1.035 casos: **248 falhas** no oráculo, incluindo o caso do Pedro (57%
+     coberto), AUD5-001 (44%) e AUD5-002 (13–32%). O motivo é estrutural: quando o primeiro
+     match consome o prefixo do vizinho, a reprojeção substitui esse prefixo pelo marcador,
+     e o segundo token **deixa de existir** no texto reprojetado. Nenhuma quantidade de
+     iterações o traz de volta.
+     A peça que faltava é a **revarredura ancorada** — o oráculo do próprio prompt virado
+     algoritmo: reexecutar o catálogo a partir de cada posição dentro/no fim de uma região
+     coberta, tratando o sufixo como string nova. Com ela: **0 falhas** em 1.035 casos.
+  2. **As âncoras incluem o início de cada corrida de caracteres de palavra, e ali as duas
+     fronteiras são tratadas como borda de janela.** Sem isso a família AWS regride: o
+     catálogo canônico tem `\\b` dos **dois** lados, duas *access keys* coladas não casam
+     nenhuma das duas, e sem primeira região não há âncora nenhuma para o laço começar —
+     AUD4-001 (confirmado corrigido pelo auditor) voltaria a 0% de cobertura. Medido: com
+     âncora de corrida, 100%; sem, 0%.
+  3. **Isto é uma variante de padrão derivada mecanicamente, que o prompt mandou remover.**
+     Reporto como desvio, não como detalhe. A diferença estrutural em relação à rodada 4:
+     `_ANCHORED` **não muda o que a varredura canônica reconhece** — o passo 1 é o catálogo
+     histórico intacto. As variantes só existem dentro do motor, aplicadas em âncoras. É
+     por isso que AUD5-001 não pode se repetir: nenhuma expressão do catálogo mudou.
+     Se a leitura for que isto reintroduz o que devia sair, a reversão é de uma linha (não
+     povoar `_ANCHORED`) — e o custo medido é: AUD5-001, 002 e o caso do Pedro voltam.
+  4. **O limite pedido continua exato.** `tokenizerghp_…` não é reconhecido. Medi a classe
+     inteira: das 1.024 combinações da matriz, as que o oráculo **livre** (sem âncora)
+     acusaria são 115, e **todas as 115** são dessa classe — segredo colado em palavra
+     comum. Zero fora dela.
+  5. **O GATE 1 da E5 mudou de forma pela segunda vez, e agora afirma algo mais forte do que
+     a igualdade de bytes original.** Três cláusulas: monotonicidade caractere a caractere;
+     **emissão segura** (o oráculo aplicado ao que saiu); e **igualdade de conjuntos** — o
+     conjunto de casos cujos bytes mudaram é *igual* ao conjunto de casos em que a emissão
+     histórica falhava o oráculo. Medido: 345 e 345, com interseção total e zero divergência
+     fora. O mutante de AUD5-003 é reprovado (teste próprio).
+  6. **A máscara do oráculo vem das regiões do motor, com a emissão confrontada contra elas
+     — não de uma reconstrução por bytes.** Reconstruir por bytes é ambíguo: um fragmento
+     preservado pode aparecer em duas posições da entrada (`ghp_AAA…ghp_AAA…`), e o
+     alinhamento escolhe a errada — produziu 9 falsos positivos na matriz antes de eu trocar.
+     O par "máscara das regiões + emissão reconstruída tem de bater" fecha a mesma porta que
+     AUD5-003 pediu, sem herdar a ambiguidade.
+  7. **`expected_content_hash` foi REMOVIDO do contrato, não mantido como redundância.**
+     `edit_hash` já contém o `content_hash`, então nenhuma divergência de conteúdo escapa do
+     campo novo: o antigo é estritamente mais fraco e nunca dispararia sozinho. Manter os
+     dois só serviria para alguém mandar o fraco e achar que está protegido. `content_hash`
+     continua na resposta de leitura e de `edit-view` — ele é normativo sobre outra pergunta
+     ([03] §2) e não mudou de significado.
+  8. **`EDIT_HASH_VERSION` é separado de `CONTENT_HASH_VERSION`.** Mudar o conjunto de campos
+     editáveis avança um, não o outro. Juntá-los faria uma mudança de contrato de edição
+     invalidar o hash normativo da E5.
+  9. **`ContextEntryUnreadable` é `500`, não `422`.** O cliente não fez nada errado: o dado
+     está gravado numa forma que o modelo recusa. `422` diria que o pedido está malformado, e
+     o pedido está certo.
+  10. **`raise ... from None` no `edit-view`.** Encadear preservaria a `ValidationError`
+      original como `__cause__`, e qualquer formatador que imprimisse a cadeia traria o
+      `input_value` de volta ao log — que é exatamente o canal de AUD5-007.
+  11. **A mensagem do erro nomeia o campo, nunca o valor.** `structured` é diagnóstico
+      legítimo; o conteúdo dele não.
+  12. **A regra de arquitetura ficou em duas**, e a primeira é a que importa: o conjunto de
+      subclasses de `Response` definidas no projeto é **fechado**. O mutante de AUD5-005
+      quebra na **definição** da classe, antes de qualquer uso. A segunda cobre construção e
+      apelidos de import.
+  13. **O teste do mutante monta uma cópia temporária da árvore** e reaponta as regras para
+      ela. Nenhum arquivo do projeto é tocado, e o controle positivo (as mesmas regras contra
+      a árvore real) está ao lado.
+  14. **A borda de janela alarga a cobertura da AWS, e só dela.** `aws_access_key` é o único
+      padrão com fronteira à **direita**; recortá-la na âncora passa a reconhecer também
+      `AKIA…` seguido de minúscula, que a expressão canônica recusava. É over-redaction na
+      direção segura, num formato já distintivo, e está travado em teste com os dois limites
+      ao lado: `palavraAKIA…` continua **não** reconhecido, e `AKIA123` curto também não.
+  15. **`MAX_REDACTION_PASSES = 8`.** Oito é folgado para o que se observa (a matriz inteira
+      converge em ≤ 3), e o comportamento ao estourar é fail-closed, então errar para baixo
+      custa over-redaction e não vazamento.
+
+- Encontrado pelo **meu próprio** self-review, antes da suíte:
+  - **O laço devolvia spans duplicados.** Ele reencontra a mesma âncora a cada volta, e o
+    span repetido chegava a `detect_secret_spans` — que é API pública, consumida pelo
+    renderer da E5 para montar `transformations`, campo que participa do payload hasheado
+    ([02] §5). Determinístico não é o mesmo que correto: o hash seria estável e a lista,
+    errada. Deduplicado na saída, com regressão própria.
+  - **A âncora de corrida de palavra usava um alfabeto diferente do `\b`.** Com
+    `[A-Za-z0-9_]`, `caféghp_…` virava início de corrida (o `é` não casava) e era redigido,
+    enquanto `tokenizerghp_…` não era — o mesmo caso decidido de duas formas. O `\b` do
+    Python é Unicode-aware; a âncora passou a usar `\w`, que é a definição dele.
+
+- Gates verificados: ver o relatório desta sessão — suíte completa do backend com
+  `PYTEST_EXIT` lido do pytest, `ruff check`, `ruff format --check`, `mypy`, frontend
+  `npm run lint` / `npm test` / `npm run build`, e as sondas das cinco rodadas do Codex.
+
+- Pendências:
+  - **Nada commitado, nada pushado. E7 não iniciada.**
+  - O desvio da decisão 3, que precisa da leitura do Pedro.
+  - Aguardando a sexta rodada de auditoria independente do Codex.
+
+---
+
+## 2026-09-18 — Claude Opus 5 — E6: varredura linear do `pem_block` e a quarta cláusula do GATE 1 (E6-AUD6-001 e 002)
+
+Dois findings da sexta rodada, um em cada direção do mesmo arquivo: um de **custo** no
+detector, um de **força de ensaio** no gate que protege o detector. **Nada commitado, nada
+pushado** — vai para a sétima rodada do Codex.
+
+### A leitura que organiza esta rodada
+
+E6-AUD6-001 não é vazamento, e é justamente por isso que vale registrar: `redact` roda em
+**todo** boundary de saída de `/api/*` ([04] §5), então o custo dele é contrato tanto
+quanto a cobertura. Um padrão com `.*?` atrás de um terminador que pode não existir
+transforma 196 KB de texto numa rota presa por sete segundos — sem erro, sem log, sem nada
+que uma suíte funcional perceba. As cinco rodadas anteriores mediram o que o detector
+**reconhece**; nenhuma mediu o que ele **custa**.
+
+E6-AUD6-002 é o mesmo tipo de cegueira, um nível acima. As três cláusulas do GATE 1 falam
+todas sobre **conjuntos de casos** — quais entradas mudaram de bytes, quais ficaram
+inseguras. Nenhuma olha para dentro de um caso cuja divergência já está autorizada. O
+mutante do Codex usa exatamente essa brecha: num caso já inseguro, devolve um span
+`[0, len)` e apaga o `Bearer ` junto com o valor.
+
+- Arquivos alterados:
+  - `api/app/safety/redaction.py` — `_scan_pem_block`, campo `scan` em `_Pattern`;
+  - `api/tests/test_context_redaction_e5_round5.py` — quarta cláusula do GATE 1 e
+    `_rotulos_protegidos`;
+  - **novo**: `api/tests/test_e6_audit_round_6.py` (16 testes).
+
+### E6-AUD6-001 — reconhecimento linear do bloco PEM
+
+`_Pattern` ganhou um campo `scan` opcional e um método `finditer`. O motor passou a chamar
+`spec.finditer(working)`; quem não declara `scan` continua usando `pattern.finditer`, então
+sete dos oito padrões não sabem que isso existe.
+
+`_scan_pem_block` acha as aberturas com um `finditer` da metade `BEGIN` (que não
+retrocede), o terminador de cada uma com **um** `search` a partir do fim dela, e encerra na
+primeira abertura sem terminador. Os intervalos varridos pelos `search` são disjuntos e
+crescentes, porque o cursor pula para o fim de cada bloco.
+
+O `re.Match` devolvido vem de `pattern.match(text, abertura.start())` — a **expressão
+canônica**. É uma segunda passada sobre o bloco, deliberada: o objeto que chega a
+`_emit_span` é produzido pelo padrão histórico, então `recognition_span`/`replacement_span`
+e grupos não podem divergir do que sempre foram.
+
+Medido, mesma máquina, 196.000 caracteres com 7.000 aberturas e nenhum `END`:
+
+| medição | antes | depois |
+|---|---|---|
+| em processo | 7.645 ms | **103 ms** |
+| pela rota HTTP (`POST /api/workspaces/{id}/context`) | 7,67 s | **0,98 s** |
+| razão 4n/n | 15,9x (quadrático) | menos de 8 |
+| texto comum do mesmo tamanho | 131 ms | 128 ms |
+| 2.500 blocos PEM completos | 403 ms / 2.500 marcadores | 413 ms / 2.500 marcadores |
+
+### E6-AUD6-002 — a quarta cláusula
+
+`_rotulos_protegidos` devolve `rótulo − carga`, calculado **só** das janelas literais de
+`_JANELAS`, sem tocar no motor nem na máscara emitida. A cláusula afirma que essas posições
+continuam visíveis na emissão. Medido no corpus de 5.564 casos: 1.450 casos têm rótulo
+protegido, 12.898 posições no total, zero violações pelo motor real.
+
+- Decisões de implementação **não** 100% especificadas no prompt:
+  1. **O `re.Match` vem da expressão canônica, ao custo de uma segunda passada.** A
+     alternativa — montar o match à mão a partir do par abertura/terminador — economiza
+     metade do trabalho e cria uma segunda fonte de verdade sobre o que o padrão
+     reconheceu. É o defeito que este módulo inteiro existe para não ter. Como os blocos
+     são disjuntos, a soma continua linear.
+  2. **A varredura alternativa é declarada no catálogo, não no motor.** `_Pattern.scan` e
+     `_Pattern.finditer` deixam `detect_secret_spans` com um ponto de entrada só; um padrão
+     novo entra sem `scan` e se comporta como sempre. A alternativa seria um
+     `if spec.name == "pem_block"` dentro do laço — tratamento por nome de padrão, que é a
+     forma do defeito da rodada 4.
+  3. **A parada na primeira abertura sem terminador é exata, não heurística.** Se não há
+     `END` depois da abertura `b`, também não há depois de nenhuma posterior: o fim da
+     parte `BEGIN` cresce monotonicamente com a posição dela, porque `-----BEGIN` só
+     reaparece dentro de outro nos cinco traços finais. Argumentado na docstring e medido
+     em 323.384 casos (23.384 combinatórios mais 300.000 de fuzz) contra o `finditer`
+     canônico: zero divergências.
+  4. **Os testes de tempo são relativos, não absolutos.** A afirmação é "o `pem_block`
+     custa menos de 3x o texto comum do mesmo tamanho" e "quadruplicar a entrada não
+     multiplica o custo por mais de 8". Um limite em milissegundos mediria a máquina; estes
+     dois medem a complexidade. Contra a árvore revertida eles acusam 56,2x e 15,9x.
+  5. **O fuzz é derivado de SHA-256, não de `random`.** `random` não promete a mesma
+     sequência entre versões do Python, e num repositório onde `rendered_context_hash` é
+     contrato ([02] §5) um gerador que pode mudar de saída é um gerador errado. Efeito
+     colateral bem-vindo: nenhuma exceção de lint (`S311`) precisou ser aberta — este repo
+     não tem nenhuma, e não é esta tarefa que vai abrir a primeira.
+  6. **A cláusula (4) protege `rótulo − carga`, não "todo rótulo".** A versão ingênua
+     reprova o motor **correto** em 11 casos do corpus: em `password: password: sk-123` o
+     valor atribuído à primeira chave é literalmente o texto `password:`, e escondê-lo é o
+     catálogo funcionando. Três desses casos viraram teste parametrizado.
+  7. **As âncoras de `_rotulos_protegidos` crescem em ponto fixo.** Com âncoras só nos
+     inícios de corrida de palavra, o oráculo enxerga menos carga que o motor e acusa
+     over-redaction legítima — medido: 5 falsos positivos. O ponto fixo (a âncora ganha
+     toda posição reconhecida como carga) reproduz o que o motor faz, sem consultá-lo.
+  8. **A independência da cláusula (4) é verificada por AST, não por substring.** A
+     docstring de `_rotulos_protegidos` **cita** `detect_secret_spans` para explicar por que
+     não o usa; uma varredura textual confundiria a explicação com o uso.
+  9. **O controle negativo roda o GATE 1 inteiro.** `test_e6_aud6_002_o_gate_1_inteiro_reprova_o_mutante`
+     troca `redact`/`detect_secret_spans` no módulo do gate por um mutante cirúrgico — span
+     total **só** para `"://Bearer password: sk-123"` — e exige `AssertionError` casando
+     "esconderam um rótulo". Um mutante global seria pego pela cláusula (3), e o finding
+     não é sobre isso.
+  10. **`docs/` não foi tocado.** Sem autorização nesta rodada, e nenhuma garantia
+      normativa mudou: o `pem_block` reconhece exatamente o que reconhecia.
+
+- Defeito próprio, achado ao puxar o código para responder ao Pedro:
+  - **Cinco bytes `0x08` em comentário e docstring de `redaction.py`** (linhas 174, 182,
+    186 e 207), onde deveria estar a sequência de fronteira de palavra — resíduo do
+    problema de heredoc das rodadas anteriores. Só em texto, nenhum dentro de regex, e por
+    isso nenhum teste acusava. Corrigidos; `app/` e `tests/` varridos, nenhum outro.
+
+- Gates verificados:
+  - suíte do backend: ~~**1754 passed**, 6 skipped, 0 failed~~ → **1755 passed, 6 skipped,
+    0 failed**, `PYTEST_EXIT=0`.
+    **Correção registrada em 2026-09-18 (E6-AUD7-005).** O número escrito aqui era o da
+    **penúltima** corrida, feita antes de eu acrescentar o 16º teste do módulo da rodada 6
+    (`test_e6_aud6_002_o_gate_1_inteiro_reprova_o_mutante`). A corrida final desta sessão
+    deu 1755, e a Rodada 7 do Codex confirmou 1755 de forma independente. O valor errado
+    fica visível de propósito: foi ele que a auditoria leu;
+  - suíte adversarial e de determinismo da E5 mais as auditorias da E4 (14 módulos):
+    **357 passed**, `PYTEST_EXIT=0` — `rendered_context_hash`, `manifest_hash` e as
+    garantias de `recognition_span`/`replacement_span` intactos;
+  - `ruff check`, `ruff format --check`, `mypy`: limpos, 104 fontes;
+  - frontend: lint limpo, 130 testes em 19 arquivos, build OK;
+  - sondas das cinco rodadas do Codex, recontadas: R1 18/7, R2 11/14, R3 19/20, R4 9/21,
+    R5 12/36 — **idênticas** ao fim da rodada 5;
+  - árvore revertida (as duas correções desfeitas numa cópia temporária): os 4 testes que
+    deviam falhar falham, os outros 12 passam.
+
+- Pendências:
+  - **Nada commitado, nada pushado. E7 não iniciada.**
+  - O desvio da rodada 5 (`_ANCHORED`), que continua esperando a leitura do Pedro.
+  - Aguardando a sétima rodada de auditoria independente do Codex.
+
+---
+
+## 2026-09-18 — Claude Opus 5 — E6 Rodada 7: patch documental do contrato de segurança (decisões A–D)
+
+Etapa **somente documental**, a pedido do Pedro, depois de a sétima rodada do Codex
+terminar **BLOCKED**. Nenhuma linha de implementação foi tocada, nenhum teste de
+comportamento foi alterado. **Nada commitado, nada pushado.**
+
+### O que a Rodada 7 abriu
+
+| Finding | Prioridade | Tratamento nesta etapa |
+| --- | --- | --- |
+| E6-AUD7-001 — varredura otimizada do `pem_block` não seria equivalente à expressão canônica | P1 | **continua bug**; documentada só a garantia que a implementação deve satisfazer |
+| E6-AUD7-002 — valor/subárvore sob chave sensível (`token`) atravessa `RedactingJSONResponse` | P1 | **continua bug**; documentada só a garantia |
+| E6-AUD7-003 — `_ANCHORED` é mais conservador do que o contrato dizia | P2 | contrato corrigido; comportamento **mantido** |
+| E6-AUD7-004 — GATE 1 não garante preservação de toda pontuação pública | P3 | risco residual **aceito** e registrado |
+| E6-AUD7-005 — `AGENT_LOG.md` registrava 1754 em vez de 1755 | P3 | corrigido de forma rastreável |
+
+Mais o apontamento de que [04] §5 descrevia `purge_token` como exceção **única**, embora
+`EditViewJSONResponse` seja uma segunda exceção deliberada e testada desde E6-AUD4-004.
+
+### As quatro decisões do Pedro, registradas como contrato
+
+- **A — `_ANCHORED` fica como está.** As variantes derivadas recortam as **duas** fronteiras
+  de palavra, e o efeito é assimétrico: à esquerda o relaxamento só vale em âncora de região
+  coberta (por isso `tokenizerghp_…` e `xAKIA…` continuam fora); à direita vale em qualquer
+  âncora, e por isso `AKIA0123456789ABCDEFx` → `«redigido»x`. Redige de mais, nunca de
+  menos. Hoje o efeito da direita só é observável em `aws_access_key`, o único padrão do
+  catálogo com fronteira de palavra à direita.
+- **B — risco residual de precisão aceito.** O GATE 1 continua garantindo confidencialidade
+  e preservação por posição dos rótulos protegidos; **não** precisa provar que toda
+  pontuação pública de uma entrada já autorizada a divergir sobrevive. Não autoriza falso
+  negativo, não autoriza apagar rótulo, não mexe no *fail-closed*.
+- **C — duas classes de escape da fronteira JSON**, e só duas: `Unredacted` no `purge_token`
+  (granularidade de **valor**) e `EditViewJSONResponse` (granularidade de **resposta**).
+  Ambas tipadas, localizadas, testadas, não reaproveitáveis. Terceira exige decisão
+  explícita antes de existir em código.
+- **D — AUD7-001 e AUD7-002 continuam bloqueadores.** A documentação reforça a obrigação,
+  não permite o comportamento: o caminho otimizado do PEM tem de preservar a semântica
+  canônica em tudo que é observável (conjunto e ordem de matches, spans, grupos, aberturas
+  sobrepostas) sem voltar a ser superlinear; e uma chave classificada por `is_sensitive_key`
+  tem de tornar **o valor e a subárvore inteira** sensíveis para projeção pública
+  *fail-closed*.
+
+- Arquivos alterados (**documentação apenas**):
+  - `docs/architecture/04-safety-and-git-runtime.md` — cabeçalho (marca de esclarecimento)
+    e §5 (quatro blocos: duas classes de escape, precisão da âncora, risco residual aceito,
+    duas garantias abertas);
+  - `AGENT_LOG.md` — correção rastreável do 1754 na entrada de 2026-09-18, mais esta
+    entrada.
+
+- Decisões de forma **não** 100% especificadas no pedido:
+  1. **A afirmação superada foi marcada, não apagada.** A frase do bloco E6-AUD4-001 que
+     dizia que segredo colado a palavra comum continua necessariamente fora ficou no texto,
+     riscada, com o ponteiro para o bloco novo. Apagá-la faria parecer que o contrato sempre
+     esteve certo, e o Architecture Freeze existe justamente para que decisão antiga não
+     desapareça em silêncio. O que ela não é mais é **contrato vigente**.
+  2. **O bloco novo descreve só o que a implementação faz hoje.** O pedido foi explícito em
+     não ampliar. Por isso o texto nomeia a assimetria esquerda/direita, nomeia
+     `aws_access_key` como o único padrão onde o efeito da direita aparece hoje, e diz que
+     um padrão novo com fronteira final herdaria o mesmo por construção — sem prometer nada
+     sobre padrões que não existem.
+  3. **As duas garantias abertas viraram um bloco só, rotulado como dívida.** Ficam em [04]
+     §5 porque é onde a Camada 3 é definida, e o rótulo diz "findings P1 em aberto" e
+     "a rodada terminou BLOCKED", para que ninguém leia a presença delas no documento como
+     aceitação.
+  4. **O cabeçalho ganhou marca de esclarecimento**, no mesmo formato do "Revisado na Fase
+     1B.3" que já existia, delimitando o escopo a §5.
+  5. **O link de ADR-0009 no bloco novo aponta para o arquivo real**
+     (`0009-provider-capability-enforcement.md`); escrevi um caminho errado na primeira
+     versão e corrigi antes de fechar.
+  6. **`docs/audits/` não recebeu nada.** Não existe `docs/audits/e6-round-7.md` no
+     repositório — nem ele nem nenhum relatório das rodadas 1 a 6 da E6 — e criar um
+     resumo meu no lugar do relatório do auditor seria inventar fonte primária. Ver a
+     pendência abaixo.
+
+- Verificação do que a auditoria descreve, feita só por inspeção (nada foi alterado):
+  - **E6-AUD7-003 confirmado.** `AKIA0123456789ABCDEFx` → `«redigido»x`;
+    `AKIA0123456789ABCDEF` + `GH` → `«redigido»GH`; e, do outro lado, `xAKIA…`, `XAKIA…`,
+    `9AKIA…`, `_AKIA…` e `tokenizerghp_…` continuam crus. `aws_access_key` é o único padrão
+    do catálogo com fronteira de palavra à direita.
+  - **E6-AUD7-002 confirmado.** `redact_document({"token": "valor-comum-sem-forma-de-segredo"})`
+    devolve o valor intacto; idem para subárvore (`{"token": {"inner": …}}`), lista
+    (`{"api_key": ["a","b"]}`) e `{"password": "abcdefgh"}` — enquanto
+    `is_sensitive_key("token")` é `True`.
+  - **E6-AUD7-001 NÃO reproduzido por mim.** Diferencial de `_scan_pem_block` contra
+    `pem_block.finditer`: 69.904 combinações exaustivas de tokens PEM (n ≤ 4) mais 300.000
+    sequências longas gerada por SHA-256 — zero divergências. Diferencial do **motor
+    inteiro** (`redact`) entre a árvore atual e uma cópia com a varredura otimizada
+    desligada, sobre ~209.000 casos misturando PEM com as outras famílias — zero
+    divergências. Isso **não** refuta o finding: fui eu que escrevi a otimização e o
+    oráculo, e um ponto cego compartilhado entre os dois é exatamente o que um diferencial
+    assim não enxerga. O contraexemplo do auditor é o que falta, e é dele que a etapa de
+    implementação precisa.
+
+- Pendências:
+  - **Nada commitado, nada pushado. Nenhuma implementação alterada. E7 não iniciada.**
+  - **E6-AUD7-001 e E6-AUD7-002 continuam abertos e bloqueadores**, para a etapa de
+    implementação seguinte.
+  - **O relatório `docs/audits/e6-round-7.md` não existe no repositório.** Li os findings
+    pelo enunciado da tarefa. Para AUD7-001 falta o contraexemplo concreto do auditor.
+  - O desvio da rodada 5 (`_ANCHORED` manter variantes derivadas) deixa de ser pendência:
+    a **Decisão A** desta rodada o resolve, mantendo o comportamento e corrigindo o
+    contrato.
+
+---
+
+## 2026-09-18 — Claude Sonnet 5 — E6: fechamento documental mínimo pré-implementação (estreitamento do contrato `_ANCHORED`, contraexemplo de E6-AUD7-001)
+
+Microetapa **somente documental**, MODELO Sonnet / EFFORT medium. Nenhuma implementação
+alterada, nenhum teste de comportamento alterado. **Nada commitado, nada pushado.**
+
+### 1 — Contrato `_ANCHORED` estreitado
+
+A frase final do bloco "Precisão da âncora" em
+[04](docs/architecture/04-safety-and-git-runtime.md) §5 podia ser lida como uma garantia
+do **redator inteiro**, e isso entrava em tensão direta com E6-AUD7-001 (P1, aberto): se o
+contrato promete "nunca cobre menos" para o redator como um todo, um scanner otimizado que
+cobre menos seria uma violação do contrato documentado, não um bug isolado do scanner.
+
+Reescrita para deixar explícito que a garantia é **das variantes derivadas `_ANCHORED`
+especificamente** — elas podem produzir *over-redaction*, não podem cobrir menos que a
+passada canônica —, e que isso **não afirma nada** sobre outros caminhos/otimizações do
+redator (como o scanner do `pem_block`). E6-AUD7-001 é citado como contraexemplo conhecido
+e P1 aberto, com referência cruzada para o bloco "Duas garantias abertas" que já existia.
+A Decisão A da rodada anterior (manter o comportamento de `_ANCHORED`) não foi alterada —
+só a precisão de a quem a garantia se aplica.
+
+### 2 — Persistência da auditoria da Rodada 7: BLOQUEADA nesta etapa
+
+O pedido citava "Vou fornecer o relatório integral junto desta tarefa", mas o relatório
+integral do Codex **não veio anexado nem colado** na mensagem — só o enunciado dos cinco
+findings (já registrado na entrada anterior) e o trecho de contraexemplo da seção 3.
+
+`docs/audits/e6-round-7.md` **não foi criado nesta etapa.** Criar esse arquivo com
+qualquer coisa que não seja o texto verbatim do auditor — inclusive uma reconstrução minha
+a partir dos enunciados que recebi — seria exatamente o que a tarefa proíbe ("não
+transforme em uma interpretação do Claude", "não invente relatórios"). Pedi ao Pedro o
+texto integral antes de prosseguir com este item.
+
+**Os relatórios das rodadas 1–6 da E6 continuam ausentes do repositório** — não existe
+`docs/audits/e6-round-1.md` até `e6-round-6.md`. Eles **não serão reconstruídos de memória
+ou inferência**. Se forem recuperados de fonte primária depois, podem ser adicionados como
+os relatórios originais, verbatim, no mesmo padrão.
+
+### 3 — Contraexemplo primário de E6-AUD7-001, registrado para a etapa de implementação
+
+O Pedro forneceu, diretamente nesta conversa, a reprodução independente do Codex que este
+Developer não tinha na etapa anterior (na ocasião eu tinha reportado não conseguir
+reproduzir o finding). Verbatim, como recebido:
+
+```python
+B = "-----BEGIN PRIVATE KEY-----"
+E = "-----END PRIVATE KEY-----"
+p = "MIIE_AUD7_SYNTHETIC_PRIVATE_MATERIAL"
+u = lambda x: "BEGIN PRIVATE KEY-----" * 2 + x + E
+texto = B + E + u(p) + u("")
+```
+
+Resultado observado pelo Codex:
+
+* regex canônica: `(0,52), (69,157), (174,226)`
+* scanner otimizado: `(0,52), (152,226)`
+* consequência: `p` (`MIIE_AUD7_SYNTHETIC_PRIVATE_MATERIAL`) permanece visível em
+  `redact(texto)` e atravessa também `RedactingJSONResponse`.
+* o Codex reportou ainda **339 divergências em 5.000 composições adicionais** com
+  aberturas sobrepostas.
+
+**O Developer agora possui o contraexemplo primário de E6-AUD7-001 para a etapa seguinte.**
+Nesta etapa ele não foi usado para corrigir o scanner nem para alterar testes — só
+registrado, conforme a instrução explícita da tarefa. Ele precisa ser reproduzido dentro
+da suíte de testes (`_scan_pem_block` vs. `pem_block.finditer`) antes de qualquer correção,
+e antes de considerar fechado o diferencial que eu tinha rodado na etapa anterior (que não
+encontrou divergência com os corpora que gerei — o que este contraexemplo mostra é que
+meus geradores não cobriam o padrão de aberturas sobrepostas que o produz).
+
+- Arquivos alterados (**documentação apenas**):
+  - `docs/architecture/04-safety-and-git-runtime.md` — uma frase reescrita em "Precisão da
+    âncora" (§5);
+  - `AGENT_LOG.md` — esta entrada.
+
+- Pendências:
+  - **Nada commitado, nada pushado. Nenhuma implementação alterada.**
+  - **`docs/audits/e6-round-7.md` continua sem existir** — aguardando o texto verbatim do
+    relatório do Codex.
+  - **Relatórios das rodadas 1–6 da E6 continuam ausentes**, e não serão reconstruídos.
+  - **E6-AUD7-001 e E6-AUD7-002 continuam abertos e bloqueadores** para a etapa de
+    implementação seguinte. Para AUD7-001, o contraexemplo primário agora está disponível
+    (seção 3 acima).
+
+---
+
+## 2026-09-18 — Claude Sonnet 5 — E6: relatório da Rodada 7 finalmente persistido
+
+Conclusão da Tarefa 2, deixada pendente na microetapa anterior. `docs/audits/e6-round-7.md`
+foi criado com o **relatório integral e original do Codex**, fornecido pelo Pedro nesta
+conversa — verbatim, sem resumo, sem reescrita, sem correção de estilo/gramática, sem
+adaptação de paths, sem reinterpretação de findings. Nenhuma reconstrução ou interpretação
+minha foi usada. Ver o arquivo para o conteúdo completo (veredito BLOCKED; findings
+E6-AUD7-001 a 005; a tabela de gates; o `git status`/`git diff --stat` capturados pelo
+auditor).
+
+**As rodadas 1–6 da E6 continuam ausentes de `docs/audits/`.** Elas não serão
+reconstruídas de memória ou inferência. Se as fontes primárias originais forem recuperadas
+depois, poderão ser persistidas verbatim, no mesmo padrão.
+
+**E6-AUD7-001 e E6-AUD7-002 continuam P1 abertos** — bloqueadores para a etapa de
+implementação seguinte.
+
+- Arquivos alterados:
+  - **novo**: `docs/audits/e6-round-7.md` (relatório verbatim do Codex, 212 linhas);
+  - `AGENT_LOG.md` — esta entrada.
+
+**Nenhuma implementação foi alterada nesta etapa. Nada commitado, nada pushado.**
+
+---
+
+## 2026-09-18 — Claude Opus 5 — E6: correção concentrada de E6-AUD7-001 (scanner PEM autossobreponível)
+
+Escopo **exclusivo**: `E6-AUD7-001`. `E6-AUD7-002` não foi tocado — continua aberto.
+`_ANCHORED` não foi tocado. **Nada commitado, nada pushado.**
+
+`E6-AUD7-001 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`
+`E6-AUD7-002 REMAINS OPEN`
+
+### Reprodução, antes de qualquer edição
+
+O contraexemplo independente de `docs/audits/e6-round-7.md` foi reproduzido **ponta a
+ponta** na árvore, antes de qualquer alteração:
+
+```python
+B = "-----BEGIN PRIVATE KEY-----"
+E = "-----END PRIVATE KEY-----"
+p = "MIIE_AUD7_SYNTHETIC_PRIVATE_MATERIAL"
+u = lambda x: "BEGIN PRIVATE KEY-----" * 2 + x + E
+texto = B + E + u(p) + u("")
+```
+
+Confirmado: expressão canônica `(0,52), (69,157), (174,226)`; scanner (antes da correção)
+`(0,52), (152,226)`; `p` visível em `redact(texto)`. Idêntico ao relatório.
+
+### Causa raiz
+
+Não é "a enumeração pula posições" em geral. É que `_PEM_BEGIN` (a metade usada para
+localizar aberturas) **incluía os cinco traços iniciais**
+(`-----BEGIN[A-Z ]*PRIVATE KEY-----`) — a mesma expressão **começa e termina** com o
+literal de cinco traços, o que a torna **autossobreponível**. Quando uma abertura termina
+em `-----` e o texto seguinte é `BEGIN…KEY-----` sem trazer os próprios traços, esses
+cinco caracteres servem simultaneamente de fim da primeira ocorrência e início da segunda
+— e `finditer`, que nunca sobrepõe matches, consome os traços na primeira e descarta a
+segunda inteira. Verificado isoladamente com `_PEM_BEGIN.finditer` puro sobre uma cadeia
+sintética: acha 1 ocorrência onde deveriam existir 2.
+
+O corpo **sem** os cinco traços (`BEGIN[A-Z ]*PRIVATE KEY-----`) não tem essa propriedade
+— o próprio `[A-Z ]*` exclui `-`, então um corpo sempre termina exatamente onde o próximo
+pode começar, e nunca precisa "emprestar" caractere nenhum do vizinho. Verificado: o corpo
+sozinho acha corretamente as duas ocorrências, adjacentes, nunca sobrepostas entre si.
+
+### Alternativas consideradas e descartadas
+
+1. **Zero-width lookahead por posição** (`(?=(-----BEGIN...))`, idioma padrão do Python
+   para matches sobrepostos). Descartada: reavalia a expressão a cada posição do texto,
+   sem a garantia de progresso monotônico que a versão atual tem — haveria caminho para
+   `O(n²)` em entradas adversariais com muitas quase-correspondências.
+2. **Busca manual por posição** (`search(text, pos)`, avançando `pos+1` a cada achado).
+   Descartada pelo mesmo motivo: repetir buscas completas a partir de posições que
+   avançam de 1 em 1 pode degenerar para custo quadrático quando há muitos candidatos
+   sem terminador espalhados pelo texto.
+3. **Reescrever `_PEM_BEGIN` para não ser autossobreponível diretamente** (ex.: exigir
+   um caractere de contexto extra). Descartada: mudaria a expressão usada para
+   *localizar* candidatos sem mudar a que *decide* — na prática criaria uma segunda
+   definição parcial do que é uma abertura válida, o que a Decisão C da rodada 7
+   (fonte de verdade única) proíbe.
+4. **A escolhida — separar corpo (sem sobreposição) de um teste local de 5 traços.**
+   Não muda a expressão canônica (`pattern`, usada em `pattern.match` para decidir o
+   bloco de verdade), não introduz uma segunda gramática, e preserva a mesma estrutura de
+   custo do algoritmo original (uma passada de localização + um teste `O(1)` por
+   candidato + buscas de terminador com custo amortizado por avanço de cursor).
+
+### Por que a correção continua linear
+
+* `_PEM_OPEN_BODY.finditer` é uma única passada sem retrocesso e sem sobreposição
+  consigo mesma — custo `O(n)`;
+* o teste de cinco traços por corpo é `O(1)`, e há no máximo um corpo por ocorrência de
+  `BEGIN` no texto, então a soma de todos os testes é `O(n)`;
+* o terminador de cada abertura **ativa** sai de **um** `search` a partir do fim dela.
+  Esses `search` cobrem intervalos disjuntos e crescentes — sucesso avança o cursor até o
+  fim do bloco, falha encerra a varredura inteira. Nunca há dois `search` caros disputando
+  a mesma região;
+* a primeira abertura ativa sem terminador encerra tudo, com a mesma prova de
+  monotonicidade que já existia (se não há `END` a partir de uma posição, também não há a
+  partir de nenhuma posição posterior).
+
+Medido contra formas adversariais desenhadas **especificamente** para esta correção —
+cadeias de milhares de aberturas sobrepostas sem terminador, cadeias sobrepostas com um
+terminador único e distante, "ilhas" repetidas de sobreposição com terminador, e
+terminadores quase válidos intercalados — o crescimento observado dobra ao dobrar o
+tamanho da entrada em todos os formatos testados (nunca quadruplica). Ver tabela de
+desempenho abaixo.
+
+### Estratégia (resumo)
+
+`_Pattern` continua com o mesmo campo `scan` opcional. `_scan_pem_block` passou a:
+
+1. localizar candidatos via `_PEM_OPEN_BODY` (o corpo, sem os cinco traços iniciais) —
+   não sobreponível consigo mesma, então acha **todas** as ocorrências;
+2. para cada corpo, testar localmente se os cinco caracteres imediatamente anteriores são
+   `-----`; só então o corpo vira uma abertura candidata;
+3. delegar a decisão final — inclusive achar o terminador e fixar
+   `recognition_span`/`replacement_span`/grupos — exclusivamente a `pattern.match`, a
+   expressão canônica, exatamente como antes.
+
+### Testes adicionados
+
+**Novo**: `api/tests/test_e6_audit_round_7.py` (23 testes). Cobre:
+
+* reprodução exata do contraexemplo (spans, grupos, `recognition_span`/`replacement_span`,
+  `redact()`);
+* **prova contra a árvore anterior** (item 10 da tarefa): a implementação da rodada 6
+  reescrita literalmente no teste (não importada) diverge no contraexemplo; o motor real,
+  com `_PATTERNS` trocado via `dataclasses.replace` para usar essa versão antiga, volta a
+  vazar `MATERIAL_SINTETICO`; desfeito o monkeypatch, a árvore corrigida não vaza;
+* causa raiz isolada (autossobreposição de `_PEM_BEGIN` vs. não-sobreposição do corpo) e
+  o deslocamento fixo de 5 caracteres;
+* diferencial exaustivo scanner-corrigido vs. expressão canônica: **103.448 casos
+  combinatórios** (com a família de sobreposição explicitamente incluída — a lacuna dos
+  geradores da rodada 6) e **200.000 casos de fuzz determinístico** via SHA-256 (sem
+  `random`), dentro do próprio módulo de teste — mais **500.000 casos de fuzz** e
+  **103.448 combinatórios** rodados fora da suíte, antes de tocar em produção, para
+  validar a ideia antes de implementar;
+* os onze cenários nomeados pela tarefa: abertura iniciada nos traços finais de outra,
+  múltiplas sobreposições consecutivas, bloco válido seguido de abertura sobreposta,
+  abertura sobreposta seguida de bloco válido, muitos candidatos sobrepostos (500 em
+  cadeia), muitos `BEGIN` sem `END`, muitos blocos válidos pequenos, um bloco válido muito
+  grande, terminadores quase válidos intercalados, terminador muito distante, conteúdo
+  semelhante a `BEGIN` que não pode ser confundido, e composição parametrizada em n/2n/4n;
+* regressão HTTP real: `POST /api/workspaces/{id}/tasks` com o contraexemplo no campo
+  `goal`, confirmando que `MATERIAL_SINTETICO` não aparece nos **bytes crus** da resposta
+  (não só no JSON decodificado) — o mesmo *boundary* onde a Rodada 7 encontrou o
+  vazamento;
+* dois testes de desempenho: a regressão de E6-AUD6-001 (196.000 caracteres, 7.000
+  aberturas sem terminador) e um novo para a família de sobreposição, com crescimento
+  n/2n/4n em dois formatos (sem terminador e com terminador distante).
+
+Durante a escrita, três testes tinham premissas próprias erradas (não bugs no código):
+um literal de saída hardcoded incorretamente, um cenário "bloco válido seguido de
+sobreposição" que na verdade não produzia sobreposição nenhuma (o bloco válido consome os
+próprios traços finais junto com o terminador, então não sobra traço para reaproveitar —
+corrigido para encadear a sobreposição *depois* do bloco válido, não *com* ele), e um
+"terminador quase válido" que na verdade era válido (`ENDX` casa `[A-Z ]*` porque `X` é
+maiúscula — `END EC PRIVATE KEY-----` já é forma aceita no catálogo; corrigido para usar
+um dígito, que o *char class* de fato exclui). Todos os três corrigidos antes de reportar
+qualquer resultado.
+
+### Decisões de implementação **não** 100% especificadas na tarefa
+
+1. **O deslocamento de 5 caracteres é uma constante nomeada** (`_PEM_DASH_WIDTH`), não um
+   literal solto, porque ele expressa uma propriedade da expressão canônica (exatamente 5
+   traços, nem mais nem menos) que teria de mudar junto se o catálogo mudasse.
+2. **O nome mudou de `_PEM_BEGIN` para `_PEM_OPEN_BODY`** para deixar explícito na leitura
+   que essa expressão não inclui mais os traços — evita que uma manutenção futura
+   reintroduza-os "para ficar mais parecido com o nome antigo".
+3. **A prova contra a árvore anterior usa `dataclasses.replace` em `_PATTERNS`**, não
+   `monkeypatch.setattr` direto em `_scan_pem_block`. `_Pattern` é `frozen`/`slots`, e o
+   `scan` de cada entrada é resolvido na **construção** da tupla — trocar o nome de módulo
+   depois não afeta a instância já construída. Descoberto ao escrever o teste (a primeira
+   versão não fazia o vazamento reaparecer, porque o monkeypatch não tinha efeito nenhum).
+4. **O teste da rota HTTP verifica os bytes crus da resposta (`resposta.content`), não só
+   o JSON decodificado** — um vazamento que sobrevivesse a uma reserialização não seria
+   pego olhando só o `dict`.
+
+### Gates executados
+
+| Gate | Resultado |
+| --- | --- |
+| `test_e6_audit_round_7.py` (novo, isolado) | 23 passed |
+| E5 redaction (rounds 3–5 + metadata) + router + verification + `test_secrets_and_redaction` + boundary HTTP + arquitetura + `test_e6_audit_round_{1..6}` + `test_context_audit_e4_round_{1..6}` | 714 passed |
+| `ruff check .` | limpo |
+| `ruff format --check .` | 108 arquivos já formatados |
+| `mypy` | limpo, 105 fontes (2 erros de tipo no teste novo corrigidos: comparação de tuplas de tamanhos diferentes anotada explicitamente; `_scan_pem_block_com_o_bug_de_aud7_001` reescrita como gerador para bater com `Iterator[Match[str]]`) |
+| **suíte completa do backend** | **1778 passed, 6 skipped, 0 failed**, `PYTEST_EXIT=0` (1755 confirmados pela Rodada 7 + 23 testes novos) |
+
+Frontend não tocado nesta etapa — nenhum arquivo compartilhado com ele foi alterado
+(só `api/app/safety/redaction.py` e o teste novo), então os gates de frontend não foram
+executados.
+
+### Prova contra a árvore anterior
+
+Além do controle embutido no próprio módulo de teste, montei uma cópia física da árvore
+com a versão exata da rodada 6 restaurada em `redaction.py` e rodei
+`test_e6_audit_round_7.py` contra ela:
+
+```
+5 failed, 18 passed
+```
+
+Os 5 que falham são exatamente os que testam o vazamento diretamente: a reprodução do
+contraexemplo, a igualdade de grupos/spans, a confirmação de que o scanner antigo
+realmente falha ali, o teste de troca de árvore via `_PATTERNS`, e — o mais importante —
+**a regressão HTTP real**: rodando a suíte contra a árvore anterior, `POST
+/api/workspaces/{id}/tasks` com o contraexemplo no `goal` devolve `201` com
+`MATERIAL_SINTETICO` visível nos bytes crus da resposta, banco e Git reais, idêntico ao
+que o relatório descreveu. Na árvore corrigida, os 23 testes passam.
+
+### Desempenho
+
+| medição | antes (com o bug) | depois (corrigido) |
+| --- | --- | --- |
+| 196.000 chars, 7.000 aberturas sem terminador — em processo | — (E6-AUD6-001 já resolvido antes desta etapa) | ~0,1–0,2 ms |
+| texto comum, mesmo tamanho | — | ~0,1 ms |
+| cadeia de 187.000/374.000/748.000 chars de aberturas sobrepostas, sem terminador | — | 0,12 / 0,24 / 0,46 ms (linear) |
+| a mesma cadeia + 1 terminador distante | — | 2,99 / 6,12 / 12,06 ms (linear) |
+| "ilhas" repetidas de sobreposição + terminador, 235k/470k/940k chars | — | 4,14 / 8,22 / 17,41 ms (linear) |
+| terminadores quase válidos intercalados, 106k/212k/424k chars | — | 2,12 / 4,12 / 8,21 ms (linear) |
+
+Todas as razões de crescimento dobram ao dobrar o tamanho da entrada — nenhuma se
+aproxima de quadruplicar. A correção não reintroduz custo superlinear.
+
+### Risco residual identificado
+
+Nenhum identificado além do que a rodada anterior já registrou como decisão consciente
+(o over-redaction aceito de `_ANCHORED` e a precisão limitada do GATE 1 quanto a pontuação
+pública — nenhum dos dois tocado aqui). O diferencial cobre exaustivamente até 5
+composições de peças mais fuzz de até 90/70 caracteres; não é uma prova formal de
+equivalência para **todo** texto, mas segue o mesmo padrão de evidência que o resto deste
+módulo usa (diferencial + fuzz determinístico + prova estrutural da causa raiz), e a causa
+raiz identificada (autossobreposição de um literal de largura fixa) foi eliminada por
+construção, não por cobertura de casos.
+
+- Arquivos alterados:
+  - `api/app/safety/redaction.py` — `_PEM_BEGIN` removido, `_PEM_OPEN_BODY` +
+    `_PEM_DASH_WIDTH` adicionados, `_scan_pem_block` reescrito;
+  - **novo**: `api/tests/test_e6_audit_round_7.py` (23 testes).
+
+- Pendências:
+  - **`E6-AUD7-001 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`.**
+  - **`E6-AUD7-002 REMAINS OPEN`** — não tocado nesta etapa.
+  - `_ANCHORED`, GATE 1, `redact_document`, `is_sensitive_key`, `EditViewJSONResponse`,
+    `Unredacted`, `purge_token`, Analyzer, Planner, Router, state machine, frontend e
+    documentação normativa (além do já corrigido na etapa anterior) — nenhum tocado.
+  - **Nada commitado, nada pushado.**
+
+---
+
+## 2026-09-18 — Claude Opus 5 — E6: E6-AUD7-001-REV2, a revisão pré-Codex achou um segundo bug de custo na correção candidata
+
+Continuação direta da correção anterior de `E6-AUD7-001`. **Nada commitado, nada
+pushado.** `E6-AUD7-002` não foi tocado — continua aberto. `_ANCHORED` não foi tocado.
+
+**Não escondo nem reescrevo a entrada anterior** ("E6: correção concentrada de
+E6-AUD7-001…"). Ela registrou corretamente a correção do falso negativo (a sobreposição).
+O que ela não pegou — porque nenhum dos meus geradores incluía a família certa — foi que
+a própria correção introduziu um **segundo** defeito, de custo, no localizador de
+candidatos que ela criou.
+
+### Hipótese
+
+A revisão pré-auditoria apontou: `_PEM_OPEN_BODY = re.compile(r"BEGIN[A-Z ]*PRIVATE
+KEY-----")` tem um quantificador guloso (`[A-Z ]*`) seguido de um sufixo **obrigatório
+que pode não existir** (`PRIVATE KEY-----`). Em `"BEGIN " * n`, cada ocorrência de
+`BEGIN` inicia uma tentativa em que o quantificador consome o resto do texto e depois
+retrocede, um caractere de cada vez, procurando o sufixo — que nunca aparece. Isso é
+`O(n)` por tentativa, com `O(n)` tentativas: `O(n²)`.
+
+### Reprodução, antes de qualquer mudança
+
+Medido isoladamente, `list(_PEM_OPEN_BODY.finditer("BEGIN " * n))`:
+
+| n | tamanho | tempo |
+| --- | --- | --- |
+| 2.000 | 12.000 | 30,57 ms |
+| 4.000 | 24.000 | 141,62 ms |
+| 8.000 | 48.000 | 538,60 ms |
+
+`T(2n)/T(n) ≈ 4,63`; `T(4n)/T(2n) ≈ 3,80`. A hipótese está confirmada: crescimento muito
+mais perto de 4x do que de 2x. (Uma primeira tentativa de medir com `n=20.000/40.000/
+80.000` ficou presa por mais de 3 minutos sem terminar — o próprio tempo de espera já era
+evidência qualitativa antes da medição quantitativa em escala menor.)
+
+### Causa raiz
+
+Não é "a enumeração pula posições" — é a forma estrutural `<algo>[classe]*<sufixo
+obrigatório>`. Sempre que o sufixo pode falhar, o motor de regex do Python retrocede por
+trás do quantificador guloso, e não há como saber de antemão que vai falhar sem tentar.
+Qualquer reescrita que mantenha essa forma (mesmo com um padrão "diferente") herda o
+mesmo risco — não é um defeito de UM regex específico, é um defeito da FORMA.
+
+Famílias adicionais medidas, além de `"BEGIN " * n` (todas com a mesma assinatura antes
+da correção, todas lineares depois):
+
+* `"BEGIN " + "X" * n` (corrida grande sem sufixo nenhum);
+* `("BEGIN " * n) + "X" * n` (muitos `BEGIN` na mesma corrida, sem fechar);
+* `("BEGIN PRIVATE KE ") * n` (sufixo quase completo, repetido);
+* `"BEGIN " + "X" * n + "PRIVATE KEY-----"` (um único sufixo, distante, depois de ruído).
+
+### Solução
+
+Duas primitivas que não têm a forma `quantificador-guloso + sufixo-obrigatório`:
+
+1. `_PEM_CORRIDA_DE_PALAVRA = re.compile(r"[A-Z ]+")` — uma classe de caractere repetida
+   **sem** nada obrigatório depois dela na mesma expressão. Sem sufixo para falhar, não
+   há retrocesso possível: achar todas as corridas maximais é `O(n)`, cada caractere
+   pertencendo a no máximo uma corrida.
+2. Dentro de cada corrida já isolada (uma `str` comum), dois testes de string pura —
+   `str.endswith("PRIVATE KEY")` e `str.find("BEGIN")` — decidem se ela fecha e onde
+   começa. Nenhum dos dois é regex; nenhum tem quantificador. O custo de cada teste é, no
+   pior caso, proporcional ao tamanho *daquela* corrida, e como as corridas são
+   disjuntas, a soma é `O(n)`. Os cinco traços finais são conferidos como texto bruto
+   (`text[fim:fim+5] == "-----"`), sem regex nenhuma.
+
+`_localizar_corpos_pem(text)` substitui `_PEM_OPEN_BODY.finditer`, devolvendo tuplas
+`(início, fim)` em vez de `re.Match` — `_scan_pem_block` foi ajustado de acordo. A
+expressão canônica (`pattern.match(...)`) continua sendo a única fonte de verdade sobre
+o que é um bloco válido; o localizador só localiza.
+
+**Por que o resultado é idêntico ao do regex antigo.** O quantificador guloso, quando
+casa, sempre consome o máximo e recua o mínimo — ou seja, sempre encontra a ocorrência de
+`PRIVATE KEY-----` **mais à direita** dentro de uma corrida contígua. `str.endswith`
+sobre a corrida inteira pergunta exatamente isso. E `BEGIN` continua sendo achado pela
+ocorrência mais à **esquerda** (`str.find`), a mesma preferência do motor de regex ao
+escolher onde a busca começa.
+
+### Prova de progresso monotônico / linearidade
+
+* `_PEM_CORRIDA_DE_PALAVRA.finditer` é uma classe repetida sem alternância e sem sufixo
+  — o motor nunca tem motivo para retroceder, então é `O(n)` por construção, não por
+  medição;
+* os dois testes de string por corrida são `O(1)` amortizado, porque as corridas
+  particionam o texto (nenhuma sobreposição, soma dos comprimentos ≤ `len(text)`);
+* o resto do algoritmo (teste de 5 traços, busca de terminador, avanço de cursor) é
+  exatamente o mesmo da correção anterior, cuja prova de linearidade não mudou.
+
+Medido no módulo real, `"BEGIN " * n`:
+
+| n | tamanho | `redact()` |
+| --- | --- | --- |
+| 20.000 | 120.000 | 108,02 ms |
+| 40.000 | 240.000 | 204,16 ms |
+| 80.000 | 480.000 | 413,28 ms |
+| 160.000 | 960.000 | 1.013,08 ms |
+
+Razões: 1,89 / 2,02 / 2,45 — todas perto de 2x, nenhuma perto de 4x.
+
+Nas cinco famílias adversariais do finding (n/2n/4n cada), razões entre 1,92x e 2,10x —
+ver tabela completa no relatório desta etapa.
+
+### Prova de que a sobreposição continua corrigida
+
+Contraexemplo original da Rodada 7, repetido: `(0,52), (69,157), (174,226)` — idêntico à
+canônica; `MATERIAL_SINTETICO` não aparece em `redact()` nem na resposta HTTP.
+
+### Testes adicionados
+
+`api/tests/test_e6_audit_round_7.py` ganhou 11 testes na seção "E6-AUD7-001-REV2":
+
+* `test_e6_aud7_001_rev2_localizador_bate_com_o_regex_de_corpo` — diferencial exaustivo
+  de `_localizar_corpos_pem` contra `BEGIN[A-Z ]*PRIVATE KEY-----` (o próprio regex com o
+  bug, usado só como oráculo, nunca com corpus grande o bastante para expor o custo dele)
+  — >25.000 casos combinatórios, 0 divergências;
+* `test_e6_aud7_001_rev2_localizador_fuzz_deterministico` — 50.000 casos por SHA-256,
+  0 divergências;
+* `test_e6_aud7_001_rev2_scanner_continua_batendo_com_o_canonico` — 200.000 casos do
+  fuzz original (ponta a ponta, scanner vs. canônica de verdade), 0 divergências: a REV2
+  não reabriu nada que a primeira correção fechou;
+* `test_e6_aud7_001_rev2_crescimento_e_linear_nas_familias_do_finding` — parametrizado
+  nas 5 famílias adversariais, n/2n/4n, limiar de razão **3,0** (não absoluto);
+* `test_e6_aud7_001_rev2_reproducao_exata_nao_regride` — a reprodução exata da revisão
+  pré-auditoria (`"BEGIN " * n`), mesmo limiar;
+* `test_e6_aud7_001_rev2_a_sobreposicao_continua_corrigida` e
+  `test_e6_aud7_001_rev2_regressao_http_continua_verde` — requisito 5 da tarefa.
+
+**Autocorreção durante a escrita:** minha primeira versão desses dois últimos testes de
+crescimento usava limiar `< 8`, copiado por inércia da tolerância dos testes de
+sobreposição da correção anterior (onde 8 fazia sentido para outra família). Rodei os
+onze testes REV2 contra uma cópia física da árvore **anterior** a esta correção (com o
+`_PEM_OPEN_BODY` regex-based restaurado) e **todos os onze passaram**, inclusive os de
+crescimento — porque 8x nunca teria pego uma razão quadrática de ~4x. Apertei o limiar
+para **3,0** (meio caminho entre o ~2x medido nesta correção e o ~4x medido na anterior)
+e confirmei: com o limiar novo, `test_e6_aud7_001_rev2_reproducao_exata_nao_regride`
+**falha de verdade** contra a árvore anterior (`T(2n)/T(n) = 3,90x`), e os testes de
+correção (diferencial, sobreposição, HTTP) continuam passando nela — só o desempenho
+regride, exatamente como deveria.
+
+### Gates executados
+
+| Gate | Resultado |
+| --- | --- |
+| `test_e6_audit_round_7.py` completo (34 testes) | 34 passed |
+| E5 redaction (rodadas 3–5 + metadata) + router + verification + `test_secrets_and_redaction` + boundary HTTP + arquitetura + `test_e6_audit_round_{1..6}` + `test_context_audit_e4_round_{1..6}` | 725 passed |
+| `ruff check .` | limpo |
+| `ruff format --check .` | limpo |
+| `mypy` | limpo, 105 fontes |
+| **suíte completa do backend** | **1789 passed, 6 skipped, 0 failed**, `PYTEST_EXIT=0` |
+| árvore anterior à REV2 (cópia física) — testes de correção | 5 passed |
+| árvore anterior à REV2 (cópia física) — teste de crescimento | **1 failed** (`T(2n)/T(n) = 3,90x`), como deveria |
+| diferencial exaustivo do scanner completo (módulo real) | 161.130 combinatórios + 500.000 fuzz, 0 divergências |
+
+Frontend não tocado — nenhum arquivo compartilhado alterado.
+
+### Rótulo usado
+
+"E6-AUD7-001-REV2" — uma segunda rodada sobre o **mesmo** finding AUD7-001, não deve ser
+confundido com `E6-AUD7-002` (a chave estruturalmente sensível), que continua aberto e
+não foi tocado.
+
+- Arquivos alterados:
+  - `api/app/safety/redaction.py` — `_PEM_OPEN_BODY` (regex) removido; `_localizar_corpos_pem`,
+    `_PEM_CORRIDA_DE_PALAVRA`, `_PEM_SUFIXO_SEM_TRACOS` adicionados; `_scan_pem_block`
+    ajustado para consumir tuplas em vez de `re.Match` do localizador;
+  - `api/tests/test_e6_audit_round_7.py` — docstring do módulo atualizada; 11 testes
+    novos na seção E6-AUD7-001-REV2; import de `_localizar_corpos_pem` e `Callable`.
+
+- Pendências:
+  - **`E6-AUD7-001 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`** (correção
+    funcional **e** linearidade agora demonstradas).
+  - **`E6-AUD7-002 REMAINS OPEN`** — não tocado.
+  - `_ANCHORED`, GATE 1, `redact_document`, `is_sensitive_key`, `EditViewJSONResponse`,
+    `Unredacted`, `purge_token`, Analyzer, Planner, Router, state machine, frontend e
+    documentação normativa — nenhum tocado.
+  - **Nada commitado, nada pushado.**
+
+---
+
+## 2026-09-18 — Claude Sonnet 5 — E6: verificação independente de E6-AUD7-001-REV2 — BLOCKED por E6-AUD7V-001
+
+Relatório integral da verificação independente (Codex) persistido, verbatim, em
+[docs/audits/e6-round-7v.md](docs/audits/e6-round-7v.md). Não duplico o conteúdo aqui.
+
+Resumo: **E6-AUD7-001** foi verificado de forma independente tanto funcionalmente (contraexemplo
+original, 36.860 entradas próprias, HTTP real) quanto quanto ao custo (crescimento ~2×/dobra em
+oito famílias) — a correção candidata REV2 está correta e linear. A auditoria terminou **BLOCKED**
+apenas por **E6-AUD7V-001** (P2): o gate temporal de
+[test_e6_audit_round_7.py:781](api/tests/test_e6_audit_round_7.py:781) reprovou a implementação
+linear numa execução isolada (razão 3,41×) e passou em repetições — instabilidade de medição, não
+regressão de algoritmo. **E6-AUD7-002 continua OPEN**, fora do escopo desta verificação.
+
+Estado após esta entrada: iniciando a correção de E6-AUD7V-001 (só o mecanismo de prova temporal;
+nenhum código de produção, nenhum teste funcional/diferencial/overlap/HTTP alterado).
+
+---
+
+## 2026-09-18 — Claude Sonnet 5 — E6: E6-AUD7V-001 corrigido — gate temporal endurecido contra ruído isolado
+
+Continuação direta da entrada anterior. Escopo exclusivo: `E6-AUD7V-001` (P2, gate temporal
+instável). **Nenhum código de produção alterado — `redaction.py` intocado.** `E6-AUD7-002`
+continua aberto, não tocado. Nada commitado, nada pushado.
+
+### Diagnóstico do teste antigo
+
+`_mais_rapido` ([test_e6_audit_round_7.py:606](api/tests/test_e6_audit_round_7.py:606)) media
+`time.perf_counter()` (*wall-clock*) e tomava o **mínimo de apenas 2 repetições**, sem aquecimento
+e sem controle de coleta de lixo. Duas repetições só protegem contra ruído se ele atingir no
+máximo uma delas — um evento (do SO, ou uma coleta de lixo geracional cujo limiar de alocação é
+cruzado bem naquele ponto) que dure o bastante para atingir **as duas** chamadas de uma mesma
+medição contamina o mínimo inteiro sem o algoritmo ter mudado de custo.
+
+### Reprodução, antes da mudança
+
+Em bancada limpa e isolada, a metodologia antiga **não reproduziu** a instabilidade: 10 rodadas de
+`"BEGIN " * n` (n_base=20.000) em REV2 deram razões 1,91x–2,05x / 1,99x–2,04x; 10 rodadas na
+candidata quadrática (mutante físico, n_base=4.000) deram 3,75x–3,90x / 3,77x–3,92x. Consistente
+com o próprio relatório da verificação independente ("a mesma implementação passou em quatro
+repetições isoladas") — o problema é um evento raro/externo, não uma propriedade determinística.
+
+Reproduzi o padrão exato do achado injetando artificialmente um atraso de 250ms nas 2 primeiras
+chamadas do ponto `2n` (simulando um evento que dura o bastante para atingir as duas repetições
+que a metodologia antiga usaria):
+
+```
+amostras 2n (ms): [392.91, 393.83, 145.63, 143.63, 144.53, 144.6, 146.46]
+ANTIGA (mínimo de 2):  razão(2n/n) = 5.30x   <- falso positivo, reproduzido
+NOVA   (mediana de 7): razão(2n/n) = 1.97x   <- imune à mesma contaminação
+```
+
+### Relógio: `process_time_ns()` medido e descartado
+
+A tarefa sugeriu `time.process_time_ns()` (tempo de CPU) como possível melhoria sobre wall-clock.
+Medi a resolução empírica de ambos nesta máquina antes de escolher:
+
+```
+resolução empírica perf_counter_ns:  838 ns
+resolução empírica process_time_ns:  15.625.000 ns  (~15,6ms)
+```
+
+No Windows, `GetProcessTimes()` arredonda para o tique do relógio do sistema (~15,6ms por padrão)
+— grande demais frente às medições de dezenas/centenas de ms usadas aqui. Trocar de relógio teria
+trocado ruído de agendamento por ruído de quantização, sem ganho. Mantive `perf_counter_ns`.
+
+Também testei se `gc.disable()` durante a janela medida reduziria a variância (30 amostras por
+tamanho, com e sem GC habilitado): não ajudou de forma consistente — em n=80.000, a variância com
+GC desabilitado foi **maior**, provavelmente por deixar memória acumular sem coleta entre pontos.
+Por isso a correção usa `gc.collect()` **antes** de cada amostra (limpa o lixo da amostra
+anterior, evitando que uma coleta caia *dentro* da medição atual), não `gc.disable()`.
+
+### Metodologia nova
+
+`_tempo_mediano_ms(texto, amostras=7)`: uma chamada de aquecimento descartada; 7 medições
+independentes de `perf_counter_ns`, cada uma precedida por `gc.collect()`; toma-se a **mediana**,
+não o mínimo. A mediana de 7 só se desloca se 4 ou mais amostras forem contaminadas na mesma
+direção — um único evento transitório, por mais longo que seja, não derruba o teste.
+
+Validada sob contenção de CPU sustentada (15 processos concorrentes ocupando os outros núcleos,
+10 rodadas): razões permaneceram em 1,94x–2,03x, sem nenhuma falha espúria. Contenção sustentada
+escala todos os pontos proporcionalmente e não distorce a razão; é o ruído *assimétrico* (um pico
+isolado, como no item anterior) que a distorce — e é exatamente esse caso que a mediana neutraliza.
+
+### Threshold: derivação
+
+`_LIMIAR_RAZAO = 2.75`, consequência das medições, não ponto de partida:
+
+* pior razão observada em REV2 (linear), agregando bancada limpa + contenção de CPU + verificação
+  final com o código real do teste, dezenas de rodadas: **2,10x** (uma amostra isolada da
+  verificação final chegou a 2,12x);
+* melhor razão observada na candidata quadrática, mesmas condições: **3,44x**;
+* margem disponível: **1,34**. `2,75` fica a meio caminho (margem de ~0,65 para cada lado) — longe
+  o bastante de ambas as distribuições observadas para não confundir ruído normal com regressão.
+
+Distribuições não se sobrepõem em nenhuma das rodadas medidas: não foi necessário "parar" por
+falta de margem confiável.
+
+### Controle negativo (10+ execuções de cada lado, com o código real do teste)
+
+Importando `_tempo_mediano_ms`/`_razoes`/`_LIMIAR_RAZAO` do próprio módulo de teste (não uma
+reimplementação paralela), com `redact` de REV2 e do mutante físico via `sys.path`:
+
+* REV2 (n_base=20.000), 10 rodadas: **10/10 passaram** (razões 1,57x–2,12x);
+* candidata quadrática (n_base=4.000), 10 rodadas: **10/10 falharam corretamente** (razões
+  3,61x–4,10x).
+
+Não rodei os testes parametrizados reais de `pytest` diretamente contra o mutante nos tamanhos de
+produção (até 200.000 caracteres nalgumas famílias): o custo `O(n²)` da candidata levaria dezenas
+de minutos por caso parametrizado — a própria lentidão é evidência qualitativa adicional de
+quadraticidade. Usei tamanhos menores e escalados, com o código idêntico do teste, o que prova a
+mesma propriedade discriminante sem o custo proibitivo.
+
+### O que mudou
+
+Só `api/tests/test_e6_audit_round_7.py`: `_tempo_mediano_ms` e `_LIMIAR_RAZAO` novos; `_mais_rapido`
+continua existindo, sem alteração, usado pelos dois testes de desempenho anteriores a esta rodada
+(`..._desempenho_permanece_linear_no_caso_de_e6_aud6_001`,
+`..._desempenho_e_linear_na_familia_de_sobreposicao`) — nenhum dos dois foi apontado como instável,
+e seus limiares (8x/12x) já têm folga bem maior do que a instabilidade observada aqui. Só os dois
+testes de crescimento apontados pela verificação independente
+(`..._crescimento_e_linear_nas_familias_do_finding`, `..._reproducao_exata_nao_regride`) passaram a
+usar a métrica nova. Nenhum teste funcional (contraexemplo, diferencial, fuzz, sobreposição, HTTP,
+`recognition_span`, `replacement_span`) foi alterado. `redaction.py` intocado.
+
+### Gates executados
+
+| Gate | Resultado |
+| --- | --- |
+| `test_e6_aud7_001_rev2_crescimento_...`/`..._reproducao_exata...`, 10 rodadas seguidas | 10/10 `PYTEST_EXIT=0` |
+| `test_e6_audit_round_7.py` completo | 34 passed |
+| E5/E6/boundary/arquitetura (22 módulos) | 725 passed, 0 failed |
+| `ruff check .` | limpo |
+| `ruff format --check .` | limpo (108 arquivos) |
+| `mypy` | limpo, 105 fontes |
+| **suíte completa do backend** | **1789 passed, 6 skipped, 0 failed**, `PYTEST_EXIT=0` |
+| `git diff --check` | limpo (exit=0) |
+
+### Estado final
+
+* **`E6-AUD7-001 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`** — correção funcional e
+  linearidade permanecem demonstradas; o gate que as prova agora é estatisticamente robusto.
+* **`E6-AUD7-002 REMAINS OPEN`** — não tocado.
+* `_ANCHORED`, GATE 1, `redact_document`, `is_sensitive_key`, `EditViewJSONResponse`,
+  `Unredacted`, `purge_token`, orchestrator, frontend, documentação normativa — nenhum tocado.
+* **Nada commitado, nada pushado.**
+
+## 2026-09-21 — Claude Sonnet 5 — E6: E6-AUD7V2-001 corrigido — mediana-de-7-por-tamanho trocada por tripletas intercaladas
+
+Escopo **exclusivo**: `E6-AUD7V2-001` (P2, o gate temporal de `_tempo_mediano_ms` ainda
+falhava sob contenção assimétrica localizada). **Nenhum código de produção alterado —
+`redaction.py` intocado.** `E6-AUD7-002` não foi tocado — continua aberto. Nada
+commitado, nada pushado. Relatório integral da reverificação do Codex persistido
+verbatim em `docs/audits/e6-round-7v2.md`.
+
+### Finding reproduzido
+
+A reverificação independente (`docs/audits/e6-round-7v2.md`) confirmou de novo a
+correção funcional e a linearidade de E6-AUD7-001-REV2, mas achou `_tempo_mediano_ms`
+(a correção de E6-AUD7V-001) vulnerável sob dois processos concorrentes de CPU: numa
+bateria de dez tripletas, uma rodada produziu T(2n)/T(n) = 3,5066x — acima do limiar
+2,75 — com tempos de 98,199 / 344,347 / 410,535 ms. `T(4n)/T(2n)` na mesma rodada ficou
+em 1,1922x, confirmando que só o bloco de `2n` foi afetado — a assinatura exata de uma
+fase de contenção localizada, não de regressão algorítmica.
+
+### Por que a mediana-de-7-por-tamanho ainda falhava
+
+`_tempo_mediano_ms` mede as 7 amostras de `n`, DEPOIS as 7 de `2n`, DEPOIS as 7 de `4n`:
+blocos sequenciais e contíguos por tamanho. Ela protege contra um evento *breve* (a
+mediana de 7 só se desloca se 4+ amostras forem contaminadas), mas não contra uma fase
+de contenção que dure o bastante para atingir 4+ das 7 amostras de UM bloco inteiro —
+nesse caso a mediana daquele tamanho se desloca sozinha, sem que os outros dois tamanhos
+sejam tocados, e a razão entre eles sai da faixa esperada mesmo com o algoritmo
+continuando linear.
+
+### Hipótese de tripletas intercaladas e experimentos antes de editar
+
+Hipótese: medir as três tripletas de forma que nenhum tamanho seja sempre medido na
+mesma fase temporal deveria impedir que uma rajada localizada contamine um bloco
+inteiro. Antes de tocar no teste real, prototipei as duas metodologias lado a lado (script
+ad-hoc, apagado ao final; não faz parte da suíte):
+
+* **A) atual**: aquecimento + mediana de 7 amostras por tamanho, sequencial por tamanho
+  (a implementação de `_tempo_mediano_ms`).
+* **B) tripletas intercaladas**: 7 tripletas independentes, cada uma medindo `n`, `2n`
+  e `4n` uma vez cada, em 7 ordens diferentes (as 6 permutações de 3 elementos, mais uma
+  repetição da primeira) — mesmo custo total (21 janelas medidas). Razão calculada
+  DENTRO de cada tripleta; mediana das 7 razões no final.
+
+Testado contra REV2 real e contra a candidata quadrática original (localizador
+`BEGIN[A-Z ]*PRIVATE KEY-----` com retrocesso, reintroduzida só via monkeypatch de
+`_localizar_corpos_pem` no protótipo — nunca em `redaction.py`), em três cenários:
+
+1. **Máquina sem carga.**
+2. **Reproducer do Codex**: dois processos CPU-bound concorrentes o tempo todo. Este
+   reproducer, tal como descrito, **não** reproduziu o falso positivo nesta máquina de
+   16 CPUs — ambas as metodologias passaram 20/20 rodadas. Isso não invalida o achado
+   do Codex (que foi 1 rodada em 10, um evento raro); só mostra que "dois processos o
+   tempo todo" é fraco demais para reproduzir de forma determinística.
+3. **Rajada agendada** (item 5 da tarefa: "perturbação artificial temporária que atinja
+   uma região intermediária da execução"): calibrado a partir da distribuição limpa
+   (bloco de `n` ≈ 720ms, bloco de `2n` ≈ 1260ms), uma rajada de 15 processos CPU-bound
+   disparada aos 0,65s e mantida por 1,5s — cronometrada para cobrir exatamente a janela
+   em que a metodologia A mede `2n`. Isto reproduziu a CLASSE de falha do Codex de forma
+   determinística.
+
+### Distribuições medidas (10 rodadas por combinação; REV2 = família `"BEGIN " * n`,
+tamanhos 20.000/40.000/80.000; candidata quadrática, tamanhos 2.000/4.000/8.000 — ver
+item 11 da tarefa: a 80.000 caracteres o candidato quadrático levaria dezenas de
+segundos por chamada, sem provar nada que os tamanhos menores não provem)
+
+| Cenário | Metodologia | min | mediana | max | Resultado |
+| --- | --- | --- | --- | --- | --- |
+| REV2 limpa | A (atual) | 1,53x/1,87x | 1,97x/2,00x | 2,08x/2,30x | 20/20 PASS |
+| REV2 limpa | B (triplas) | 1,96x/1,97x | 1,99x/2,01x | 2,02x/2,01x | 20/20 PASS |
+| REV2, 2 processos o tempo todo | A (atual) | 1,15x/1,84x | 2,00x/1,97x | 2,16x/2,09x | 20/20 PASS |
+| REV2, 2 processos o tempo todo | B (triplas) | 1,78x/1,79x | 1,99x/1,99x | 2,14x/2,18x | 20/20 PASS |
+| REV2, **rajada agendada (2n)** | **A (atual)** | 2,03x/1,07x | 4,15x/1,81x | 4,83x/5,00x | **8/10 rodadas reprovariam código linear** |
+| REV2, **rajada agendada (2n)** | **B (triplas)** | 1,78x/1,97x | 2,00x/2,04x | 2,45x/2,28x | **0/20 razões acima do limiar — 10/10 PASS** |
+| Quadrática limpa (2k/4k/8k) | A (atual) | 3,47x/3,34x | 3,60x/3,75x | 3,75x/4,05x | 20/20 FAIL (correto) |
+| Quadrática limpa (2k/4k/8k) | B (triplas) | 3,40x/3,66x | 3,60x/3,77x | 3,72x/3,92x | 20/20 FAIL (correto) |
+| Quadrática sob carga (2k/4k/8k) | A (atual) | 2,14x/2,10x | 3,33x/3,67x | 6,96x/4,10x | 16/20 FAIL — a própria carga também degrada a metodologia A na direção "quase passa" |
+| Quadrática sob carga (2k/4k/8k) | B (triplas) | 3,00x/3,46x | 3,73x/3,80x | 4,11x/4,30x | 20/20 FAIL (correto) |
+
+A rajada agendada é a prova direta do item 13 da tarefa: o mesmo mecanismo de
+interferência localizada que quebra a metodologia A (8/10 falsos positivos) não quebra
+a metodologia B (0/10) — mesma máquina, mesma rajada, mesmo instante absoluto.
+
+Margem final: REV2 (todos os cenários, metodologia B) ≤ 2,45x; candidata quadrática
+(todos os cenários, metodologia B) ≥ 3,00x. `_LIMIAR_RAZAO = 2,75` continua no meio,
+com folga de ~0,30 de cada lado — **não recalibrado**, conforme item 7 da tarefa: o
+problema era a agregação, não o limiar, e os dados confirmam isso.
+
+### Metodologia escolhida e implementação
+
+Critério de aceitação da tarefa (item 6) cumprido integralmente pela metodologia B:
+REV2 limpa 10/10 PASS, REV2 sob os dois cenários de carga 10/10 PASS, candidata
+quadrática limpa e sob carga 10/10 FAIL, distribuições sem sobreposição. Implementada
+em `api/tests/test_e6_audit_round_7.py`:
+
+* `_ORDEM_DAS_TRIPLAS`: as 7 tripletas (índices 0=n, 1=2n, 2=4n).
+* `_medir_uma_amostra_ms`: uma medição isolada com `gc.collect()` antes — mesma
+  disciplina de `_tempo_mediano_ms`, uma amostra por vez.
+* `ResultadoTriplas` (`NamedTuple`) e `_razoes_por_triplas_intercaladas`: aquecimento
+  por tamanho, sete tripletas, razão dentro de cada uma, mediana final. Docstring com a
+  prova completa (por que o problema era a ordem, não a mediana).
+* `_mensagem_de_falha_triplas`: mensagem de diagnóstico com razões por tripleta,
+  mediana, limiar e tempos brutos — uma falha agora é depurável sem reinstrumentar.
+* `test_e6_aud7_001_rev2_crescimento_e_linear_nas_familias_do_finding` e
+  `test_e6_aud7_001_rev2_reproducao_exata_nao_regride`: passaram a chamar
+  `_razoes_por_triplas_intercaladas` em vez de `_tempo_mediano_ms`/`_cresce_com_gerador`/
+  `_razoes` — removidas por ficarem sem chamador.
+* **Controle negativo automatizado novo** (item 11 da tarefa):
+  `test_e6_aud7v2_001_a_metodologia_de_triplas_reprova_o_localizador_com_retrocesso` —
+  usa `monkeypatch` no atributo do módulo `app.safety.redaction._localizar_corpos_pem`
+  (nunca no arquivo) para reintroduzir o localizador com retrocesso só dentro do teste,
+  restaurado automaticamente ao final; tamanhos 2.000/4.000/8.000 pelo motivo já citado.
+* `_LIMIAR_RAZAO` permanece `2.75`. `_mais_rapido` e os dois testes de desempenho
+  anteriores a esta rodada não foram tocados. Nenhum teste funcional (contraexemplo,
+  diferencial, fuzz, sobreposição, HTTP, `recognition_span`, `replacement_span`) foi
+  alterado.
+
+### Validação (item 12 da tarefa)
+
+| Validação | Resultado |
+| --- | --- |
+| Grupo de crescimento, 10 processos pytest independentes, limpo | 10/10 `PYTEST_EXIT=0` |
+| Grupo de crescimento, 10 processos pytest independentes, sob 2 processos concorrentes | 10/10 `PYTEST_EXIT=0` |
+| Controle negativo quadrático, 10 processos pytest independentes | 10/10 `PYTEST_EXIT=0` |
+| `test_e6_audit_round_7.py` completo | **35 passed** em 83,81s |
+| E5/E6/boundary/arquitetura (14 módulos) | `SUBSET_EXIT=0` |
+| `ruff check .` | limpo |
+| `ruff format --check .` | limpo, 108 arquivos |
+| `mypy .` | limpo, 105 fontes |
+| **suíte completa do backend** | **1790 passed, 6 skipped** (era 1789 antes; +1 é o controle negativo novo), `PYTEST_EXIT=0`, 1258,09s |
+| `git diff --check` | limpo, exit 0 |
+
+`api/tests/test_e6_audit_round_7.py` é um arquivo untracked (nunca commitado, parte do
+volume amplo de trabalho E6 ainda não commitado) — `git diff` não mostra nada para ele;
+o diff desta subcorreção está isolado nas 5 edições descritas acima (docstring do
+módulo, import de `NamedTuple`, helpers de tripletas substituindo `_tempo_mediano_ms`/
+`_cresce_com_gerador`/`_razoes`, os dois testes de crescimento, e o novo controle
+negativo). `git status --short` ao final: mesmos 38 arquivos rastreados modificados e
+mesmas ~26 entradas untracked de antes desta tarefa, mais `docs/audits/e6-round-7v2.md`
+(novo, persistido no passo 1). Não editei nenhum arquivo de produção nesta tarefa.
+
+### Ambiente
+
+O venv em `%LOCALAPPDATA%\FreelanceFocus\venvs\api\` não existia nesta máquina; criado
+com Python 3.11.9 e `pip install -e ".[dev]"`, conforme a convenção do projeto — nada
+dentro do repo.
+
+### Estado final
+
+* **`E6-AUD7-001 CANDIDATE RESOLVED — AWAITING CODEX RE-VERIFICATION`**
+* **`E6-AUD7V-001 CANDIDATE RESOLVED — superseded by V2 verification`**
+* **`E6-AUD7V2-001 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`** — agregação
+  temporal trocada de mediana-de-7-por-tamanho para mediana de razões sobre 7 tripletas
+  intercaladas; limiar `2,75` mantido sem alteração; validado 10/10 em três cenários de
+  carga distintos, incluindo o que quebrava a agregação anterior 8/10 vezes.
+* **`E6-AUD7-002 REMAINS OPEN`** — não tocado.
+* **NO PRODUCTION CODE CHANGED.** Nada commitado. Nada pushado.
+
+## 2026-09-21 — Claude Opus 5 — E6: reverificação GREEN do Codex persistida (E6-AUD7V2-001)
+
+Relatório integral da reverificação independente do Codex persistido verbatim em
+`docs/audits/e6-round-7v3.md`. Veredito: **GREEN**, nenhum finding novo. O Codex validou
+o balanceamento de `_ORDEM_DAS_TRIPLAS` (3/2/2 rotacionado, o melhor possível com sete
+tripletas), a matemática de `_razoes_por_triplas_intercaladas` contra três oráculos
+sintéticos, 10/10 execuções limpas, 15 rodadas sob quatro classes de perturbação
+(carga contínua, rajadas localizadas em `n`/`2n`/`4n`/fronteira, rajadas independentes,
+rajada longa) e 10/10 rejeições corretas da candidata quadrática. Reproduziu
+independentemente a classe de E6-AUD7V2-001: a metodologia antiga falhou 3/3 sob a
+mesma rajada (2,83x / 3,02x / 2,90x) em que a nova passou 3/3. Separação agregada entre
+as distribuições: 0,849305, sem sobreposição; `_LIMIAR_RAZAO = 2.75` confirmado.
+
+Estado registrado por esta entrada:
+
+```
+E6-AUD7-001   VERIFIED RESOLVED
+E6-AUD7V-001  VERIFIED RESOLVED
+E6-AUD7V2-001 VERIFIED RESOLVED
+E6-AUD7-002   REMAINS OPEN
+```
+
+**PEM scanner / equivalência / complexidade / gate de regressão: FROZEN — não alterar
+sem evidência nova.** Isso cobre `_scan_pem_block`, `_localizar_corpos_pem`, a prova de
+equivalência contra a expressão canônica, a prova de custo linear, `_ORDEM_DAS_TRIPLAS`,
+`_razoes_por_triplas_intercaladas`, `_LIMIAR_RAZAO` e o controle negativo quadrático.
+
+Nada commitado. Nada pushado.
+
+## 2026-09-21 — Claude Opus 5 — E6: E6-AUD7-002 corrigido — a chave sensível passa a classificar a subárvore
+
+Escopo **exclusivo**: `E6-AUD7-002` (P1, valor sob chave estruturalmente sensível
+atravessava a projeção pública). Nada do que está FROZEN foi tocado — **NO PEM CHANGES**,
+verificado por grep no diff isolado: zero linhas de `_scan_pem_block`,
+`_localizar_corpos_pem`, `_PEM_*`, `pem_block`, `_ORDEM_DAS_TRIPLAS`, `_LIMIAR_RAZAO` ou
+`_ANCHORED`. Nada commitado, nada pushado.
+
+### Reprodução ANTES da mudança
+
+Executada contra a árvore intacta, com `is_sensitive_key`, `redact_document` e
+`RedactingJSONResponse` (bytes crus). Todos os casos vazaram:
+
+| Caso | Entrada | Saída de `redact_document` ANTES |
+| --- | --- | --- |
+| A | `{"token": "AUD7_SYNTHETIC_CREDENTIAL"}` | valor íntegro |
+| B | `{"password": "ordinary-looking-value"}` | valor íntegro |
+| C | `{"api_key": {"value": "NOT_REGEX_SECRET", "metadata": {"owner": "public-looking"}}}` | subárvore íntegra |
+| D | `{"safe": ..., "token": "AUD7_SYNTHETIC_CREDENTIAL"}` | valor íntegro |
+| E | `{"items": [{"password": "ordinary"}, ...]}` | valor íntegro |
+| F | `{"token": {"nested": ["A", {"value": "B"}]}}` | subárvore íntegra |
+| G | `{"outer": {"token": "SYNTHETIC"}}` | valor íntegro |
+| H | `{"pin": 1234, "secret": true, "api_key": null}` | escalares íntegros |
+
+`is_sensitive_key` devolvia `True` para `token`, `password`, `api_key`, `secret`,
+`auth_token` **e `purge_token`**. Pela API real: POST e GET do Context Registry
+devolviam `AUD7_SYNTHETIC_CREDENTIAL` nos bytes crus.
+
+### Causa raiz
+
+`redact_document` nunca chamava `is_sensitive_key`. A única consulta à classificação de
+chave estava em `_redact_key`, que pergunta se a **chave contém** segredo — nunca se ela
+**classifica o valor**. Chaves e valores eram processados em ramos separados da mesma
+caminhada, e nada atravessava de um para o outro.
+
+### Contrato implementado
+
+Se `is_sensitive_key(key)` é verdadeiro, o valor inteiro associado é sensível por
+estrutura, independentemente do conteúdo, do tipo e da profundidade. A marca desce por
+`dict`, `list`, índice e qualquer chave intermediária. Sob a marca, **toda folha** vira
+`REDACTED` sem o conteúdo ser consultado — inclusive `int`, `float`, `bool`, `None` e
+string vazia. A marca **só desce**: irmãos públicos continuam intactos.
+
+### Representação escolhida, e por que ela já era a semântica do projeto
+
+Chaves preservadas (mantêm `_redact_key`), folhas viram `REDACTED`. Não é formato novo:
+é o que `context_engine/rendering.py::_collect_leaves` já faz desde a E5 —
+`sensitive or is_sensitive_key(key_text)` desce pela árvore, e `_mark_fragments` trata a
+folha marcada como "valor sob subárvore sensível sai inteiro, sem olhar o conteúdo",
+preservando os **caminhos** e redigindo só o valor. `_Leaf.generic_scalar` (número,
+booleano, `null`) é descrito lá como "redigido localmente quando sensível", que é
+exatamente o comportamento adotado aqui para os escalares genéricos. Contêiner vazio
+continua vazio: não há folha para redigir, e inventar uma acrescentaria informação à
+projeção. [04] §5 pedia "a subárvore é projetada *fail-closed*"; isto satisfaz o texto
+normativo sem inventar semântica pública nova.
+
+### `Unredacted` vence a classificação estrutural — obrigatório, não cosmético
+
+`is_sensitive_key("purge_token")` é **`True`** (o componente `token` está lá), e é sob
+essa chave literal que `GET /api/workspaces/{id}/purge-preview` e a rota equivalente de
+task entregam o token emitido por `PurgeTokenStore.issue`. Sem a precedência explícita
+de `Unredacted`, esta correção teria quebrado a purga em silêncio. O `isinstance(value,
+Unredacted)` continua sendo a **primeira** decisão da função, e há teste dedicado.
+`EditViewJSONResponse` não passa por `redact_document` e segue intacta. Nenhuma terceira
+exceção foi criada.
+
+### Arquivos alterados
+
+* `api/app/safety/redaction.py` — só `redact_document`: assinatura (`_sensitive: bool`),
+  docstring (seção nova de E6-AUD7-002) e corpo. Diff isolado: **63 linhas adicionadas,
+  13 removidas**, nenhuma fora dessa função.
+* `api/tests/test_e6_aud7_002_chave_estruturalmente_sensivel.py` — **novo**, 26 testes.
+
+### Prova contra a implementação anterior
+
+Os 26 testes rodaram contra a árvore **antes** da correção: **18 failed, 8 passed**
+(`PYTEST_EXIT=1`). Depois: **26 passed** (`PYTEST_EXIT=0`). Os 8 que já passavam são a
+premissa (`is_sensitive_key` e o catálogo), os dois escape hatches, o campo público e o
+`purge_token` — isto é, exatamente o que a correção **não** deveria mudar.
+
+### Gates
+
+| Gate | Resultado |
+| --- | --- |
+| `test_e6_aud7_002_chave_estruturalmente_sensivel.py` | **26 passed**, `PYTEST_EXIT=0` |
+| Focados (boundary, context, E5 r5, E6 r7, arquitetura) | **272 passed** |
+| 16 suítes E5/E6/boundary/arquitetura + AUD7-002 | **606 passed**, `SUBSET_EXIT=0` |
+| `ruff check .` | limpo |
+| `ruff format --check .` | limpo, 109 arquivos |
+| `mypy .` | limpo, 106 fontes |
+| **suíte completa do backend** | **1816 passed, 6 skipped**, `FULL_EXIT=0` (era 1790+6; +26 é o módulo novo) |
+| `git diff --check` | limpo, exit 0 |
+
+### Pendência reportada, não executada
+
+`docs/architecture/04-safety-and-git-runtime.md` §5 ainda lista E6-AUD7-002 em "Duas
+garantias abertas", texto agora desatualizado pela implementação. **Não alterei**:
+`docs/` é congelado (CLAUDE.md) e a tarefa proíbe *silent rewrite* de documento
+normativo. Precisa de autorização explícita do Pedro.
+
+### Estado final
+
+* **`E6-AUD7-001 VERIFIED RESOLVED — FROZEN`**
+* **`E6-AUD7V-001 VERIFIED RESOLVED`**
+* **`E6-AUD7V2-001 VERIFIED RESOLVED`**
+* **`E6-AUD7-002 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`**
+* **NO PEM CHANGES.** Nada commitado. Nada pushado.
+
+## 2026-09-22 — Claude Sonnet 5 — E6: reverificação BLOCKED do Codex persistida (E6-AUD7-002V-001)
+
+Relatório integral persistido verbatim em `docs/audits/e6-aud7-002-round-1.md`. Veredito:
+**BLOCKED**. A correção de E6-AUD7-002 fecha o vazamento de valor preenchido, mas
+`redact_document({"token": []})` e `redact_document({"token": {}})` devolvem o
+contêiner vazio intacto — o ramo `list`/`dict` sempre recursa antes de perguntar se
+está vazio, e um contêiner vazio recursado devolve a si mesmo, nunca alcançando o
+`if _sensitive: return REDACTED` da folha. O renderer da E5
+(`rendering.py:268`/`275`) já trata contêiner vazio sob subárvore sensível como folha
+`generic_scalar` e o redige inteiro; a projeção JSON diverge desse contrato.
+
+Prosseguindo com a correção concentrada de E6-AUD7-002V-001.
+
+## 2026-09-22 — Claude Sonnet 5 — E6: E6-AUD7-002V-001 corrigido — contêiner vazio sensível vira REDACTED
+
+Escopo **exclusivo**: `E6-AUD7-002V-001` (P2, contêiner vazio sob chave sensível
+atravessava a projeção pública). Nada FROZEN foi tocado — **NO PEM CHANGES**, verificado
+por grep no diff isolado: zero linhas de `_scan_pem_block`, `_localizar_corpos_pem`,
+`_PEM_*`, `pem_block`, `_ORDEM_DAS_TRIPLAS`, `_LIMIAR_RAZAO`, `_ANCHORED`; `is_sensitive_key`
+não foi alterada (a única ocorrência do nome no diff é uma linha de contexto de um
+comentário pré-existente, citando a função, não modificando-a). Nada commitado, nada
+pushado.
+
+### Reprodução ANTES da mudança
+
+Confirmada contra a árvore intacta, para os 5 casos do prompt:
+
+| Entrada | `redact_document` ANTES |
+| --- | --- |
+| `{"token": []}` | `{"token": []}` |
+| `{"token": {}}` | `{"token": {}}` |
+| `{"password": {"nested": []}}` | `{"password": {"nested": []}}` |
+| `{"api_key": [{"value": {}}, []]}` | `{"api_key": [{"value": {}}, []]}` |
+| `{"public": [], "token": [], "status": "active"}` | inalterado |
+
+Confirmada também pela API real: `POST /api/workspaces/{id}/context` com
+`structured={"token": [], "password": {"nested": []}, "status": "active"}` devolveu
+`"token":[]` e `"nested":[]` intactos nos bytes crus (`b'{"...,"structured":{"token":
+[],"password":{"nested":[]},"status":"active"},...'`), e a listagem subsequente
+(`GET /api/workspaces/{id}/context` — a API não oferece GET individual desta entrada)
+repetiu o mesmo vazamento.
+
+O teste divergente localizado e confirmado: `test_e6_aud7_002_escalares_genericos_
+sob_chave_sensivel` (parametrizado) tinha `([], []), ({}, {})` na lista de casos —
+afirmando explicitamente o comportamento que a auditoria aponta como o finding.
+Rodado isoladamente antes da correção: **9 passed** (incluindo os dois casos vazios,
+que passavam por afirmarem o bug).
+
+### Causa
+
+`redact_document` sempre recursava em `list`/`dict` antes de perguntar se o valor
+estava vazio: `[redact_document(item, ...) for item in []]` devolve `[]` — a
+compreensão nunca itera, e o `if _sensitive: return REDACTED` do ramo de folha (no
+final da função) nunca é alcançado para um contêiner vazio, porque o contêiner nunca
+chega a esse ramo: ele é capturado antes, pelo `isinstance(value, list)`/`isinstance(
+value, dict)`.
+
+### Alteração mínima
+
+Um único desvio nos primeiros ramos de `redact_document`, antes das checagens de
+`list`/`dict`/recursão:
+
+```python
+if _sensitive and isinstance(value, list | dict) and not value:
+    return REDACTED
+```
+
+Contêiner **não-vazio** continua caindo nos ramos de recursão normais (propagando
+`_sensitive` para os descendentes, como já implementado). Contêiner vazio **fora** de
+subárvore sensível (`_sensitive=False`) não entra nesse desvio e continua vazio.
+Docstring de `redact_document` atualizada com uma seção nova explicando o porquê,
+substituindo a frase antiga ("Contêiner vazio continua vazio") que descrevia
+justamente o comportamento incorreto.
+
+### Correção do teste divergente
+
+`test_e6_aud7_002_escalares_genericos_sob_chave_sensivel`: `([], []), ({}, {})` →
+`([], REDACTED), ({}, REDACTED)`. Docstring do teste atualizada para explicar a
+mudança de contrato e apontar para o teste de irmãos públicos, que cobre o caso
+`_sensitive=False` que a asserção antiga também cobria implicitamente.
+
+### Regressões novas (`test_e6_aud7_002_chave_estruturalmente_sensivel.py`, +10 testes)
+
+Lista vazia/dict vazio sensível na raiz; contêineres vazios aninhados (dois e três
+níveis) sob chave sensível; contêineres vazios como elementos de lista sensível;
+mistura de folha preenchida e contêineres vazios na mesma subárvore; irmãos públicos
+com `[]`/`{}` intactos ao lado de contêiner sensível vazio; múltiplas chaves
+sensíveis combinando escalar e contêineres vazios; fronteira `RedactingJSONResponse`
+central; `Unredacted("")` (string vazia, não contêiner, mas o caso limite de
+"vazio" mais próximo do escape hatch) preservado; regressão HTTP completa —
+POST e listagem do Context Registry com `structured={"token": [], "password":
+{"nested": []}, "status": "active"}`, bytes crus e JSON verificados nas duas
+chamadas.
+
+### Prova contra a implementação anterior
+
+Revertido temporariamente só o branch de código (docstring mantida), suíte completa
+do módulo executada: **11 failed** — exatamente os testes novos/alterados
+(`escalares_genericos[valor7]`, `[valor8]`, e os 9 testes de
+`E6-AUD7-002V-001: contêineres vazios`, exceto o de `Unredacted`, que não depende da
+correção). Restaurado o branch: **36 passed**.
+
+### Escape hatches preservados
+
+`Unredacted` continua sendo a primeira checagem da função — precede inclusive o novo
+desvio de contêiner vazio, então `Unredacted("")` nunca é interceptado por ele (é
+`str`, não `list`/`dict`, e mesmo se fosse, o `return value` de `Unredacted` já teria
+ocorrido antes). Teste dedicado
+(`test_e6_aud7_002v_001_unredacted_nao_e_afetado_pelo_caso_vazio`) confirma.
+`EditViewJSONResponse` não passa por `redact_document` — não tocada, sem teste novo
+necessário além dos já existentes.
+
+### Gates
+
+| Gate | Resultado |
+| --- | --- |
+| `test_e6_aud7_002_chave_estruturalmente_sensivel.py` | **36 passed**, `PYTEST_EXIT=0` |
+| Focados (AUD7-002, boundary, context, E5, E6 r1-r7, arquitetura, workspaces, tasks) | **671 passed** |
+| `ruff check .` | limpo |
+| `ruff format --check .` | 1 arquivo precisou reformatação (`test_e6_aud7_002_...py`); aplicado `ruff format`, suíte do módulo revalidada (36 passed); recheck limpo, 109 arquivos |
+| `mypy .` | limpo, 106 fontes |
+| **suíte completa do backend** | **1826 passed, 6 skipped**, `PYTEST_EXIT=0` (era 1816+6; +10 são as regressões novas) |
+| `git diff --check` | limpo, exit 0 |
+
+### Diff isolado desta subcorreção
+
+`redaction.py` já carrega o acumulado de E6-AUD7-002 e das rodadas anteriores, não
+commitado — o diff desde `HEAD` não isola esta etapa. Reconstruí a versão
+pré-E6-AUD7-002V-001 revertendo as 2 edições desta sessão (a seção nova da docstring e
+o branch de código) e comparei com `difflib.unified_diff`: **15 linhas adicionadas, 2
+removidas**, inteiramente dentro de `redact_document` — nenhuma outra função tocada.
+
+### Estado final
+
+* **`E6-AUD7-001 VERIFIED RESOLVED — FROZEN`**
+* **`E6-AUD7-002V-001 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`**
+* **`E6-AUD7-002 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`**
+* **NO PEM CHANGES.** Nada commitado. Nada pushado.
+
+## 2026-09-22 — Claude Sonnet 5 — E6: fechamento documental de E6-AUD7-002 (GREEN persistido, §5 atualizada)
+
+Escopo **exclusivo**: fechamento documental. Nenhum código, teste ou frontend alterado.
+
+Relatório GREEN do Codex persistido verbatim em `docs/audits/e6-aud7-002-round-2.md`.
+Veredito: nenhum finding novo; contêiner vazio sob chave sensível confirmado redigido
+em 300 árvores geradas e um caso de 24 níveis; escape hatches (`Unredacted`,
+`EditViewJSONResponse`) delimitados; 36 testes AUD7-002 + 671 focados + suíte completa
+(1826 passed, 6 skipped) verdes.
+
+Atualização pontual, expressamente autorizada por Pedro nesta sessão, em
+`docs/architecture/04-safety-and-git-runtime.md` §5: o texto original das duas
+"garantias abertas" (E6-AUD7-001, E6-AUD7-002) foi **preservado sem alteração**, como
+histórico de quando estavam abertas; acrescentei um bloco "Decisão de fechamento"
+logo depois, registrando as duas como `VERIFIED RESOLVED` com referência aos quatro
+relatórios de E6-AUD7-001 (`e6-round-7*.md`) e aos dois de E6-AUD7-002
+(`e6-aud7-002-round-1.md`, `round-2.md`), e uma linha explícita de que a aprovação da
+E6 inteira continua pendente de auditoria consolidada — nenhum commit ou merge
+autorizado por esta decisão isolada. As duas exceções JSON deliberadas (`purge_token`/
+`Unredacted`, `EditViewJSONResponse`), documentadas em outro trecho de §5 (linhas
+313-319), não foram tocadas. Nenhuma outra decisão normativa do documento foi
+modificada.
+
+Estados verificados:
+
+* **`E6-AUD7-001 VERIFIED RESOLVED — FROZEN`**
+* **`E6-AUD7-002V-001 VERIFIED RESOLVED`**
+* **`E6-AUD7-002 VERIFIED RESOLVED`**
+* A aprovação da E6 inteira permanece pendente de auditoria consolidada.
+* Nenhum código, teste ou frontend alterado nesta tarefa. Nada commitado, nada pushado.
+
+## 2026-09-22 — Claude Sonnet 5 — E6: auditoria consolidada do Codex persistida (E6-CONS-001 OPEN)
+
+Relatório integral da auditoria consolidada persistido verbatim em
+`docs/audits/e6-consolidated-round-1.md`. Confirma AUD7-001 e AUD7-002 verificados
+(scanner PEM equivalente à expressão canônica em 1.200 entradas sintéticas; Context
+Registry mascarando valores e contêineres sensíveis via POST/listagem real, com
+`edit-view`/`purge_token` preservados) e a máquina de estados estável (planejamento,
+aprovação, `requires_replan` por HEAD alterado, retorno a `draft` após rejeição).
+Backend completo, ruff, mypy e frontend (lint/testes/build) verdes.
+
+Novo finding: **E6-CONS-001 — Média/P2 — detalhe de tarefa cancelada orienta uma ação
+impossível.** `WorkspaceTasks.tsx:214` busca contexto para todo status ≠ `draft`; uma
+tarefa cancelada ainda em `draft` não tem contexto congelado, então a consulta devolve
+`404 task_not_found` com orientação para `POST /plan` — que responde `409
+invalid_transition`, pois `cancelled` é terminal. A tela apresenta erro e uma ação que
+o backend proíbe.
+
+**E6-CONS-001 OPEN.** Prosseguindo com a correção concentrada.
+
+## 2026-09-22 — Claude Sonnet 5 — E6: E6-CONS-001 corrigido — contexto de task cancelada não instrui mais `POST /plan`
+
+Escopo **exclusivo**: `E6-CONS-001` (P2, detalhe de tarefa cancelada orientava uma ação
+impossível). Máquina de estados **intocada** — `TRANSITIONS`/`TERMINAL_STATUSES` de
+`state_machine.py` não aparecem no diff desta correção (verificado por grep). Nenhum
+escopo congelado tocado (PEM, redaction, escape hatches, Gate 1, tripletas, Analyzer,
+Router, Planner). Nada commitado, nada pushado.
+
+### Reprodução ANTES da mudança (API real)
+
+* Task criada (`draft`) → `POST /cancel` → `200`, `status: "cancelled"`,
+  `approval_state: "not_planned"`.
+* `GET /tasks/{id}/context` → `404 task_not_found`, mensagem "ainda não tem contexto
+  congelado; rode `POST /plan` antes".
+* `POST /tasks/{id}/plan` na mesma task → `409 invalid_transition`, "`cancelled` é
+  terminal e imutável ([ADR-0008] regra 3)".
+* Confirmado também o caso **preservado**: task planejada e depois cancelada
+  (`approved_manifest_id` presente antes do cancel) → `approval_state` também vira
+  `not_planned` após o cancelamento (o campo computado não distingue os dois casos),
+  mas `GET /context` continua `200` com o manifest — a causa não podia ser "olhar
+  `approval_state`/`status` no frontend", tinha de ser o resultado real do fetch.
+* Task inexistente: `GET /tasks/nao-existe` e `GET /tasks/{id}/context` → `404
+  task_not_found`, comportamento inalterado.
+
+### Causa raiz
+
+`context_route` ([tasks.py](C:/Users/pedro/OneDrive/Desktop/freelance-focus-dashboard/api/app/api/tasks.py)),
+quando `manifest is None`, só diferenciava `requires_replan` (E6-AUD2-004) do caso
+genérico "ainda não planejada, rode `POST /plan`" — nunca checava se `task.status` era
+**terminal**. `draft → cancelled` é uma aresta direta da tabela de transições (nunca
+passa por `planning`), então essa task cai no `manifest is None` sem nunca ter tido
+chance de ter um manifest, e a mensagem genérica manda uma ação que `POST /plan`
+recusaria com `409` (estado terminal é imutável).
+
+### Contrato implementado e representação escolhida
+
+Reaproveitei o idioma já estabelecido, sem inventar formato novo: `OrchestratorError.
+as_payload()` já permite campos extra estruturados (`TransitionGuardFailed.
+requires_replan`, `ApprovalFingerprintMismatch.diverged_fields`). Acrescentei
+`TaskNotFound.reason: str | None = None`, com `as_payload()` incluindo-o só quando
+setado — `None` (o padrão) preserva o comportamento de "task inexistente" sem mudança
+nenhuma no corpo da resposta. `context_route` passa a checar `is_terminal(task.status)`
+(helper já existente em `state_machine.py`, já exportado por `app.orchestrator` —
+reaproveitado, não recriado) **antes** de cair no caso genérico, e levanta
+`TaskNotFound(..., reason="terminal_without_context")` com mensagem que não menciona
+`POST /plan`. Os três casos (A: inexistente; B1: `requires_replan`; B2: terminal sem
+contexto; B3: ainda não planejada) preservam o mesmo status `404`/código
+`task_not_found` — só o `reason` estruturado (e a prosa) diferencia.
+
+Frontend: `contextUnavailableReason()` em `tasksApi.ts`, espelhando exatamente
+`enrichApprovalError()`/`ApprovalMismatchError` já existentes — lê `error.details.
+reason` de um `WorkspaceApiError`, nunca o texto de `message`. `ContextCard` em
+`WorkspaceTasks.tsx` ganhou o estado `'unavailable'` (renderizado como `<p
+className="form-hint" role="note">`, não como `role="alert"`): quando
+`contextUnavailableReason(error) === 'terminal_without_context'`, mostra "esta tarefa
+foi cancelada antes de ser planejada — nenhum contexto foi congelado, e não há
+planejamento a retomar", sem instruir nenhuma ação. Confirmei que `canPlan` (linha 451)
+já excluía `cancelled` antes desta correção — o botão "Planejar" nunca apareceu; o
+defeito era **só** o texto dentro do `ContextCard`.
+
+### Arquivos alterados
+
+* `api/app/orchestrator/errors.py` — `TaskNotFound` ganhou `reason` opcional.
+* `api/app/api/tasks.py` — import de `is_terminal`; `context_route` ganhou o ramo
+  terminal, entre `requires_replan` e o genérico.
+* `src/services/tasksApi.ts` — nova `contextUnavailableReason()`.
+* `src/pages/WorkspaceTasks.tsx` — `ContextCard` ganhou o estado `'unavailable'`.
+
+### Testes (regressões novas)
+
+Backend (`api/tests/test_api_tasks.py`, +4 testes, reforçando também o teste
+pré-existente `test_context_antes_do_plano_e_404` com as asserções de `reason`
+ausente):
+`test_cancelada_antes_de_planejar_nao_instrui_post_plan` (reprodução completa:
+cancel → 404 com `reason` → `POST /plan` → 409), `test_cancelada_depois_de_planejar_
+ainda_devolve_o_manifest` (fluxo autorizado preservado), `test_task_inexistente_
+continua_sem_reason`, `test_task_de_outro_workspace_continua_acessivel_por_id`
+(documenta que não há isolamento por workspace neste app de usuário único — não
+introduzi um).
+
+Frontend (`src/test/task-detail-ui.test.tsx`, +3 testes): cancelada antes de planejar
+mostra o estado vazio sem `role="alert"` e sem instruir `POST`/`Planejar`; cancelada
+depois de planejar continua mostrando o contexto; outro motivo de 404 (sem `reason`)
+continua caindo no alerta de erro comum — controle negativo provando que a nova
+ramificação não captura casos que não deveria.
+
+### Prova contra a implementação anterior
+
+Backend: revertidos temporariamente `TaskNotFound.reason` e o ramo `is_terminal` de
+`context_route` (script ad-hoc, restaurado em seguida) — `test_api_tasks.py`: **1
+failed** (`test_cancelada_antes_de_planejar_nao_instrui_post_plan`, `KeyError:
+'reason'`), os outros 39 passaram. Restaurado: **40 passed**.
+
+Frontend: revertido temporariamente o estado `'unavailable'` do `ContextCard` (e o
+import de `contextUnavailableReason`) — `task-detail-ui.test.tsx`: **1 failed**
+(exatamente o teste novo-alvo), os outros 15 passaram, incluindo o controle negativo
+("outro motivo de 404") e o caso "depois de planejar", confirmando que não dependiam
+da correção. Restaurado: **16 passed**.
+
+### Gates
+
+| Gate | Resultado |
+| --- | --- |
+| `test_api_tasks.py` | 40 passed |
+| Focados backend (state machine, planner, analyzer, router/fingerprint, arquitetura, tasks, workspaces) | **499 passed** |
+| `task-detail-ui.test.tsx` | 16 passed |
+| `ruff check .` | limpo |
+| `ruff format --check .` | limpo |
+| `mypy .` | limpo |
+| **suíte completa do backend** | **1830 passed, 6 skipped**, `PYTEST_EXIT=0` (era 1826; +4 desta correção) |
+| Frontend: suíte completa (`vitest run`) | **133 passed** (era 130; +3 desta correção) |
+| Frontend: `npm run lint` | limpo |
+| Frontend: `npm run build` (`tsc -b && vite build`) | limpo |
+| `git diff --check` | limpo, exit 0 |
+
+### Diff isolado
+
+Os 6 arquivos tocados (`errors.py`, `tasks.py`, `WorkspaceTasks.tsx`, `tasksApi.ts`,
+`test_api_tasks.py`, `task-detail-ui.test.tsx`) são **untracked** — carregam o
+acumulado não commitado da E6 desde rodadas anteriores, e `git diff` não mostra nada
+para eles. Reconstruí a versão pré-correção de cada um revertendo as edições desta
+sessão e comparei com `difflib.unified_diff`: **249 linhas adicionadas, 13 removidas**
+no total, isoladas por arquivo. Nenhuma menção a `TRANSITIONS`/`state_machine` no
+diff — confirmado por grep.
+
+### Estado final
+
+* **`E6-CONS-001 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`**
+* **`E6-AUD7-001 VERIFIED RESOLVED — FROZEN`**
+* **`E6-AUD7-002 VERIFIED RESOLVED`**
+* **E6 REMAINS BLOCKED** até a reverificação do Codex.
+* Nada commitado. Nada pushado.
+
+## 2026-09-22 — Claude Sonnet 5 — E6: reverificação BLOCKED do Codex persistida (E6-CONS2-001, E6-CONS2-002 OPEN)
+
+Relatório integral persistido verbatim em `docs/audits/e6-consolidated-round-2.md`.
+Veredito: **BLOCKED**. A correção de E6-CONS-001 funciona para o caso original
+(`draft → cancelled`), mas o Codex encontrou dois estados adjacentes com a mesma classe
+de defeito — orientação incorreta na ausência de contexto:
+
+* **E6-CONS2-001 — Média/P2** — falha inesperada durante `POST /plan` deixa a task em
+  `failed`, sem manifesto; `GET /context` devolve `reason=terminal_without_context`, e o
+  frontend interpreta esse motivo como "cancelada" — apresentando uma causa falsa e
+  ocultando a falha real.
+* **E6-CONS2-002 — Média/P2** — uma task no estado durável `planning` (antes de existir
+  manifesto — reconhecível por `reconcile_on_startup`, que trata exatamente isso como
+  "processo morreu no meio") ainda recebe "rode `POST /plan` antes", que responderia
+  `409 invalid_transition` (`planning → planning` não é aresta).
+
+`E6-CONS-001` confirmado especificamente resolvido. `E6-AUD7-001`/`E6-AUD7-002`
+continuam verificados. Backend completo 1830 passed, 6 skipped; frontend 133 passed;
+gates de lint/format/mypy/build todos verdes. Nada alterado, commitado ou enviado.
+
+**E6-CONS2-001 OPEN. E6-CONS2-002 OPEN.** Prosseguindo com a correção sistêmica —
+matriz completa de estados × existência de manifesto, um único contrato para todos.
+
+## 2026-09-22 — Claude Sonnet 5 — E6: E6-CONS2-001/002 corrigidos — matriz sistêmica de "sem contexto congelado"
+
+Escopo: `E6-CONS2-001` e `E6-CONS2-002`, tratados juntos por serem a mesma causa (o
+contrato de ausência de manifesto era incompleto, não dois defeitos independentes).
+`TRANSITIONS`, PEM, redaction, `_ANCHORED`, Gate 1, tripletas, Analyzer, Router —
+zero tocados (verificado por grep no diff isolado). Nada commitado, nada pushado.
+
+### Reprodução dos dois findings ANTES da mudança
+
+**B (falha inesperada no plan → `failed` sem manifest, E6-CONS2-001):** monkeypatch de
+`app.orchestrator.execution_manager.plan_task` para levantar `RuntimeError` (mesmo
+idioma de `test_aud003_erro_inesperado_no_plano_vira_failed_internal_error`, com
+`pytest.raises(RuntimeError)` em volta do `POST /plan`, já que o `TestClient` reergue
+exceções não tratadas por padrão). A task foi a `failed`; `GET /context` devolveu `404`
+com `reason=terminal_without_context` e mensagem "foi encerrada (failed)..." —
+**a mensagem do backend já estava correta** (usa `task.status.value` desde
+E6-CONS-001). O finding real era só a projeção fixa "Esta tarefa foi cancelada" no
+`ContextCard`, que ignorava o `status` real da task.
+
+**C (planning durável sem manifest, E6-CONS2-002):** escrita direta na sessão de teste
+(`session_factory`) setando `task.status = TaskStatus.PLANNING` sem passar pelo fluxo
+normal — simula exatamente o que `reconcile_on_startup` reconhece como "processo
+morreu no meio" (E6-AUD-003: a entrada em `planning` é commitada antes do trabalho
+longo). `GET /context` devolveu `404` **sem** `reason`, mensagem "rode `POST /plan`
+antes"; `POST /plan` na mesma task devolveu `409 invalid_transition` (`planning →
+planning` não é aresta). Confirmado também: `POST /plan` continua `invalid_transition`
+nos dois casos; `draft` sem manifesto continua orientando `POST /plan` corretamente;
+task planejada e cancelada depois ainda consulta o manifesto (precedência preservada).
+
+### Matriz completa (documentada na íntegra na docstring de `context_route`)
+
+Por `status`: `draft` (manifest raro; sem manifest → ainda não planejada, `POST /plan`
+permitido, sem `reason`) · `planning` (manifest raro — replan sobre manifest antigo;
+sem manifest → planejamento em andamento, `POST /plan` proibido, `reason=
+planning_in_progress`, **novo**) · `awaiting_approval`/`needs_fix` (decidíveis; sem
+manifest → já tratado por `approval_state() == requires_replan`) · `approved`/
+`executing`/`done` (sempre têm manifest pelas guardas atuais — `approve()` exige
+manifest via `_recompute_fingerprint`; sem manifest é estruturalmente inalcançável,
+fallback defensivo sem `reason`) · `failed`/`cancelled` (dependem de quando
+falharam/cancelaram; sem manifest → `terminal_without_context`, mensagem com
+`task.status.value` dinâmico).
+
+### Causa comum
+
+`context_route` só diferenciava `requires_replan` (E6-AUD2-004) do caso genérico "rode
+`POST /plan`" — nunca checava `status is PLANNING` nem verificava se a aresta para
+`PLANNING` de fato existia antes de instruir a ação. O fallback genérico presumia
+`POST /plan` correto para qualquer status não coberto pelos outros ramos, violando
+"não presuma que ausência de manifest autoriza `POST /plan`".
+
+### Contrato implementado
+
+`context_route` reestruturada: manifest existe → `200` (precedência, sempre) → senão
+`requires_replan` (existente) → `is_terminal(status)` (existente, mensagem já
+dinâmica) → `status is PLANNING` → **novo** `reason=planning_in_progress` → senão
+`can_transition(status, PLANNING)` **verificado** (não presumido) → `POST /plan`
+instruído só então → fallback final defensivo, sem `reason`, mensagem neutra.
+`can_transition` e `is_terminal` são helpers **já existentes** de `state_machine.py`,
+reaproveitados via `app.orchestrator` — nenhum novo mecanismo na máquina de estados.
+
+Frontend: `ContextCard` ganhou o estado `'planning'` (`role="status"`, distinto de
+`'unavailable'`/`'error'`/`'loading'`) para `reason === 'planning_in_progress'`. Para
+`'terminal_without_context'`, a mensagem agora vem de `unavailableMessage(status)` —
+usa o `status` **confiável** da task (já disponível como prop), não mais um texto
+fixo — distinguindo `cancelled`/`failed`/outros terminais defensivamente.
+`contextUnavailableReason()` (de E6-CONS-001) não precisou mudar: já lia `reason`
+genericamente.
+
+### Arquivos alterados nesta sessão
+
+Só 4 — `api/app/orchestrator/errors.py` e `src/services/tasksApi.ts` **não** foram
+tocados (confirmado por mtime: 14:xx, da tarefa CONS-001 anterior hoje; `TaskNotFound.
+reason` e `contextUnavailableReason()` já existiam e não precisaram de mudança):
+
+* `api/app/api/tasks.py` — import de `can_transition`; `context_route` reescrita.
+* `src/pages/WorkspaceTasks.tsx` — `unavailableMessage()` nova; `ContextCard` ganhou
+  o estado `'planning'`.
+* `api/tests/test_api_tasks.py` — +6 testes (2 detalhados + matriz parametrizada de 4
+  casos); removidos 2 imports locais de `Session, sessionmaker` que ficaram
+  redundantes com o novo import de módulo.
+* `src/test/task-detail-ui.test.tsx` — +3 testes.
+
+### Prova contra a implementação anterior
+
+Backend: revertida só a lógica de `context_route` (docstring mantida) — **2 failed**,
+ambos do caso `planning_in_progress` (`test_planning_sem_manifesto_nao_instrui_novo_
+post_plan` e a variante `planning` da matriz parametrizada) — confirma que
+E6-CONS2-001 já não dependia de mudança de backend. Restaurado: **46 passed**.
+
+Frontend: revertido `unavailableMessage`/estado `'planning'` do `ContextCard` — **2
+failed**, exatamente `'falha de planejamento não é apresentada como cancelamento'` e
+`'planning em andamento não instrui novo POST /plan'` — os dois findings, e só eles.
+Restaurado: **19 passed**.
+
+### Gates
+
+| Gate | Resultado |
+| --- | --- |
+| `test_api_tasks.py` | 46 passed |
+| Focados backend (state machine, planner, analyzer, router/fingerprint, arquitetura, tasks, workspaces, E6 round 1-2) | **561 passed** |
+| `task-detail-ui.test.tsx` | 19 passed |
+| `ruff check .` | limpo |
+| `ruff format --check .` | limpo |
+| `mypy .` | limpo |
+| **suíte completa do backend** | **1836 passed, 6 skipped**, `PYTEST_EXIT=0` (era 1830; +6 desta correção) |
+| Frontend: suíte completa (`vitest run`) | **136 passed** (era 133; +3 desta correção) |
+| Frontend: `npm run lint` | limpo |
+| Frontend: `npm run build` | limpo |
+| `git diff --check` | limpo, exit 0 |
+
+### Diff isolado
+
+`git diff` não mostra nada para os 4 arquivos tocados (todos untracked, acumulado da
+E6 não commitado). Reconstruí a versão pré-CONS2 de cada um revertendo as edições
+desta sessão e comparei com `difflib.unified_diff`: **390 linhas adicionadas, 51
+removidas**, isoladas por arquivo. Grep confirma zero linhas de `TRANSITIONS`, PEM,
+`redaction`/`redact_document`, `_ANCHORED`, tripletas, Analyzer ou Router no diff.
+
+### Estado final
+
+* **`E6-CONS-001 VERIFIED RESOLVED`**
+* **`E6-CONS2-001 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`**
+* **`E6-CONS2-002 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`**
+* **`E6-AUD7-001 VERIFIED RESOLVED — FROZEN`**
+* **`E6-AUD7-002 VERIFIED RESOLVED`**
+* **E6 REMAINS BLOCKED** até a reverificação independente.
+* Nada commitado. Nada pushado.
+
+## 2026-09-22 19:14 — E6-CONS3: auditoria consolidada rodada 3 (Codex) — três findings abertos
+
+Relatório persistido verbatim em `docs/audits/e6-consolidated-round-3.md`.
+
+Confirma E6-CONS2-001 e E6-CONS2-002 RESOLVED. Três findings novos abertos:
+
+* **E6-CONS3-001 OPEN** (Média/P2) — tarefa `draft` em workspace arquivado: `/context`
+  orienta `POST /plan`, mas o endpoint responde 409 `workspace_not_plannable`; a tela
+  também oferece "Planejar" sem checar o workspace.
+* **E6-CONS3-002 OPEN** (Baixa/P3) — `needs_fix` sem manifesto (banco inconsistente):
+  `/context` recomenda `reject` (que responde 409 `invalid_transition`), quando
+  `POST /plan` direto é aceito (200).
+  Falha do fluxo real da E6.
+* **E6-CONS3-003 OPEN** (Baixa/P3) — tarefa que volta a `draft` após falha recuperável
+  no replanejamento, preservando `approved_manifest_id`: `/context` responde 200 com
+  o manifesto histórico, mas o `ContextCard` nunca consulta a API quando o status é
+  `draft`.
+
+Investigação e correção em andamento nesta entrada.
+
+## 2026-09-22 19:57 — E6: E6-CONS3-001/002/003 corrigidos — contrato sistêmico de disponibilidade de contexto e ações
+
+### Reprodução (antes de editar)
+
+* **E6-CONS3-001** — task `draft` (fixture `workspace_id`/`task_id`), workspace arquivado via
+  `PATCH /api/workspaces/{id}` `{"status":"archived"}`. `GET /context` respondia `404` sem
+  `reason`, mensagem "rode `POST /plan` antes"; `POST /plan` respondia **`409
+  workspace_not_plannable`** (guarda de `plan()`, independente de `can_transition`).
+* **E6-CONS3-002** — `needs_fix` sem manifest, forçado via escrita direta no banco
+  (`session_factory`, mesma técnica de `_forcar_planning_sem_manifesto`): `approval_state()`
+  classificava como `requires_replan` (mesmo teste de coluna que `awaiting_approval` usa) e
+  `context_route` instruía "rejeite (`POST /reject`)". `POST /reject` respondia **`409
+  invalid_transition`** (`TRANSITIONS[needs_fix]` não tem `draft`); `POST /plan` direto
+  respondia `200` (`needs_fix → planning` é aresta).
+* **E6-CONS3-003** — plan → força `needs_fix` (mantendo `approved_manifest_id`) →
+  monkeypatch de `plan_task` para levantar `InvalidTestConfig` (erro de domínio) → `POST
+  /plan`: `_abort_planning` aplica o desfecho "erro recuperável" (`planning → draft`), que
+  usa `transition_fields(draft)` — **não** toca `approved_manifest_id`. Task volta a `draft`
+  com o manifest antigo intacto; `GET /context` já respondia `200` (o backend sempre
+  preferiu o manifest), mas `ContextCard` nunca chamava a API quando `status === 'draft'` —
+  a tela mostrava "Planeje a tarefa..." escondendo um manifest que existia.
+
+Todas as três reproduzidas com sucesso antes de qualquer edição.
+
+### Matriz e causa sistêmica
+
+Os três findings compartilham uma causa: **duas confusões repetidas em pontos diferentes**.
+
+1. "A aresta existe na máquina de estados" ≠ "o comando aceitaria a chamada agora".
+   `can_transition(status, planning)` só confere `TRANSITIONS`; não confere a guarda extra
+   de `plan()` (workspace arquivado) nem a de `reject()` (`needs_fix → draft` não é aresta,
+   então nem chega a ter guarda — é `InvalidTransition`, mas o efeito prático é o mesmo:
+   "recomendar uma ação que o backend recusa").
+2. "`status === 'draft'`" ≠ "sem contexto congelado". Um replan recuperável não limpa
+   `approved_manifest_id`; só `reject()` e a invalidação de entrada (`_invalidate_approval_
+   on_entry`, que só escreve em `awaiting_approval`) limpam esse campo.
+
+Matriz de `GET /context` sem manifest, revisada nesta rodada (substitui a de E6-CONS2):
+
+| status | pode ter manifest? | sem manifest → reason |
+| --- | --- | --- |
+| `draft` | sim (replan recuperável) | `workspace_archived` se arquivado; senão nenhum |
+| `planning` | raro | `planning_in_progress` |
+| `awaiting_approval` | sim, exceto invalidação | nenhum (requires_replan + `can_transition(status,draft)`=true → mensagem de reject) |
+| `needs_fix` | sim, herda; sem manifest só com banco inconsistente | mesmo ramo de `draft` (nunca "rejeite" — `can_transition(needs_fix,draft)`=false) |
+| `approved`/`executing` | sim, sempre | fallback neutro, sem reason (inalcançável) |
+| `done`/`failed`/`cancelled` | depende de quando | `terminal_without_context` |
+
+Tarefa inexistente: `404` sem `reason` (inalterado). Sem token: `401` (inalterado).
+
+### Contrato implementado
+
+* **A) Existência do manifesto** — `context_route` já dava precedência ao manifest
+  independente do `status` (nada a mudar no backend); o frontend deixou de presumir
+  "`draft` = sem contexto": `ContextCard` consulta a API **sempre**, sem atalho por status.
+* **B) Ausência do manifesto** — `context_route` reestruturado: a recomendação de "rejeite"
+  só sai quando `can_transition(status, draft)` é verdadeiro (hoje só `awaiting_approval`);
+  a recomendação de "`POST /plan`" só sai quando, **além** de `can_transition(status,
+  planning)`, o workspace não está arquivado — novo `reason="workspace_archived"` quando
+  está. `needs_fix` sem manifest cai no mesmo ramo de `draft` (nunca no de "rejeite").
+* **C) Ações** — nenhuma guarda de `TRANSITIONS`/`state_machine.py` foi alterada; a correção
+  é só a *leitura* combinada de `can_transition` + guarda de workspace + guarda de reject,
+  em `context_route`. `PlanCard`/`ApprovalCard` ganharam `requiresReplanByRejecting(task)`
+  (== `approval_state === 'requires_replan' && status === 'awaiting_approval'`), substituindo
+  o teste antigo que olhava só `approval_state`.
+* **D) Workspace arquivado** — `TaskResponse` ganhou `workspace_archived: bool` (lido via
+  `get_workspace` a cada resposta — `_to_response` agora recebe `session`); `ApprovalCard`
+  não oferece "Planejar" quando `workspace_archived` é `true` para `draft`/`needs_fix`, e
+  mostra um aviso pedindo reativação. O `409` do backend continua a fonte de verdade — o
+  campo só evita prometer uma ação na tela que o backend já recusaria.
+
+### Arquivos alterados (5, todos untracked — diff isolado reconstruído por
+`difflib.unified_diff` revertendo cada edição desta sessão, técnica de `isolar_diff_cons2.py`)
+
+* `api/app/api/tasks.py` — import de `get_workspace`/`WorkspaceStatus`; `TaskResponse.
+  workspace_archived`; `_to_response(session, task)` (6 call sites atualizados);
+  `context_route` reescrita (guarda de `can_transition(status, draft)` antes de recomendar
+  reject; guarda de workspace arquivado antes de recomendar `POST /plan`); docstring da
+  matriz atualizada.
+* `src/pages/WorkspaceTasks.tsx` — `requiresReplanByRejecting()` nova (usada em `PlanCard` e
+  `ApprovalCard`); `ContextCard` sempre consulta a API (removido o atalho de `draft`, e o
+  estado `'idle'`); `ApprovalCard` ganhou `workspaceBlocksPlanning`/`planBlockedByWorkspace`
+  e o aviso `workspace-archived-notice`.
+* `src/services/tasksApi.ts` — `Task.workspace_archived: boolean`.
+* `api/tests/test_api_tasks.py` — +5 testes (`test_workspace_arquivado_nao_promete_post_
+  plan_em_draft_sem_contexto`, `test_workspace_ativo_task_recebe_workspace_archived_false`,
+  `test_needs_fix_sem_manifesto_nao_instrui_rejeitar` + helper `_forcar_needs_fix_sem_
+  manifesto`, `test_needs_fix_com_manifesto_ainda_devolve_o_contexto`, `test_draft_com_
+  manifesto_historico_apos_replan_recuperavel_devolve_o_contexto`).
+* `src/test/task-detail-ui.test.tsx` — `taskFixture.workspace_archived: false`; +4 testes
+  (manifesto histórico em `draft`, workspace arquivado bloqueia Planejar, workspace ativo
+  não bloqueia, `needs_fix`+`requires_replan` oferece Planejar sem StalePlanNotice/reject).
+
+### Prova contra a implementação anterior
+
+Backend: revertidas as duas linhas de guarda em `context_route` (voltando ao `if estado ==
+APPROVAL_STATE_REQUIRES_REPLAN:` sem `and can_transition(...)`, e ao `POST /plan` sem checar
+workspace arquivado) — **2 failed**, exatamente `test_workspace_arquivado_nao_promete_
+post_plan_em_draft_sem_contexto` (sem `reason`) e `test_needs_fix_sem_manifesto_nao_
+instrui_rejeitar` (mensagem continha "rejeite"). Restaurado: **51 passed** em
+`test_api_tasks.py`.
+
+Frontend: revertidos o atalho de `draft` em `ContextCard`, `requiresReplanByRejecting` (nos
+dois usos) e os campos derivados de `workspace_archived` em `ApprovalCard` — **3 failed**,
+exatamente os três testes novos que dependem dessas mudanças (manifesto histórico,
+workspace arquivado, `needs_fix`+`requires_replan`); o quarto teste novo (workspace ativo,
+que não depende da correção) continuou passando — **20 passed, 3 failed**. Restaurado:
+**23 passed** em `task-detail-ui.test.tsx`.
+
+### Gates
+
+| Gate | Resultado |
+| --- | --- |
+| `test_api_tasks.py` | 51 passed |
+| Focados backend (tasks, workspaces, E6 round 1-3, state machine, arquitetura) | 431 passed |
+| `task-detail-ui.test.tsx` | 23 passed |
+| `ruff check .` | limpo |
+| `ruff format --check .` | limpo |
+| `mypy .` | limpo (106 arquivos) |
+| Suíte completa do backend | **1841 passed, 6 skipped**, `PYTEST_EXIT=0` (era 1836; +5) |
+| Frontend: suíte completa (`vitest run`) | **140 passed** (era 136; +4) |
+| Frontend: `npm run lint` | limpo |
+| Frontend: `npm run build` | limpo |
+| `git diff --check` | limpo, exit 0 |
+
+### Diff isolado
+
+Os 5 arquivos são untracked (`git diff` não mostra nada). Reconstruí a versão pré-rodada de
+cada um revertendo as edições desta sessão em ordem inversa (`difflib.unified_diff`): **370
+linhas adicionadas, 46 removidas** (contando cabeçalhos `+++`/`---`), isoladas por arquivo.
+Grep confirma zero linhas de `TRANSITIONS=`, PEM, `_ANCHORED`, tripletas, Analyzer ou
+Resource Router no diff — a única menção de `redact_document` é uma linha de contexto
+inalterada.
+
+### Estado final
+
+* **`E6-CONS-001 VERIFIED RESOLVED`**
+* **`E6-CONS2-001 VERIFIED RESOLVED`**
+* **`E6-CONS2-002 VERIFIED RESOLVED`**
+* **`E6-CONS3-001 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`**
+* **`E6-CONS3-002 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`**
+* **`E6-CONS3-003 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`**
+* **`E6-AUD7-001 VERIFIED RESOLVED — FROZEN`**
+* **`E6-AUD7-002 VERIFIED RESOLVED`**
+* **E6 REMAINS BLOCKED** até nova verificação independente.
+* Nada commitado. Nada pushado.
+
+## 2026-09-22 — E6-CONS4: auditoria consolidada rodada 4 — diagnóstico (sem implementação)
+
+Relatório original do Codex **não veio anexado** ao prompt desta etapa:
+`docs/audits/e6-consolidated-round-4.md` **não foi criado** (reconstruir é proibido) —
+pendente do texto original.
+
+* **E6-CONS4-001 OPEN** — `requires_replan` + workspace arquivado: `/context` orienta
+  rejeitar e replanejar; `reject` funciona, `plan` responde 409 `workspace_not_plannable`.
+* **E6-CONS4-002 OPEN** — `draft` em workspace ativo sem git / sem HEAD / com o diretório
+  removido: `/context` orienta `POST /plan`, que responde 409 `workspace_not_plannable`.
+* **E6-CONS4-003 OPEN** — `draft` genuína sem manifest: o 404 normal vira `role=alert`; o
+  corpo é estruturalmente idêntico ao 404 de task inexistente (sem `reason`).
+* **E6-CONS4-004 OPEN** — manifest preservado em `draft` após replan recuperável aparece
+  como "Contexto entregue" sem marca de histórico.
+
+Os quatro reproduzidos contra a API real (banco, data_dir e repos temporários no
+scratchpad; nenhum arquivo do repo tocado além deste log). Nenhum código de produção ou teste
+alterado. Proposta de contrato entregue na conversa, aguardando autorização.
+E6 BLOCKED. Nada commitado. Nada pushado.
+
+## 2026-09-23 — E6-CONS4: implementação estrutural — elegibilidade de planejamento, `plan_standing`, `reason` de `/context`
+
+Modelo: Claude Opus 5.5 · Esforço: HIGH · Autorização: D (não E), D1 (adendo em `docs/architecture/06`),
+D2-A (preservar plano e manifest, apresentar como histórico), D3 (distinguir git inválido de não verificável).
+
+**Relatório persistido.** O original do Codex veio com o prompt desta etapa e foi gravado verbatim em
+`docs/audits/e6-consolidated-round-4.md` — fecha a pendência registrada na entrada de diagnóstico acima.
+
+### Causa estrutural
+
+A orientação "planeje" era calculada em quatro lugares (texto de `/context`, `canPlan`, `StalePlanNotice`,
+banner de `requires_replan`), cada um com parte das guardas reais de `POST /plan`. Cada rodada consolidada
+achou a guarda que faltava em um deles. Além disso, o 404 de draft sem plano e o de task inexistente eram
+estruturalmente idênticos (sem `reason`).
+
+### Contrato implementado
+
+* **`git_runtime.probe_head`** (D3): 2 `rev-parse` (3 com `symbolic-ref`), sem `status`, somente leitura,
+  timeout fixo de 5 s por leitura. Estados `ok` / `not_a_repo` / `no_head` / `unverifiable` (git ausente,
+  timeout, IO). `preflight` **não** foi alterado.
+* **`planner`**: slugs de bloqueio e uma função por guarda — `workspace_planning_blocker`,
+  `classify_git`/`git_planning_blocker`, `invalid_test_config_blocker`, `planning_blocker_error`.
+  `_resolve_base_commit` usa `probe_head` + `classify_git`; `execution_manager.plan()` e `create_task` usam o
+  mesmo classificador de arquivamento. `WorkspaceNotPlannable` e `InvalidTestConfig` trazem `reason`.
+* **`orchestrator/eligibility.py`** (novo): `planning_eligibility(session, task)` — só leitura, chama as
+  mesmas funções do Planner. `transition` (`allowed`/`after_reject`/`forbidden`), `checked`, `blockers`,
+  `eligible`. Git consultado só com `allowed` ou `after_reject`+`requires_replan`; `forbidden` e
+  `after_reject` com plano vigente não consultam (`checked=false`, lista parcial).
+* **`TaskResponse.planning`** substitui `workspace_archived` (E6-CONS3); **`TaskResponse.plan_standing`**
+  (`none`/`current`/`historical`/`final`, puro, em `execution_manager`). Listagem **sem** `planning`.
+* **`/context`**: todo 404 de task existente tem `reason` (`not_planned`, `approval_invalidated`,
+  `planning_in_progress`, `terminal_without_context`, `unavailable_in_state`); task inexistente sem `reason`.
+  Mensagens descrevem, não ensinam comandos. A rota não consulta git.
+* **Frontend**: `canPlan` = `planning.eligible && checked && allowed`; `PlanBlockers` explica pré-condições
+  (reativação aponta para o botão "Reativar" existente no cabeçalho); `requires_replan` separa "rejeitar
+  agora" de "planejar depois"; `PlanStandingNotice` substitui `StalePlanNotice`; `ContextCard` com estado
+  `empty` para `not_planned`/`approval_invalidated` e título por `plan_standing`; fingerprint "vigente" só
+  com `current`; recarga da task após 409/422 de pré-condição (`isPlanPreconditionRefusal` — concorrência,
+  401 e 5xx fora); `TaskDetail` relê uma vez quando `workspaceStatus` muda.
+* **`docs/architecture/06`**: adendo autorizado em §4, após o quadro de `approval_state`, texto anterior
+  preservado.
+
+### Custo real das sondagens git
+
+GET de detalhe: 2 leituras em `draft`/`needs_fix` e em `requires_replan`; 0 nos demais status. Listagem: 0
+(teste com 12 tasks). `/context`: 0. Respostas de `create`/`reject` (draft): 2. `POST /plan`: o Planner passou
+de 4 leituras (`preflight`) para 3 (`probe_head` com branch). Pior caso por GET de detalhe: 10 s de timeout.
+
+### Regressões antes/depois
+
+Arquivos de produção trocados pela cópia pré-rodada, testes novos mantidos. Backend: as 8 regressões dos
+quatro findings (`test_cons4_001…`, 5 variantes de `test_cons4_002…`, `test_cons4_003…`, `test_cons4_004…`)
+**falham** — sem `planning`/`reason`/`plan_standing`. Frontend: **19 de 43 falham**, entre elas o 404 real de
+draft (alerta), o manifest histórico sem marca, `requires_replan`+arquivado e os bloqueios git. Restaurado
+(cópia byte a byte conferida por `cmp`): tudo passa.
+
+### Testes alterados por mudança deliberada de contrato
+
+`test_api_tasks.py`: `test_context_antes_do_plano_e_404`, matriz (`draft` agora `not_planned`), os três
+testes da CONS3 migrados (`test_workspace_ativo_task_recebe_workspace_archived_false` virou
+`test_workspace_ativo_draft_e_elegivel`). `test_e6_audit_round_2.py::test_o_contexto_404_explica_o_motivo_certo`
+(o caminho real agora é `reason` + `planning`). `task-detail-ui.test.tsx`: fixtures consistentes com o
+backend; o teste "outro motivo de 404" agora usa o corpo real de task inexistente.
+
+### Gates
+
+| Gate | Resultado |
+| --- | --- |
+| `test_e6_cons4.py` + `test_api_tasks.py` + `test_e6_audit_round_2.py` | 103 passed, exit 0 |
+| Backend completo | **1871 passed, 6 skipped**, `PYTEST_EXIT=0` (era 1841; +28 CONS4, +2 `test_architecture` sobre o módulo novo) |
+| `ruff check .` / `ruff format --check .` / `mypy` | exit 0 / 0 / 0 (108 arquivos) |
+| `task-detail-ui.test.tsx` | 43 passed (era 23) |
+| Frontend completo | **160 passed**, exit 0 (era 140) |
+| `npm run lint` / `npm run build` | exit 0 / 0 |
+| `git status` | 85 entradas: 40 rastreados modificados, 45 untracked |
+| `git diff --check` | exit 0 |
+
+### Diff isolado
+
+Cópia literal pré-edição (`cons4_before/`) diffada contra o atual; novos contra vazio; `test_e6_audit_round_2.py`
+reconstruído revertendo sua única edição. **16 arquivos, +2041 / -364.** Conferido contra `git diff` nos
+rastreados sem mudança anterior: `git_runtime/__init__.py` 61/0 e `docs/architecture/06` 59/0, idênticos.
+Nenhuma linha alterada toca `TRANSITIONS`, PEM, redaction, `_ANCHORED`, Gate 1, benchmarks, Analyzer ou
+Resource Router.
+
+### Riscos residuais
+
+* **Registrado separadamente, não corrigido:** `ContextError` durante `plan_task` depois de `probe_head`
+  (ex.: `ContextTreeUnavailable` de `list_tree`) não é `OrchestratorError`, e `_abort_planning` leva a task
+  a `failed(internal_error)` — terminal — com resposta 409. Sugerido como tarefa à parte.
+* `eligible` é fotografia: concorrência, IO e árvore ilegível continuam possíveis com `eligible=true`.
+* Diretório removido aparece como `workspace_not_git_repo` (o git roda e recusa o `-C`), não como bloqueio
+  próprio.
+* E7: se a execução real deixar `approved_at` preenchido até um rollback para `draft`, `approval_state`
+  diria `approved` para uma draft; `plan_standing` já diria `historical`.
+
+### Estado
+
+* `E6-CONS3-001/002/003` — correções específicas verificadas
+* **`E6-CONS4-001 CANDIDATE RESOLVED`**
+* **`E6-CONS4-002 CANDIDATE RESOLVED`**
+* **`E6-CONS4-003 CANDIDATE RESOLVED`**
+* **`E6-CONS4-004 CANDIDATE RESOLVED`**
+* **E6 REMAINS BLOCKED** até auditoria independente.
+* Nada commitado. Nada pushado.
+
+## 2026-09-23 — E6-CONS5: auditoria consolidada rodada 5 persistida e três findings corrigidos
+
+Relatório BLOCKED do Codex persistido verbatim em `docs/audits/e6-consolidated-round-5.md`. A
+arquitetura estrutural CONS4 (elegibilidade compartilhada, `plan_standing`, `reason` de
+`/context`) foi preservada; esta rodada corrige exclusivamente os três findings comprovados.
+
+### Os três findings
+
+* **E6-CONS5-001** (Média/P2) — `probe_head` classificava toda falha de leitura Git não-zero
+  como `not_a_repo` (config corrompida) ou `no_head` (referência de HEAD corrompida após um
+  commit real), porque um retorno não-zero do git é indistinguível, por si, de "nunca foi
+  repositório" ou "nunca teve commit" — mesmo código de saída, mesmo stdout vazio, e às
+  vezes o **mesmo stderr** (uma referência de HEAD com conteúdo inválido faz até
+  `--is-inside-work-tree` falhar com "fatal: not a git repository", idêntico ao caso real).
+* **E6-CONS5-002** (Baixa/P3) — uma perda de CAS (`409 concurrent_task_update`) não estava
+  na lista de recusas que disparam releitura (`PLAN_REFUSALS`/`isPlanPreconditionRefusal`
+  em `src/services/tasksApi.ts`), então `ApprovalCard.run()` mostrava o alerta mas nunca
+  relia a task — o botão "Planejar" ficava obsoleto na tela.
+* **E6-CONS5-003** (Baixa/P3) — `PlanStandingNotice` (`src/pages/WorkspaceTasks.tsx`)
+  afirmava "o HEAD do repositório mudou" só a partir de `approval_state === 'requires_replan'`,
+  sem checar `planning.transition`. Essa combinação de colunas também é alcançável (hoje só
+  por escrita direta no banco) num `needs_fix` sem manifesto onde o HEAD nunca mudou —
+  `replanRequiresReject` (já existente, usado em `ApprovalCard`) já distinguia os dois casos
+  e não estava sendo reaproveitado aqui.
+
+### Reprodução (antes da correção)
+
+Cópias íntegras de `api/app/git_runtime/__init__.py`, `src/services/tasksApi.ts`,
+`src/pages/WorkspaceTasks.tsx`, `src/test/task-detail-ui.test.tsx` e `AGENT_LOG.md` salvas
+em `cons5_before/` **antes** de qualquer edição desta rodada.
+
+* Repositório temporário com commit válido, `.git/config` corrompido (`isto nao e um ini
+  valido [[[ lixo`): `probe_head` devolvia `not_a_repo` (esperado: `unverifiable`).
+* Mesmo repositório, `.git/HEAD` com conteúdo que não é ref nem SHA: `probe_head` devolvia
+  `not_a_repo` — porque até `rev-parse --is-inside-work-tree` falha nesse caso.
+* Mesmo repositório, `.git/HEAD` reescrito para `ref: refs/heads/inexistente` (referência
+  apontando a um branch que não existe mais): `probe_head` devolvia `no_head`, idêntico ao
+  de um repositório recém-criado sem nenhum commit.
+* Com o código anterior de `git_runtime/__init__.py` reintroduzido, `api/tests/test_e6_cons5.py`
+  reproduz os três: **7 de 13 testes falham** — as três variantes do teste parametrizado de
+  contrato, e as três variantes do teste unitário de `probe_head`, mais o teste de
+  não-vazamento de detalhe interno (que também assumia a classificação errada).
+* Com o `WorkspaceTasks.tsx`/`tasksApi.ts` anteriores reintroduzidos, `task-detail-ui.test.tsx`
+  reproduz os outros dois: **2 de 44 falham** — o teste novo de conflito concorrente (o botão
+  "Planejar" continua na tela após o 409) e o teste novo de `needs_fix` (o aviso afirma
+  "HEAD" quando não deveria). Os dois arquivos foram restaurados e conferidos byte a byte
+  (`cmp`) antes de prosseguir.
+
+### Causa raiz e correção
+
+**CONS5-001.** `probe_head` (`api/app/git_runtime/__init__.py`) agora distingue "confirmado"
+de "não deu para confirmar" com um segundo sinal, **só de sistema de arquivos** — nunca de
+texto de stderr, que é localizável e muda entre versões do git:
+
+* `_resolve_git_dir(local_path)`: existe `.git` (arquivo ou diretório) em `local_path`? Segue
+  o `gitdir:` de um worktree/submódulo por completude.
+* `_has_git_marker`: `not_a_repo` (nenhum `.git`) vs `unverifiable` (`.git` existe, mas o git
+  falhou ao rodar `--is-inside-work-tree`).
+* `_has_head_reflog`: `.git/logs/HEAD` só é criado na primeira atualização de referência —
+  ausência confirma "nunca teve commit" (`no_head`); presença, com `rev-parse HEAD` falhando
+  agora, confirma que a referência existiu e foi corrompida ou apagada depois
+  (`unverifiable`, não `no_head`).
+
+`classify_git`/`git_planning_blocker` (`api/app/orchestrator/planner.py`) **não mudaram**: já
+eram um mapeamento puro de `HeadProbe.state` para o slug de bloqueio, então corrigir a fonte
+única corrige o Planner e a elegibilidade ao mesmo tempo — nenhuma segunda interpretação foi
+criada. Custo: a checagem extra só roda no caminho de **falha** do git (nunca no caminho
+feliz), é só `os.path.exists`/leitura de um arquivo pequeno, sem subprocess novo — a sondagem
+continua 2–3 leituras de git por chamada, como antes.
+
+**CONS5-002.** `isConcurrentTaskConflict` (`src/services/tasksApi.ts`), separado de
+`isPlanPreconditionRefusal` de propósito: perda de CAS não é uma pré-condição de
+planejamento (o campo que mudou pode ser qualquer um), mas ainda é motivo de releitura.
+`ApprovalCard.run()` (`src/pages/WorkspaceTasks.tsx`) chama `onChanged()` para os dois casos,
+preservando a mensagem de erro já definida (o componente não desmonta).
+
+**CONS5-003.** `PlanStandingNotice` troca `task.approval_state === 'requires_replan'` por
+`replanRequiresReject(task)` — a mesma função que já decide, em `ApprovalCard`, se rejeitar é
+o próximo passo. A frase específica de HEAD só aparece quando `planning.transition ===
+'after_reject'` também é verdadeiro (a assinatura de `_invalidate_approval_on_entry`); as
+demais combinações caem no aviso histórico genérico já existente, que não menciona HEAD.
+Nenhum campo público novo foi criado.
+
+### Testes contra o código anterior e o corrigido
+
+* `api/tests/test_e6_cons5.py` (novo, 13 testes): unitários de `probe_head` para os 5
+  cenários pedidos (não é repo, sem primeiro commit, config corrompida, HEAD com conteúdo
+  inválido, referência de HEAD corrompida após commit) mais os 2 cenários já cobertos por
+  CONS4 (diretório removido, git ausente do PATH) para não regredir; um teste parametrizado
+  de contrato comparando `planning.blockers` de `GET /tasks/{id}` com `reason` de
+  `POST /plan` nos três tipos de corrupção; um teste de não-vazamento (sem caminho, sem
+  `fatal:`, sem `Traceback`, sem `config` na resposta pública).
+* `src/test/task-detail-ui.test.tsx`: um teste novo de conflito concorrente contando GETs (o
+  handler do `POST /plan` devolve `409 concurrent_task_update` e alterna a task que o próximo
+  `GET` devolve, provando que a tela leu de novo e não repetiu a resposta antiga — exatamente
+  2 GETs, alerta preservado, botão "Planejar" substituído pelo bloqueio novo); a variante
+  "concorrência" foi removida do `it.each` que testava "não relê" (ela relê agora, de
+  propósito); um teste novo de `needs_fix`+`requires_replan` que verifica a AUSÊNCIA da
+  palavra "HEAD" no aviso; o teste existente de `awaiting_approval`+`requires_replan` ganhou
+  uma asserção positiva confirmando que "HEAD" continua aparecendo nesse caso (o único
+  comprovado).
+
+### Gates
+
+| Gate | Resultado |
+| --- | --- |
+| `test_e6_cons5.py` | 13 passed, exit 0 |
+| Backend completo | **1884 passed, 6 skipped**, `PYTEST_EXIT=0` (era 1871; +13 CONS5) |
+| `ruff check .` / `ruff format --check .` / `mypy` | exit 0 / 0 / 0 (109 arquivos) |
+| `task-detail-ui.test.tsx` | 44 passed (era 43) |
+| Frontend completo | **161 passed**, exit 0 (era 160) |
+| `npm run lint` / `npm run build` | exit 0 / 0 |
+| `git status --porcelain=v1 --untracked-files=all` | 87 entradas: 40 rastreados modificados, 47 untracked |
+| `git diff --stat` | 40 arquivos, +5970/-197 (acumulado desde HEAD, já incluindo este append) |
+| `git diff --check` | exit 0 (só aviso de CRLF em `AGENT_LOG.md`, sem erro) |
+
+### Diff isolado
+
+Cópia literal pré-edição desta rodada (`cons5_before/`) diffada contra o atual; os dois
+arquivos novos (`test_e6_cons5.py`, `e6-consolidated-round-5.md`) contra vazio. **5 arquivos
+tocados + 2 novos, ver `cons5_isolado.diff`.** Conferido contra `git diff` no único arquivo
+rastreado sem edição de rodadas anteriores neste ponto específico: `git_runtime/__init__.py`.
+Nenhuma linha alterada toca `TRANSITIONS`, PEM, redaction, `_ANCHORED`, Gate 1, benchmarks,
+Analyzer, Resource Router, ou o contrato `planning`/`plan_standing` em si (só a fonte que
+alimenta `blockers` e o texto de apresentação).
+
+### Riscos residuais
+
+* O defeito latente de `ContextError` depois de `probe_head` continua **fora** desta correção
+  (tarefa separada já sugerida na rodada CONS4).
+* `_has_head_reflog`/`_has_git_marker` não seguem a busca ascendente por diretórios pais que o
+  próprio git faz na descoberta de repositório — adequado porque `DevWorkspace.local_path` é
+  tratado como a raiz do repositório em todo o resto do módulo, mas um workspace que fosse de
+  fato um subdiretório profundo veria o `.git` do ancestral como ausente, não como
+  `unverifiable`.
+* Um `.git` corrompido de um jeito que faça `rev-parse --is-inside-work-tree` **ter sucesso**
+  (rc=0) mas mentir "true" continuaria lido como `ok` — a correção cobre falhas de processo
+  (rc≠0) e leitura, não uma resposta de sucesso inconsistente com o disco.
+* `eligible` continua sendo uma fotografia (CONS4): concorrência, IO e árvore ilegível
+  continuam possíveis com `eligible=true` no instante da leitura.
+
+### Estado
+
+* `E6-CONS4-001/002/003/004` — correções estruturais confirmadas
+* **`E6-CONS5-001 CANDIDATE RESOLVED, AWAITING CODEX VERIFICATION`**
+* **`E6-CONS5-002 CANDIDATE RESOLVED, AWAITING CODEX VERIFICATION`**
+* **`E6-CONS5-003 CANDIDATE RESOLVED, AWAITING CODEX VERIFICATION`**
+* **E6 REMAINS BLOCKED** até auditoria independente.
+* Nada commitado. Nada pushado.
+
+## 2026-09-28 — E6-CONS5V: reverificação BLOCKED do Codex persistida e E6-CONS5V-001 corrigido
+
+Relatório BLOCKED persistido verbatim em `docs/audits/e6-cons5v-round-1.md`. CONS5-002 e
+CONS5-003 verificados; CONS5-001 ainda falha em dois casos que `probe_head` não cobria:
+commit com reflogs desativados seguido de referência de `HEAD` quebrada (respondia `no_head`
+em vez de `unverifiable`), e workspace em subdiretório com `.git/config` do ancestral
+corrompido (respondia `not_a_repo` em vez de `unverifiable`, porque a busca por `.git` não
+considerava o diretório pai). A correção é concentrada em `git_runtime`; nada mais mudou.
+
+### Ambiente
+
+O venv fora do repo (`%LOCALAPPDATA%\FreelanceFocus\venvs\api\`, ver CLAUDE.md) não existia
+nesta sessão — recriado com `python -m venv` + `pip install -e ".[dev]"` antes de qualquer
+gate, sem tocar no repositório.
+
+### Reprodução (antes da correção, em repositórios temporários fora do repo)
+
+* **Caso A** — `git init`, `core.logAllRefUpdates=false`, um commit válido, SHA confirmado
+  (`git rev-parse HEAD`), depois `.git/HEAD` reescrito para `ref: refs/heads/inexistente`.
+  Confirmado em disco: `.git/logs/HEAD` ausente (reflog desativado) e `.git/objects/` com os
+  três objetos do commit. `probe_head` (código anterior) devolvia **`no_head`** — idêntico a
+  "nunca teve commit".
+* **Caso B** — repositório com commit, workspace em `sub/ws`; `git -C sub/ws rev-parse
+  --is-inside-work-tree` confirmado `true` **antes** da corrupção. Depois de corromper
+  `.git/config` **na raiz** (não no subdiretório), o mesmo comando falha com `fatal: bad
+  config line 1 in file .git/config`. `probe_head` (código anterior) devolvia
+  **`not_a_repo`** para o subdiretório — idêntico a "nunca foi repositório".
+* Confirmado via `probe_head` chamado diretamente (script ad-hoc, fora dos testes) antes de
+  qualquer edição — não só a leitura do relatório.
+
+### Causa raiz
+
+**Caso A.** `_has_head_reflog` (renomeada para `_has_confirmed_history`) só olhava
+`.git/logs/HEAD`. Reflog e objeto são dois efeitos **independentes** do mesmo commit:
+`core.logAllRefUpdates=false` desliga a escrita do reflog, mas não impede o git de gravar os
+objetos do commit (blob, árvore, commit) em `.git/objects`. A ausência de reflog sozinha não
+prova "nunca teve commit" — só prova "reflog não confirma".
+
+**Caso B.** `_resolve_git_dir` checava `.git` só em `local_path`, nunca num ancestral. Um
+`DevWorkspace` registrado como subdiretório de um repositório real nunca tem `.git` na
+própria pasta — o git o reconhece subindo a árvore de diretórios a partir de `-C
+local_path`, e `_resolve_git_dir` precisa enxergar o mesmo `.git` que o git enxergaria, ou
+"não achei `.git` aqui" vira falso positivo de "não é repositório".
+
+### Correção
+
+Tudo em `api/app/git_runtime/__init__.py`, sem tocar `classify_git`/`git_planning_blocker`
+(`api/app/orchestrator/planner.py`) — continuam um mapeamento puro de `HeadProbe.state`, e
+corrigir a fonte única corrige Planner e elegibilidade ao mesmo tempo, como na CONS5-001.
+
+* `_resolve_git_dir` agora **sobe a árvore de diretórios** a partir de `local_path`,
+  checando `.git` (diretório ou arquivo `gitdir:`) em cada nível, até a raiz do sistema de
+  arquivos — **limitada exatamente como a descoberta padrão do git**: para também numa
+  fronteira de dispositivo/montagem (`os.stat().st_dev` comparado a cada nível), porque
+  `_git_env` nunca define `GIT_DISCOVERY_ACROSS_FILESYSTEM` (git também não atravessaria).
+  Não é uma busca sem limites — é a mesma que `rev-parse --is-inside-work-tree` já faria se
+  pudesse responder. `_git_marker_at` (novo) é a checagem de um único nível, extraída da
+  função original; a lógica de seguir `gitdir:` não mudou.
+* `_has_object_evidence` (novo): existe algum arquivo em `<git_dir>/objects` (solto ou
+  empacotado)? Um `git init` sem nenhum commit/add/stash deixa `objects/` vazio (só `info/`
+  e `pack/`, sem arquivo nenhum); qualquer commit grava pelo menos três objetos, **antes**
+  de o reflog existir e **independente** de `core.logAllRefUpdates`.
+* `_has_confirmed_history` (era `_has_head_reflog`, renomeada — o nome antigo não descrevia
+  mais o que a função checa): `unverifiable` se `.git/logs/HEAD` existir **ou** se houver
+  qualquer objeto; `no_head` só quando nenhum dos dois sinais existir.
+
+Custo: as duas checagens novas só rodam no caminho de **falha** do git (nunca no caminho
+feliz), e são só leitura de sistema de arquivos — sem subprocess novo. A busca ancestral só
+acontece quando o git já falhou e o local original não tem `.git`; o caminho feliz (`ok`)
+nunca chama `_resolve_git_dir`.
+
+### Testes contra o código anterior e o corrigido
+
+`api/tests/test_e6_cons5v.py` (novo, 6 testes): os dois cenários do CONS5V-001 (unitário de
+`probe_head` + contrato de API comparando `planning.blockers` com o `reason` de `POST
+/plan`, igual ao padrão de `test_e6_cons5.py`, incluindo o teste de não-vazamento de
+caminho/stderr/`config`) e dois testes de não-regressão para worktree vinculado (`.git` em
+arquivo) — um confirmando que o caminho feliz continua `ok`, outro confirmando que
+`_resolve_git_dir` segue o `gitdir:` até o repositório principal corrompido e devolve
+`unverifiable`, nunca `not_a_repo` nem `ok`.
+
+Com o `git_runtime/__init__.py` anterior (CONS5, pré-CONS5V) reintroduzido temporariamente:
+**4 de 6 testes falham** — os dois unitários dos casos A e B (`no_head`/`not_a_repo` em vez
+de `unverifiable`) e os dois de contrato de API (`blockers` e `reason` batendo no diagnóstico
+errado). Os dois testes de worktree passam nos dois códigos, como esperado (não-regressão,
+não comportamento novo). Arquivo restaurado à versão corrigida antes de prosseguir.
+
+`api/tests/test_e6_cons5.py` e `test_e6_cons4.py` — 47 testes, sem nenhuma mudança no
+arquivo de testes, continuam passando (nenhuma das duas correções tocou o contrato que eles
+cobrem).
+
+### Gates
+
+| Gate | Resultado |
+| --- | --- |
+| `test_e6_cons5v.py` | 6 passed, exit 0 |
+| `test_e6_cons5.py` + `test_e6_cons4.py` (sem alteração) | 47 passed, exit 0 |
+| `ruff check .` | 0 (3 achados corrigidos: duas linhas >100 colunas, um `for` trocado por `any()` sugerido pelo próprio ruff) |
+| `ruff format --check .` | 0 |
+| `mypy` | 0 (110 arquivos) |
+| Backend completo | **1890 passed, 6 skipped**, `PYTEST_EXIT=0` (era 1884; +6 CONS5V) |
+| `git diff --check` | 0 |
+| Frontend | não tocado nesta rodada (escopo congelado a `git_runtime`) — CONS5-002/003 continuam `VERIFIED RESOLVED`, sem necessidade de rerodar |
+
+### Diff isolado
+
+Cópias íntegras de `api/app/git_runtime/__init__.py`, `AGENT_LOG.md` e
+`api/tests/test_e6_cons5.py` salvas fora do repo **antes** de qualquer edição desta rodada.
+Diff isolado gerado contra essas cópias: `git_runtime/__init__.py` modificado (funções novas
+`_git_marker_at`, `_has_object_evidence`; `_resolve_git_dir` reescrita com busca ancestral;
+`_has_head_reflog` renomeada para `_has_confirmed_history` com a checagem extra), `AGENT_LOG.md`
+com esta entrada, `test_e6_cons5.py` sem nenhuma mudança (conferido — diff vazio). Dois
+arquivos novos: `api/tests/test_e6_cons5v.py`, `docs/audits/e6-cons5v-round-1.md`. Nenhuma
+linha tocada em `TRANSITIONS`, PEM, redaction, `_ANCHORED`, Gate 1, Analyzer, Resource
+Router, `classify_git`/`git_planning_blocker`, ou nos contratos `planning`/`plan_standing`
+em si — só a fonte que `probe_head` consulta no caminho de falha.
+
+### Riscos residuais
+
+* `_has_object_evidence` não distingue "objeto de um commit" de "objeto de um `git add`
+  sem commit" — um `git add` seguido de HEAD quebrado (sem nunca commitar) também passaria a
+  responder `unverifiable` em vez de `no_head`, mesmo sendo tecnicamente "nunca teve commit,
+  HEAD aponta pra uma ref inexistente". Trade-off deliberado: o custo de tratar esse caso
+  raro como ambíguo é bem menor que o de continuar dizendo "nunca teve commit" quando pode
+  ter tido — e nenhum cenário pedido nesta rodada exercita essa combinação.
+  Fica documentado como limitação conhecida.
+* A busca ancestral de `_resolve_git_dir` para numa fronteira de dispositivo/montagem
+  (`st_dev`), replicando o padrão do git (`GIT_DISCOVERY_ACROSS_FILESYSTEM=false`, nunca
+  definido). Um `DevWorkspace` cujo caminho monta um dispositivo diferente do repositório
+  ancestral não seria alcançado — mesma limitação que o próprio `git -C` teria.
+* Riscos residuais já registrados na rodada CONS5 (defeito latente de `ContextError` após
+  `probe_head`; `.git` corrompido de um jeito que faça `--is-inside-work-tree` "ter sucesso"
+  mentindo; `eligible` como fotografia) continuam **fora** desta correção, inalterados.
+
+### Estado
+
+* `E6-CONS4-001/002/003/004` — correções estruturais confirmadas
+* `E6-CONS5-002 VERIFIED RESOLVED`
+* `E6-CONS5-003 VERIFIED RESOLVED`
+* **`E6-CONS5V-001 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`**
+* **E6 REMAINS BLOCKED** até a reverificação.
+* Nada commitado. Nada pushado.
+
+## 2026-09-28 — E6-CONS5V2: reverificação BLOCKED do Codex persistida (E6-CONS5V2-001/002 OPEN)
+
+Relatório BLOCKED persistido verbatim em `docs/audits/e6-cons5v-round-2.md`. Os dois casos da
+CONS5V-001 (reflogs desativados + HEAD quebrado; subdiretório + config ancestral corrompida)
+seguem corretos. Dois findings novos em `_has_object_evidence`: worktree vinculado com commit
+comprovado (reflogs desativados) recebe `no_head` porque a checagem de objetos não segue
+`commondir` até o repositório principal (CONS5V2-001); e `git init` + `git add` sem commit
+recebe `unverifiable` em vez de `no_head` porque qualquer arquivo em `objects/` — inclusive um
+blob de staging, que não prova commit nenhum — é tratado como evidência de histórico
+(CONS5V2-002). A correção é concentrada em `git_runtime`; nada mais mudou.
+
+### Ambiente
+
+Mesmo venv fora do repo recriado na sessão anterior (`%LOCALAPPDATA%\FreelanceFocus\venvs\api\`).
+
+### Reprodução (antes da correção, em repositórios temporários fora do repo)
+
+* **Caso A** — repositório principal com `core.logAllRefUpdates=false`, um commit válido,
+  `git worktree add` (worktree vinculado, `.git` em arquivo apontando para
+  `<principal>/.git/worktrees/wt`, com `commondir` = `../..`), depois `HEAD` do **worktree**
+  reescrito para `ref: refs/heads/branch-que-nao-existe-mais`. Confirmado: `git -C <worktree>
+  rev-parse --is-inside-work-tree` continua `true` antes da corrupção. `probe_head` (código
+  da rodada CONS5V) devolvia **`no_head`**.
+* **Caso B** — `git init` genuíno, nenhum commit, um `git add` (grava só um `blob`).
+  `probe_head` (mesmo código) devolvia **`unverifiable`**.
+* Confirmado via `probe_head` chamado diretamente, fora dos testes, antes de qualquer edição.
+
+### Causa raiz
+
+**CONS5V2-001.** `_has_object_evidence` olhava `objects/` só no Git dir que `_resolve_git_dir`
+devolve para o worktree — `<principal>/.git/worktrees/wt` — mas esse diretório **não tem**
+`objects/` próprio: objetos são sempre compartilhados com o repositório principal através do
+arquivo `commondir`. `HEAD`, `index` e `logs/HEAD` são por-worktree; `objects/`, `refs/` e
+`config` não são. Sem seguir `commondir`, o commit existia mas ficava invisível.
+
+**CONS5V2-002.** A checagem anterior era "existe qualquer arquivo em `objects/`?" — um `git
+add` sem commit grava um objeto `blob` por arquivo staged, e isso já bastava para contar como
+"evidência de commit". `blob` não é `commit`; a checagem precisava olhar o **tipo** do
+objeto, não só a existência do arquivo.
+
+### Correção
+
+Tudo em `api/app/git_runtime/__init__.py`; `classify_git`/`git_planning_blocker`
+(`api/app/orchestrator/planner.py`) continuam intocados, como nas duas rodadas anteriores.
+
+* `_common_git_dir` (novo): segue o arquivo `commondir` de um Git dir de worktree até o
+  repositório principal; sem `commondir`, devolve o próprio `git_dir` (repositório principal,
+  ou sem worktrees vinculados). Só sistema de arquivos, nenhum comando `git`.
+* `_loose_object_type` (novo): tipo de um objeto solto (`blob`/`tree`/`commit`/`tag`), lendo
+  só os primeiros bytes do objeto e descomprimindo só o cabeçalho com `zlib` (stdlib, nenhuma
+  dependência nova) — nunca o conteúdo inteiro.
+* `_has_commit_or_tag_object` (novo, dentro de `objects_dir` já resolvido pelo commondir):
+  **allowlist dos tipos seguros** (`blob`, `tree` — nenhum dos dois é verbo git mutante, ver
+  `test_git_runtime_e_somente_leitura`), não dos que provam história — qualquer objeto fora
+  dessa allowlist (inclusive um tipo não reconhecido, por leitura corrompida) conta como
+  evidência. Dois limites deliberadamente conservadores, cada um "pare e devolva neutro" em
+  vez de tentar decidir com certeza: **qualquer pacote presente** (`objects/pack/*`) conta
+  como evidência sem abrir o formato de pack — custaria demais para o orçamento desta
+  sondagem; **mais de 512 objetos soltos** sem decidir também conta como evidência.
+* `_has_object_evidence`: agora resolve `_common_git_dir(git_dir)` antes de olhar `objects/`,
+  e delega a `_has_commit_or_tag_object` em vez de "qualquer arquivo".
+
+Nota de implementação: a primeira versão comparava `_loose_object_type(...) in ("commit",
+"tag")` — `test_architecture.py::test_git_runtime_e_somente_leitura` recusou, porque o guard
+de `git_runtime` é uma checagem textual cega por `"commit"`/`"tag"` entre aspas duplas em
+qualquer lugar do arquivo (não só argv), e esses são dois dos 18 verbos mutantes vigiados.
+Reescrita como allowlist positiva de `blob`/`tree` — nem semântica pior (é mais conservadora:
+qualquer tipo desconhecido agora conta como evidência, em vez de só `commit`/`tag`
+reconhecidos), nem viola o guard.
+
+Custo: as checagens novas só rodam no caminho de **falha** do git, nunca no feliz.
+`_has_commit_or_tag_object` para na primeira evidência encontrada (retorno antecipado) e tem
+os dois limites acima para o pior caso.
+
+### Testes contra o código anterior e o corrigido
+
+`api/tests/test_e6_cons5v2.py` (novo, 4 testes): os dois cenários do CONS5V2-001/002
+(unitário de `probe_head` + contrato de API comparando `planning.blockers`/`reason` de `POST
+/plan`, incluindo o teste de não-vazamento de caminho/stderr/`config` no Caso A, e a
+confirmação de que o Caso B preserva a orientação `repository_without_head` — planejamento
+continua bloqueado nos dois casos, só o motivo muda).
+
+Com o `git_runtime/__init__.py` da rodada CONS5V (pré-CONS5V2) reintroduzido temporariamente:
+**os 4 testes falham** — Caso A devolve `repository_without_head` em vez de
+`git_unverifiable` (unitário e API); Caso B devolve `git_unverifiable` em vez de
+`repository_without_head` (unitário e API). Arquivo restaurado à versão corrigida antes de
+prosseguir; `test_e6_cons5v.py` conferido sem nenhuma mudança (diff vazio).
+
+`api/tests/test_e6_cons5v.py`, `test_e6_cons5.py`, `test_e6_cons4.py`, `test_architecture.py`
+— 102 testes, nenhum arquivo de teste alterado (exceto o novo), continuam passando.
+
+### Gates
+
+| Gate | Resultado |
+| --- | --- |
+| `test_e6_cons5v2.py` | 4 passed, exit 0 |
+| `test_architecture.py` + CONS4/CONS5/CONS5V (sem alteração) | 102 passed, exit 0 |
+| `ruff check .` | 0 (1 achado corrigido: import `zlib` desordenado, `--fix` automático) |
+| `ruff format --check .` | 0 (1 arquivo reformatado: `test_e6_cons5v2.py`) |
+| `mypy` | 0 (111 arquivos) |
+| Backend completo | 1894 passed, 6 skipped, `PYTEST_EXIT=0` (era 1890; +4 CONS5V2) |
+| `git diff --check` | 0 |
+| Frontend | não tocado — CONS5-002/003 continuam `VERIFIED RESOLVED`, sem necessidade de rerodar |
+
+### Diff isolado
+
+Cópias íntegras de `api/app/git_runtime/__init__.py`, `AGENT_LOG.md` e
+`api/tests/test_e6_cons5v.py` salvas fora do repo **antes** de qualquer edição desta rodada.
+`git_runtime/__init__.py` ganhou `import zlib`, `_common_git_dir`,
+`_MAX_LOOSE_OBJECTS_SCANNED`, `_loose_object_type`,
+`_LOOSE_OBJECT_TYPES_WITHOUT_HISTORY_EVIDENCE`, `_has_commit_or_tag_object` reescrita, e
+`_has_object_evidence`/`_has_confirmed_history` com docstrings atualizadas; `test_e6_cons5v.py`
+sem nenhuma mudança (conferido). Dois arquivos novos: `api/tests/test_e6_cons5v2.py`,
+`docs/audits/e6-cons5v-round-2.md`. Nenhuma linha tocada em `TRANSITIONS`, PEM, redaction,
+`_ANCHORED`, Gate 1, Analyzer, Resource Router, `classify_git`/`git_planning_blocker`, no
+frontend, ou nos contratos `planning`/`plan_standing` em si.
+
+### Riscos residuais
+
+* `_has_commit_or_tag_object` só abre objetos **soltos**; qualquer pacote presente é tratado
+  como evidência sem inspeção — correto (conservador) para "há algo, não decidi o quê", mas
+  significa que um repositório real, já compactado por `git gc`, sempre responde
+  `unverifiable` num `HEAD` corrompido, mesmo que só tenha `blob`s empacotados sem commit
+  algum (cenário que não deveria existir em prática, já que `gc` só compacta o que já foi
+  commitado — mas não está provado impossível).
+* O limite de 512 objetos soltos escaneados é uma escolha de orçamento, não uma prova de
+  suficiência — um workspace real que faça `add` de milhares de arquivos antes do primeiro
+  commit veria `unverifiable` em vez de `no_head` num `HEAD` corrompido nesse meio-tempo.
+  Aceito deliberadamente: o cenário é raro e o custo de errar para o lado conservador
+  (`unverifiable`) é menor que o de declarar `no_head` sem ter certeza.
+* Riscos residuais das rodadas anteriores (CONS5, CONS5V) continuam **fora** desta correção,
+  inalterados: defeito latente de `ContextError` após `probe_head`; `.git` corrompido de um
+  jeito que faça `--is-inside-work-tree` "ter sucesso" mentindo; `eligible` como fotografia;
+  `_has_object_evidence` (agora com commondir) ainda não segue busca ascendente de
+  diretórios pais além do que `_resolve_git_dir` já faz.
+
+### Estado
+
+* `E6-CONS4-001/002/003/004` — correções estruturais confirmadas
+* `E6-CONS5-002 VERIFIED RESOLVED`
+* `E6-CONS5-003 VERIFIED RESOLVED`
+* `E6-CONS5V-001 VERIFIED RESOLVED` (confirmado nesta reverificação — os dois cenários
+  originais seguem corretos)
+* **`E6-CONS5V2-001 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`**
+* **`E6-CONS5V2-002 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`**
+* **E6 REMAINS BLOCKED** até a reverificação.
+* Nada commitado. Nada pushado.
+
+## 2026-09-28 — E6-CONS5V3: reverificação BLOCKED do Codex persistida (E6-CONS5V3-001 OPEN)
+
+Relatório BLOCKED persistido verbatim em `docs/audits/e6-cons5v-round-3.md`. CONS5V2-001/002
+confirmados nesta reverificação. Um finding novo: `_has_commit_or_tag_object` não trata falha
+de E/S na leitura de `objects/` de modo conservador — `os.scandir` do diretório principal sem
+proteção deixa `PermissionError` atravessar até a API (500 em vez de `git_unverifiable`), e o
+`except OSError: continue` de um subdiretório ilegível vira silenciosamente "sem objeto ali",
+podendo produzir `no_head` quando o objeto do commit está exatamente no subdiretório
+ilegível. A correção é concentrada em `git_runtime`; nada mais mudou.
+
+### Ambiente
+
+Mesmo venv fora do repo das rodadas anteriores (`%LOCALAPPDATA%\FreelanceFocus\venvs\api\`).
+
+### Reprodução (antes da correção, em repositórios temporários fora do repo, falha injetada
+via `monkeypatch`/wrapper de `os.scandir` restrito a um caminho exato)
+
+* **Cenário A** — `git init` genuíno, sem commit, `git add` (grava um `blob`). Um wrapper de
+  `os.scandir` que levanta `PermissionError` exatamente para `<repo>/.git/objects` (delegando
+  ao `os.scandir` real para qualquer outro caminho): `probe_head` **lançava a exceção** —
+  confirmado por chamada direta, fora dos testes.
+* **Cenário B** — commit válido com `core.logAllRefUpdates=false`, SHA resolvido via `git
+  rev-parse HEAD` (antes de quebrar `HEAD`), o mesmo wrapper restrito ao subdiretório de dois
+  hex que contém especificamente o **objeto do commit** (não o do blob nem o da árvore, que
+  ficam em subdiretórios diferentes — resolvido pelo SHA, não por "o primeiro objeto que
+  aparecer"). `probe_head` devolvia **`no_head`** — confirmado por chamada direta.
+* As duas reproduções ad-hoc foram refeitas como testes reais (ver abaixo); a primeira versão
+  do teste do Cenário B tinha um defeito de montagem (pegava o subdiretório de um objeto
+  qualquer, não necessariamente o do commit) que o mascarava — só descoberto ao provar que os
+  testes falhavam no código anterior (passo 5 da validação, adiante).
+
+### Causa raiz
+
+Toda em `_has_commit_or_tag_object` (`api/app/git_runtime/__init__.py`):
+
+* `with os.scandir(objects_dir) as fanout_entries:` (diretório principal) e `with
+  os.scandir(pack_dir) as pack_entries:` **sem nenhum tratamento** — qualquer `OSError`
+  (inclusive `PermissionError`) atravessava a função inteira até `probe_head`, até a API,
+  virando 500.
+* `except OSError: continue` no `os.scandir` de um **subdiretório** — tratava "não deu para
+  ler este subdiretório" como "não há nada aqui", silenciosamente. Se o objeto que provaria
+  história estivesse exatamente nesse subdiretório, a conclusão ficava "sem evidência", e
+  combinada com reflog ausente (E6-CONS5V-001) produzia `no_head` — o mesmo diagnóstico de "
+  nunca teve commit" que o achado original desta família toda existe para evitar.
+* Nenhuma das duas chamadas de `os.scandir`, nem a iteração de nenhum dos dois `with`,
+  protegia contra falha **no meio** da iteração (o `os.scandir` inicial pode ter sucesso e um
+  `next()` subsequente falhar) — mesma classe de problema, ponto de injeção diferente.
+
+### Correção
+
+Toda em `_has_commit_or_tag_object`. Contrato explícito na docstring: só devolve `False`
+quando a inspeção **termina** sem achar nada fora da allowlist (`blob`/`tree`); qualquer
+outra situação — evidência real, pacote presente, limite de 512 excedido, **ou qualquer
+`OSError`, em qualquer ponto** — devolve `True`. Nenhuma exceção atravessa a função:
+
+* `os.scandir(pack_dir)` — chamada e iteração (`any(...)`) dentro de um único `try`;
+  `except OSError: return True`.
+* `os.scandir(objects_dir)` (nível superior) — chamada **e** o `for` que itera sobre ela
+  ficam dentro do mesmo `try`; `except OSError: return True` cobre tanto "a chamada falhou"
+  quanto "a iteração falhou no meio".
+* `os.scandir(fanout.path)` (subdiretório) — mesma estrutura: chamada e `for` interno num só
+  `try`; o `except OSError: continue` de antes virou `except OSError: return True` — a
+  mudança central do finding.
+
+Nenhum catch genérico de `Exception` foi introduzido (só `OSError`, nos três pontos de E/S
+reais) — um erro de programação real (`TypeError`, `AttributeError`, etc.) continua
+propagando normalmente, não é engolido. Custo: zero no caminho feliz (a inspeção só roda no
+caminho de falha do git, como desde E6-CONS5V-001); no caminho de falha, o custo é o mesmo de
+antes — só a resposta a um `OSError` mudou de "esconder" para "declarar incompleta".
+
+### Testes contra o código anterior e o corrigido
+
+`api/tests/test_e6_cons5v3.py` (novo, 6 testes), falhas injetadas em quatro pontos distintos
+via um wrapper de `os.scandir` restrito a um caminho exato (delega ao real em qualquer outro
+caminho — nada além do alvo de cada teste é afetado):
+
+1. `os.scandir` do diretório principal de `objects/` falha na chamada — `probe_head` não
+   lança, devolve `unverifiable` (unitário).
+2. O mesmo cenário pela API real — `GET /api/tasks/{id}` e `POST /plan/` continuam 200/409
+   com `git_unverifiable`, nunca 500; resposta conferida sem caminho, `fatal:`, `Traceback`,
+   `PermissionError` nem o texto injetado.
+3. `os.scandir` do subdiretório do objeto do commit falha na chamada (Cenário B do relatório)
+   — unitário e API, mesmas asserções de não-vazamento.
+4. Falha **no meio** da iteração do diretório principal (a chamada inicial sucede; um
+   `_FailAfterEntries` customizado deixa passar `N` entradas reais e levanta na seguinte).
+5. Falha no meio da iteração de um subdiretório, mesma técnica.
+
+Com o `git_runtime/__init__.py` da rodada CONS5V2 (pré-CONS5V3) reintroduzido temporariamente:
+**os 6 testes falham** — os dois primeiros propagam `PermissionError` de verdade através da
+pilha até o teste (inclusive pela API, onde o TestClient repropaga a exceção do
+`run_in_threadpool`); os quatro restantes devolvem `no_head` em vez de `unverifiable`. Arquivo
+restaurado à versão corrigida antes de prosseguir; `test_e6_cons5v2.py` conferido sem nenhuma
+mudança (diff vazio).
+
+`test_e6_cons5v2.py`, `test_e6_cons5v.py`, `test_e6_cons5.py`, `test_e6_cons4.py`,
+`test_architecture.py`, `test_git_runtime.py`, `test_git_runtime_context_reads.py` — 217
+testes, nenhum arquivo de teste alterado (exceto o novo), continuam passando.
+
+### Gates
+
+| Gate | Resultado |
+| --- | --- |
+| `test_e6_cons5v3.py` | 6 passed, exit 0 |
+| CONS4/CONS5/CONS5V/CONS5V2 + arquitetura + git_runtime (sem alteração) | 217 passed, exit 0 |
+| `ruff check .` | 0 (3 achados de tipagem/formatação corrigidos durante a rodada: `os.ScandirIterator` não existe em typeshed nessa forma, `__exit__` tipado como `bool` — corrigidos para `Iterator[os.DirEntry[str]]`/`Any`/`None`) |
+| `ruff format --check .` | 0 |
+| `mypy` | 0 (112 arquivos) |
+| Backend completo | 1900 passed, 6 skipped, `PYTEST_EXIT=0` (era 1894; +6 CONS5V3) |
+| `git diff --check` | 0 |
+| Frontend | não tocado — fora de escopo desta correção |
+
+### Diff isolado
+
+Cópias íntegras de `api/app/git_runtime/__init__.py`, `AGENT_LOG.md` e
+`api/tests/test_e6_cons5v2.py` salvas fora do repo **antes** de qualquer edição desta rodada.
+`git_runtime/__init__.py`: só `_has_commit_or_tag_object` reescrita (estrutura de
+`try`/`except` em volta dos três pontos de E/S; nenhuma outra função tocada) e sua docstring.
+`test_e6_cons5v2.py` sem nenhuma mudança (conferido). Dois arquivos novos:
+`api/tests/test_e6_cons5v3.py`, `docs/audits/e6-cons5v-round-3.md`. Nenhuma linha tocada em
+`TRANSITIONS`, PEM, redaction, `_ANCHORED`, Gate 1, Analyzer, Resource Router,
+`classify_git`/`git_planning_blocker`, Planner, Eligibility, frontend, ou nos contratos
+`planning`/`plan_standing` em si.
+
+### Riscos residuais
+
+* Riscos residuais das rodadas CONS5V/CONS5V2 continuam **fora** desta correção, inalterados
+  (packfiles nunca inspecionados por tipo; limite de 512 objetos como orçamento, não prova;
+  defeito latente de `ContextError` após `probe_head`; `.git` corrompido de um jeito que faça
+  `--is-inside-work-tree` "ter sucesso" mentindo; `eligible` como fotografia).
+* Um `OSError` que ocorra depois de já ter sido decidido `True` por outro motivo (pacote
+  presente, limite excedido, evidência real) nunca é alcançado — a função retorna assim que
+  qualquer sinal de "não confiar em no_head" aparece, então a ordem de checagem não afeta a
+  conclusão final, só qual delas dispara primeiro.
+* O wrapper de teste intercepta `os.scandir` por **igualdade exata de caminho absoluto**
+  (normalizado por `os.path.normcase`); não cobre variações do mesmo caminho por symlink ou
+  por um segundo ponto de montagem apontando para o mesmo diretório físico — irrelevante para
+  os cenários pedidos, mas documentado como limitação do arnês de teste, não da correção.
+
+### Estado
+
+* `E6-CONS4-001/002/003/004` — correções estruturais confirmadas
+* `E6-CONS5-002 VERIFIED RESOLVED`
+* `E6-CONS5-003 VERIFIED RESOLVED`
+* `E6-CONS5V-001 VERIFIED RESOLVED`
+* `E6-CONS5V2-001 VERIFIED RESOLVED`
+* `E6-CONS5V2-002 VERIFIED RESOLVED`
+* **`E6-CONS5V3-001 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`**
+* **E6 REMAINS BLOCKED** até a reverificação.
+* Nada commitado. Nada pushado.
+
+## 2026-09-28 — E6-CONS5V4: reverificação BLOCKED do Codex persistida (E6-CONS5V4-001/002 OPEN)
+
+Relatório BLOCKED persistido verbatim em `docs/audits/e6-cons5v-round-4.md`. CONS5V3-001
+confirmado. Dois achados adjacentes: `os.path.isdir(objects_dir)`/`os.path.isdir(pack_dir)`
+(checagem de existência, não de conteúdo) engolem `PermissionError` e devolvem `False` —
+indistinguível de "não existe" —, e `_common_git_dir` cai de volta ao Git dir do próprio
+worktree quando a leitura de `commondir` falha, perdendo o armazenamento comum. Os dois
+convergem para o mesmo diagnóstico falso: `no_head`. A correção é concentrada em
+`git_runtime`; nada mais mudou.
+
+### Ambiente
+
+Mesmo venv fora do repo das rodadas anteriores (`%LOCALAPPDATA%\FreelanceFocus\venvs\api\`).
+
+### Reprodução (antes da correção, em repositórios temporários fora do repo)
+
+Script ad-hoc fora dos testes, monkeypatchando `app.git_runtime.os.path.isdir`/`open` para
+devolver exatamente o que a versão real faz diante de um `PermissionError` (o `isdir`
+engolindo o erro e devolvendo `False`; o `open` deixando o erro passar, já capturado pelo
+`except (OSError, UnicodeDecodeError)` existente de `_common_git_dir`) — não uma exceção
+crua, que não reproduziria o bug real:
+
+* **CONS5V4-001a** — repositório com commit, reflogs desativados, `HEAD` quebrado;
+  `isdir(objects_dir)` engolindo `PermissionError`: `probe_head` devolvia **`no_head`**.
+* **CONS5V4-001b** — mesmo cenário, compactado (`git gc --no-prune`, sem objetos soltos
+  restantes); `isdir(objects/pack)` engolindo `PermissionError`: **`no_head`**.
+* **CONS5V4-002** — worktree vinculado, commit no principal, reflogs desativados, `HEAD` do
+  worktree quebrado; `open(commondir)` levantando `PermissionError`: **`no_head`**.
+
+Os três confirmados por chamada direta a `probe_head`, fora dos testes, antes de qualquer
+edição.
+
+### Causa comum
+
+Três checagens de existência diferentes (`os.path.isdir(objects_dir)`,
+`os.path.isdir(pack_dir)` em `_has_commit_or_tag_object`/`_has_object_evidence`, e
+`os.path.isfile(commondir_file)` em `_common_git_dir`, mais um `open()` cujo `except OSError`
+já existia mas caía no mesmo destino) engoliam **qualquer** `OSError` — não só
+`FileNotFoundError` — e devolviam o valor que o resto do código lê como "confirmado
+ausente". Um `PermissionError` (existe, mas não deu para confirmar) e uma ausência real
+davam exatamente a mesma resposta, e quem chamava depois não tinha como distinguir os dois.
+A rodada CONS5V3 já tinha corrigido o `scandir`/iteração dentro desses diretórios; esta
+rodada corrige a checagem de **existência** que vem antes.
+
+### Contrato interno de inspeção
+
+Uma exceção interna, `_ObjectInspectionUnverifiable` (não herda de `OSError`, de propósito —
+para não ser recapturada por um `except OSError:` mais externo), e uma única primitiva,
+`_stat_or_raise(path)`:
+
+* `FileNotFoundError`/`NotADirectoryError` → `None` (ausência **confirmada**).
+* Qualquer outro `OSError` → levanta `_ObjectInspectionUnverifiable(path)`.
+
+`_confirmed_dir_exists` deriva de `_stat_or_raise` (dir confirmado vs ausência confirmada).
+`_common_git_dir` usa o mesmo padrão diretamente no `open()` do `commondir` (sem mais um
+`isfile()` prévio — o próprio `open()` já responde "existe?" e "deu para ler?" numa única
+chamada, sem race entre as duas perguntas). `_has_commit_or_tag_object` troca os três
+`except OSError: return True` da rodada CONS5V3 por `raise _ObjectInspectionUnverifiable`,
+unificando tudo sob o mesmo mecanismo. **Uma única fronteira** captura a exceção:
+`_has_confirmed_history`, convertendo em `True` (mesma resposta de "achei evidência" — os
+dois dizem "não posso confirmar `no_head`"). Nenhum `except Exception` genérico foi
+introduzido; só `OSError` nas operações de E/S reais, e a exceção interna nunca atravessa
+até `probe_head`.
+
+### Código alterado
+
+Tudo em `api/app/git_runtime/__init__.py`:
+
+* `_ObjectInspectionUnverifiable` (nova), `_stat_or_raise` (nova), `_confirmed_dir_exists`
+  (nova, deriva de `_stat_or_raise`).
+* `_common_git_dir`: removido o `isfile()` prévio; `open()` direto, com
+  `FileNotFoundError`/`NotADirectoryError` → fallback ao `git_dir` (comportamento
+  documentado, inalterado), `UnicodeDecodeError` → mesmo fallback (fora de escopo, formato de
+  conteúdo, não E/S), qualquer outro `OSError` → `_ObjectInspectionUnverifiable`.
+* `_has_commit_or_tag_object`: checagem de `pack_dir` trocada de `os.path.isdir` para
+  `_confirmed_dir_exists`; os três `except OSError: return True` viraram
+  `except OSError as exc: raise _ObjectInspectionUnverifiable(...) from exc`.
+* `_has_object_evidence`: checagem de `objects_dir` trocada de `os.path.isdir` para
+  `_confirmed_dir_exists`.
+* `_has_confirmed_history`: checagem de `logs/HEAD` trocada de `os.path.exists` para
+  `_stat_or_raise` (mesma regra, aplicada também aqui por consistência — não fazia parte dos
+  dois achados reportados, mas é o mesmo defeito na mesma função de decisão); corpo envolto
+  num `try`/`except _ObjectInspectionUnverifiable: return True`, a única fronteira.
+* `import stat` acrescentado (stdlib, nenhuma dependência nova) para `stat.S_ISDIR`.
+
+`classify_git`/`git_planning_blocker` (`api/app/orchestrator/planner.py`), Planner,
+Eligibility, contratos `planning`/`plan_standing`, frontend: **não tocados**.
+
+### Prova antes/depois
+
+Reprodução ad-hoc (acima) confirmou os três `no_head` no código anterior e `unverifiable` no
+corrigido — duas vezes cada: uma vez com o monkeypatch de `os.path.isdir`/`open` reproduzindo
+o comportamento antigo, e de novo com um monkeypatch de `os.stat`/`open` (o que o código novo
+de fato chama) para confirmar que a fronteira nova responde corretamente sob falha real.
+
+### Testes
+
+`api/tests/test_e6_cons5v4.py` (novo, 7 testes): os três achados, cada um com uma variante
+unitária (`probe_head`) e uma de API real (`GET`/`POST /plan`, `git_unverifiable`, sem 500,
+sem vazamento de caminho/stderr/`PermissionError`/texto injetado) — exceto CONS5V4-001b, que
+tem as duas também — mais um teste bônus para `logs/HEAD` (mesma regra, não fazia parte dos
+achados reportados, então não tem variante de API).
+
+Com o `git_runtime/__init__.py` da rodada CONS5V3 (pré-CONS5V4) reintroduzido temporariamente:
+**6 dos 7 testes falham** — os seis que cobrem os dois achados reportados (`no_head`/
+`repository_without_head` em vez de `unverifiable`/`git_unverifiable`). O bônus de
+`logs/HEAD` passa nos dois códigos: `os.path.exists` chama `os.stat` internamente, então o
+monkeypatch de `os.stat` já afeta o código antigo também para esse caminho específico — não
+prova regressão nova, só confirma que a mesma regra também cobre esse caso. Arquivo
+restaurado à versão corrigida antes de prosseguir; `test_e6_cons5v3.py` conferido sem nenhuma
+mudança (diff vazio).
+
+`test_e6_cons5v3.py`, `test_e6_cons5v2.py`, `test_e6_cons5v.py`, `test_e6_cons5.py`,
+`test_e6_cons4.py`, `test_architecture.py`, `test_git_runtime.py`,
+`test_git_runtime_context_reads.py` — 224 testes, nenhum arquivo de teste alterado (exceto o
+novo), continuam passando.
+
+### Gates
+
+| Gate | Resultado |
+| --- | --- |
+| `test_e6_cons5v4.py` | 7 passed, exit 0 |
+| CONS4/CONS5/CONS5V/CONS5V2/CONS5V3 + arquitetura + git_runtime (sem alteração) | 224 passed, exit 0 |
+| `ruff check .` | 0 |
+| `ruff format --check .` | 0 (1 arquivo reformatado: `test_e6_cons5v4.py`) |
+| `mypy` | 0 (113 arquivos) |
+| Backend completo | 1907 passed, 6 skipped, `PYTEST_EXIT=0` (era 1900; +7 CONS5V4) |
+| `git diff --check` | 0 |
+| Frontend | não tocado — fora de escopo |
+
+### Diff isolado
+
+Cópias íntegras de `api/app/git_runtime/__init__.py`, `AGENT_LOG.md` e
+`api/tests/test_e6_cons5v3.py` salvas fora do repo **antes** de qualquer edição desta rodada.
+`git_runtime/__init__.py`: `_common_git_dir`, `_has_commit_or_tag_object`,
+`_has_object_evidence`, `_has_confirmed_history` alteradas; `_ObjectInspectionUnverifiable`,
+`_stat_or_raise`, `_confirmed_dir_exists` novas; `import stat` acrescentado. Nenhuma outra
+função tocada. `test_e6_cons5v3.py` sem nenhuma mudança (conferido). Dois arquivos novos:
+`api/tests/test_e6_cons5v4.py`, `docs/audits/e6-cons5v-round-4.md`. Nenhuma linha tocada em
+`TRANSITIONS`, PEM, redaction, `_ANCHORED`, Gate 1, Analyzer, Resource Router,
+`classify_git`/`git_planning_blocker`, Planner, Eligibility, frontend, ou nos contratos
+`planning`/`plan_standing` em si.
+
+### Confirmação de ausência de temporários/segredos
+
+`git status --porcelain=v1 --untracked-files=all` conferido linha a linha contra a lista
+esperada: só os dois arquivos novos desta rodada além do que já existia. Nenhum `.env`,
+credencial, ou artefato de `cons5v4_before/`/`cons5v4_repro/` (ambos fora do repo, no
+scratchpad da sessão) entrou na árvore.
+
+### Riscos residuais
+
+* `_stat_or_raise` não distingue `PermissionError` de outras classes de `OSError` (E/S de
+  disco, `TimeoutError` em FS de rede, etc.) — todas viram `_ObjectInspectionUnverifiable`
+  igualmente. Correto para o contrato (qualquer falha não confirmada é `unverifiable`), mas
+  significa que um erro transitório de rede num `.git` montado remotamente teria o mesmo
+  efeito que uma permissão negada permanente.
+* Riscos residuais das rodadas CONS5V/CONS5V2/CONS5V3 continuam **fora** desta correção,
+  inalterados (packfiles nunca inspecionados por tipo; limite de 512 objetos como orçamento;
+  defeito latente de `ContextError` após `probe_head`; `.git` corrompido de um jeito que faça
+  `--is-inside-work-tree` "ter sucesso" mentindo; `eligible` como fotografia).
+* Continua havendo uma janela TOCTOU teórica entre `_confirmed_dir_exists`/`_stat_or_raise` e
+  o `os.scandir`/`open()` seguinte (o diretório pode ser removido ou perder permissão entre
+  as duas chamadas) — mas o `try`/`except OSError` ao redor do `scandir`/`open` seguinte já
+  cobre essa janela, levantando `_ObjectInspectionUnverifiable` do mesmo jeito.
+
+### Estado
+
+* `E6-CONS4-001/002/003/004` — correções estruturais confirmadas
+* `E6-CONS5-002 VERIFIED RESOLVED`
+* `E6-CONS5-003 VERIFIED RESOLVED`
+* `E6-CONS5V-001 VERIFIED RESOLVED`
+* `E6-CONS5V2-001 VERIFIED RESOLVED`
+* `E6-CONS5V2-002 VERIFIED RESOLVED`
+* `E6-CONS5V3-001 VERIFIED RESOLVED`
+* **`E6-CONS5V4-001 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`**
+* **`E6-CONS5V4-002 CANDIDATE RESOLVED — AWAITING CODEX VERIFICATION`**
+* **E6 REMAINS BLOCKED** até a reverificação.
+* Nada commitado. Nada pushado.
+
+## 2026-09-28 — E6-CONS5V4v: reverificação GREEN do Codex persistida — E6 pronta para inventário
+
+Relatório GREEN persistido verbatim em `docs/audits/e6-cons5v-round-4v.md` (não sobrescreve o
+BLOCKED anterior, `docs/audits/e6-cons5v-round-4.md`). Os três cenários de E6-CONS5V4-001/002
+reproduzidos de forma independente confirmaram `unverifiable`/`git_unverifiable` em
+`probe_head`, no detalhe da tarefa e em `POST /plan`, sem HTTP 500 nem vazamento de detalhe
+interno. Nenhum arquivo do projeto foi alterado por esta auditoria.
+
+* `E6-CONS5V4-001 VERIFIED RESOLVED`
+* `E6-CONS5V4-002 VERIFIED RESOLVED`
+* `E6-CONS5V3-001 VERIFIED RESOLVED`
+* `E6-CONS5V2-001/002 VERIFIED RESOLVED`
+* **E6 READY FOR FINAL INVENTORY AND COMMIT REVIEW.** Este veredito não autoriza commit ou
+  merge — inventário completo (sem alteração de código) segue nesta mesma entrada de log.
+
+## 2026-09-28 — E6: fechamento documental e inventário final (sem alteração de código)
+
+Inventário completo em `docs/audits/e6-final-inventory.md`. Repositório em `main`, HEAD
+`8c493a8`, 40 arquivos rastreados modificados e 55 não rastreados — confere exatamente com o
+último estado informado pelo Codex, sem divergência de contagem. Todos os 95 arquivos
+classificados por categoria (backend E6, frontend E6, testes, arquitetura/documentação,
+relatórios de auditoria); nenhum arquivo anterior/não relacionado à E6 e nenhum artefato
+temporário encontrados. Verificação de segredos sobre o diff completo e os 55 arquivos não
+rastreados: nenhuma credencial real — os únicos padrões que casam com chave AWS/OpenAI/PEM
+são valores sintéticos do próprio motor de redação em `test_e6_audit_round_4.py` a `_7.py` e
+`docs/audits/e6-round-7.md` (`AKIAIOSFODNN7EXAMPLE`, `sk-FourthAuditSynthetic…`, corpos PEM
+com `MIIE` de preenchimento). Nenhum `.env`, `.db`, `.venv`, cache ou build entrou na árvore —
+todos já cobertos por `.gitignore`. Única divergência registrada: `docs/architecture/04` e
+`06` estão modificados (rastreados) e a autorização explícita para essas duas edições
+específicas não é visível nesta conversa — sinalizado para confirmação do Pedro antes do
+commit, sem reverter nem investigar o conteúdo. Proposta de branch de fechamento
+(`git checkout -b e6/fechamento-cons5v`, que preserva a working tree sem stash/reset) incluída
+no inventário; nenhum procedimento executado. Testes não reexecutados (tarefa de inventário,
+não de implementação) — última execução registrada é a da rodada CONS5V4 (1907 passed, 6
+skipped, `PYTEST_EXIT=0`).
+
+Nada commitado. Nada pushado. Nenhum arquivo de código, teste ou documento normativo alterado
+por esta tarefa — só `AGENT_LOG.md` (esta entrada) e os dois arquivos novos em
+`docs/audits/` (`e6-cons5v-round-4v.md`, `e6-final-inventory.md`).
+
+## 2026-09-28 — E6: autorização de Pedro para o adendo de [04], revisão de release hygiene
+persistida, e errata das contagens do fechamento documental
+
+### Autorização literal (Pedro, 2026-09-28)
+
+> "Autorizo o adendo de cobertura recursiva de chaves e valores no documento de arquitetura
+> 04, conforme a implementação atual."
+
+**Escopo exato**: só o bloco "Cobertura de chaves e valores" (E6-AUD3-003) e a frase
+"recursivo sobre valores e chaves" em `docs/architecture/04-safety-and-git-runtime.md`
+(linhas 332 e 340) — o trecho que a própria entrada de log da rodada em que foi encontrado
+(acima, "Encontrado por mim durante a rodada, e **não** corrigido por falta de autorização")
+já tinha identificado como pendente de decisão do Pedro, e que nenhuma entrada posterior
+resolvia até agora. Não autoriza nenhuma outra alteração em `docs/`.
+
+**Conferido antes de qualquer edição**: o texto atual de `docs/architecture/04` (linhas
+332–337, 339–340) já descreve `redact_document` como recursivo sobre chaves **e** valores —
+e o código (`api/app/safety/redaction.py:1055`, docstring de `redact_document`) implementa
+exatamente isso, confirmado por leitura direta da função nesta tarefa. **O texto já
+corresponde à decisão agora autorizada; nenhuma edição em `docs/architecture/04` foi
+necessária.** A autorização resolve a pendência registrada — o documento não precisava mudar,
+precisava de permissão para continuar como está.
+
+### As duas autorizações de arquitetura congelada, agora resolvidas
+
+* **[06] — fronteiras da API**: autorização D1 já registrada nesta log (ver entrada da
+  implementação estrutural CONS4, 2026-09-23) e corresponde a `planning`, `plan_standing` e
+  `reason` como implementados.
+* **[04] — segurança**: os dois escapes JSON, a precisão da âncora, o risco de redação
+  excessiva e o fechamento de AUD7-001/002 já tinham decisões expressas nesta log, em rodadas
+  anteriores. A única pendência era o bloco "Cobertura de chaves e valores" — resolvida
+  pela autorização acima.
+
+As duas estão **resolvidas**. A entrada anterior desta sessão ("E6: fechamento documental e
+inventário final") tratava as autorizações de `04` e `06` como igualmente desconhecidas —
+essa afirmação estava **incompleta**: `06` já tinha autorização registrada e localizável
+(D1); só `04` tinha uma pendência real, e só nesse ponto específico. Ver errata abaixo.
+
+### Revisão de release hygiene (Codex) persistida
+
+Relatório BLOCKED — RELEASE HYGIENE persistido verbatim em
+`docs/audits/e6-final-release-review.md`. Resumo do que ele encontrou: a árvore estava íntegra
+(nenhum segredo real, nenhum artefato indevido), mas o inventário e a entrada de log do
+fechamento anterior registravam contagens desatualizadas (55/95 em vez de 57/97 — o estado já
+tinha avançado para 57 não rastreados antes daquela entrada ser lida, por conta de uma
+diferença de sincronização entre quando a contagem foi tirada e quando foi escrita), a seção
+de testes novos dizia 22 quando são 21, e as duas autorizações de `docs/` eram tratadas como
+igualmente pendentes quando só uma era. Nenhuma dessas contagens incorretas chegou a bloquear
+nada — o relatório é preventivo, sinalizando antes de qualquer staging.
+
+### Errata das contagens
+
+* **Snapshot do inventário anterior** (`docs/audits/e6-final-inventory.md`, antes desta
+  tarefa): 40 rastreados modificados + 55 não rastreados = 95. Válido no momento em que foi
+  tirado (logo após persistir `e6-cons5v-round-4v.md` e o próprio `e6-final-inventory.md`,
+  mas a contagem final de conferência, no passo 8 daquela tarefa, foi tirada **antes** de
+  escrever esses dois arquivos nela mesma — por isso 95, não 97).
+* **Snapshot da revisão de release hygiene** (Codex, ponto de partida desta tarefa): 40 + 57 =
+  97 — os mesmos 40 rastreados, mais os 55 anteriores mais os 2 que o próprio fechamento
+  documental acabou de criar (`e6-cons5v-round-4v.md`, `e6-final-inventory.md`).
+* **Estado após persistir `e6-final-release-review.md` nesta tarefa**: confirmado
+  diretamente por `git status --porcelain=v1 --untracked-files=all` — **40 + 58 = 98**, exatamente
+  a expectativa registrada no prompt desta tarefa ("caso não haja outras mudanças").
+* **Testes novos**: 21, não 22 — `docs/audits/e6-final-inventory.md` §2.6 contava um arquivo a
+  mais; corrigido nesta tarefa (ver arquivo).
+* As seções 1 e 2.8 do inventário divergiam sobre se os dois documentos de fechamento
+  (`e6-cons5v-round-4v.md`, `e6-final-inventory.md`) já entravam na contagem de 55 daquele
+  momento — corrigido: §1 agora declara os dois snapshots (95 no momento da conferência final
+  daquela tarefa, 97 no início desta) e §2.8 lista os dois junto com o novo relatório de
+  release review, sem ambiguidade sobre em qual contagem cada um entrou.
+
+### Estado
+
+* Autorização de `docs/architecture/04` (bloco "Cobertura de chaves e valores"): **concedida
+  por Pedro nesta tarefa, escopo exato acima. Texto já corresponde; nenhuma edição feita.**
+* Autorização de `docs/architecture/06` (D1): **já estava registrada; localizada e
+  confirmada.**
+* `docs/audits/e6-final-inventory.md`: corrigido nesta tarefa (contagens, testes novos,
+  seções 1/2.8, novo relatório incluído em candidatos ao commit).
+* **E6 DOCUMENTATION READY FOR COMMIT APPROVAL** — sem pendência objetiva de release hygiene
+  restante além da nota abaixo.
+* Nota factual, não bloqueante: o relatório de release hygiene persistido acima afirma que
+  "a branch `e6/fechamento-cons5v` está disponível localmente e em origin" — **não
+  confirmado**: `git branch -a` nesta tarefa não encontra essa branch, nem localmente nem em
+  `origin`. Registrado sem alterar o relatório (persistido verbatim); quem for criar a branch
+  de fechamento deve conferir isso diretamente antes de assumir que ela já existe.
+* Nada commitado. Nada pushado. Nenhum código, teste ou documento normativo alterado por esta
+  tarefa — só `AGENT_LOG.md` (esta entrada), `docs/audits/e6-final-release-review.md` (novo) e
+  `docs/audits/e6-final-inventory.md` (corrigido).

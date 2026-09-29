@@ -37,6 +37,7 @@ const workspaceFixture = (over: Partial<Workspace> = {}): Workspace => ({
   repository_url: null,
   default_branch: null,
   status: 'archived',
+  test_config: null,
   created_at: '2026-09-03T10:00:00+00:00',
   updated_at: '2026-09-03T10:00:00+00:00',
   ...over,
@@ -68,9 +69,10 @@ afterEach(() => {
 })
 
 describe('WorkspaceDetail — abas', () => {
-  // A aba Contexto passou a ser habilitada na E4 (Context Registry). Tarefas continua em
-  // fase futura (E6), e é ela que mantém a cobertura do estado desabilitado.
-  it('habilita Contexto e mantém Tarefas em fase futura', async () => {
+  // Contexto foi habilitada na E4 (Context Registry) e Tarefas na E6 (Orchestrator
+  // Planner). Com as três abas ativas, nenhuma cobre mais o estado "fase futura" — o
+  // marcador desapareceu da tela porque nenhuma aba o merece, e é isso que se afirma aqui.
+  it('habilita as três abas e não mostra mais nenhuma como fase futura', async () => {
     installRouter((method, path) => {
       if (path === '/workspaces') return { body: [] }
       if (path === '/workspaces/w1/git') return { body: { is_git_repo: false, head: null, branch: null, dirty_file_count: null } }
@@ -83,8 +85,23 @@ describe('WorkspaceDetail — abas', () => {
     const contexto = await screen.findByRole('tab', { name: /Contexto/ })
     const tarefas = screen.getByRole('tab', { name: /Tarefas/ })
     expect(contexto).toBeEnabled()
-    expect(tarefas).toBeDisabled()
-    expect(within(tarefas).getByText('· fase futura')).toBeInTheDocument()
+    expect(tarefas).toBeEnabled()
+    expect(screen.queryByText('· fase futura')).not.toBeInTheDocument()
+  })
+
+  it('troca para o painel de tarefas ao clicar na aba', async () => {
+    installRouter((method, path) => {
+      if (path === '/workspaces') return { body: [] }
+      if (path === '/workspaces/w1/git') return { body: { is_git_repo: false, head: null, branch: null, dirty_file_count: null } }
+      if (path === '/workspaces/w1/tasks') return { body: [] }
+      return { status: 404, body: {} }
+    })
+
+    renderDetail(workspaceFixture())
+
+    fireEvent.click(await screen.findByRole('tab', { name: /Tarefas/ }))
+
+    expect(await screen.findByText('Nova tarefa')).toBeInTheDocument()
   })
 
   it('troca para o painel de contexto ao clicar na aba', async () => {

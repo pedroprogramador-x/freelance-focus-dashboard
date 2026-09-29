@@ -18,9 +18,11 @@ from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy import Engine, event
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import AppSettings, get_settings
+from app.db.conflicts import WriteConflict, is_write_conflict
 
 
 def _configure_connection(dbapi_connection: Any, _record: Any) -> None:
@@ -64,11 +66,34 @@ def session_scope(factory: sessionmaker[Session]) -> Iterator[Session]:
 
     Erro de invariante **não** falha em silêncio ([15] do prompt da E2 e a lição do
     `upsert` comercial): a exceção sobe depois do rollback.
+
+    ## O `COMMIT` também pode perder uma corrida (E6-AUD3-002)
+
+    O `COMMIT` final acontece **aqui**, depois de o comando ter retornado — fora de
+    qualquer `try` do Orchestrator. Um conflito nesse ponto subia como `OperationalError`
+    cru e virava `500`, apesar de ser o mesmo fato que a linha anterior do fluxo já sabe
+    traduzir: alguém commitou primeiro.
+
+    A ordem importa e é a de [04] §5 para toda releitura pós-conflito: **rollback antes de
+    qualquer outra coisa**. A sessão perdedora ainda segura o *snapshot* que o SQLite
+    recusou, e uma leitura antes do rollback responderia com o estado que a vencedora já
+    substituiu.
+
+    `is_write_conflict` é o classificador único de `db/conflicts.py`, conservador por
+    desenho: o que ele não reconhece sobe **como está**, sem mascaramento.
     """
     session = factory()
     try:
         yield session
         session.commit()
+    except OperationalError as error:
+        session.rollback()
+        if not is_write_conflict(error):
+            raise
+        raise WriteConflict(
+            "a transação não pôde ser fechada porque outra escrita concorrente commitou "
+            "primeiro; nada desta operação foi persistido ([02] §4)"
+        ) from error
     except Exception:
         session.rollback()
         raise

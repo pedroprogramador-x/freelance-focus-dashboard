@@ -40,11 +40,17 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.context_engine.content_hash import compute_content_hash, normalize_structured
+from app.context_engine.content_hash import (
+    compute_content_hash,
+    compute_edit_hash,
+    normalize_structured,
+)
 from app.context_engine.errors import (
+    ContextChanged,
     ContextEntryNotFound,
     InvalidContextEntry,
     InvalidSourceRefs,
+    RedactedContentRejected,
 )
 from app.context_engine.source_ref_expansion import (
     ExpansionStatus,
@@ -62,6 +68,7 @@ from app.db.enums import ContextDomain, ContextOrigin, ContextState, StaleReason
 from app.db.models import ContextRegistryEntry, DevWorkspace
 from app.safety.canonical import CanonicalizationError, canonical_json
 from app.safety.policy import SafetyPolicy
+from app.safety.redaction import contains_redaction_marker
 from app.safety.types import SafetyDecision
 
 #: [02] §2: `title` é `String(255)`. O SQLite não recusa um VARCHAR longo (E3-AUD-007), e
@@ -87,18 +94,50 @@ UNSET = _Unset.SENTINEL
 # --------------------------------------------------------------------------- validação
 
 
+def _reject_redaction_markers(campo: str, valor: object) -> None:
+    """Recusa conteúdo autoral que carregue marcador de redação (E6-AUD4-004).
+
+    Vale para toda escrita do registry — `POST`, `PATCH` e o seed de importação —, porque
+    as três desembocam nos mesmos limpadores. Pôr a guarda aqui, e não na borda HTTP, é a
+    mesma razão de E3-AUD-007: um chamador interno não passa pelo Pydantic, e o invariante
+    é do domínio.
+
+    A varredura entra em `structured` inteiro, **chave e valor**, em qualquer profundidade:
+    é exatamente onde a resposta redigida põe `«chave redigida N»`, e um `PATCH` que
+    devolvesse o documento inteiro reescreveria os nomes de campo com os placeholders.
+    """
+    if isinstance(valor, str):
+        if contains_redaction_marker(valor):
+            raise RedactedContentRejected(
+                f"{campo} contém marcador de redação e não pode ser persistido como "
+                "conteúdo autoral; use POST /api/context/{entry_id}/edit-view para obter "
+                "o conteúdo cru antes de editar"
+            )
+        return
+    if isinstance(valor, dict):
+        for chave, item in valor.items():
+            _reject_redaction_markers(f"{campo} (chave)", chave)
+            _reject_redaction_markers(campo, item)
+        return
+    if isinstance(valor, list | tuple):
+        for item in valor:
+            _reject_redaction_markers(campo, item)
+
+
 def _clean_title(title: str) -> str:
     cleaned = title.strip()
     if not cleaned:
         raise InvalidContextEntry("title não pode ser vazio")
     if len(cleaned) > MAX_TITLE_LENGTH:
         raise InvalidContextEntry(f"title excede {MAX_TITLE_LENGTH} caracteres")
+    _reject_redaction_markers("title", cleaned)
     return cleaned
 
 
 def _clean_body(body: str) -> str:
     if not body or not body.strip():
         raise InvalidContextEntry("body não pode ser vazio")
+    _reject_redaction_markers("body", body)
     return body
 
 
@@ -111,6 +150,7 @@ def _clean_tags(tags: list[str] | None) -> list[str]:
     if not tags:
         return []
     cleaned = [tag.strip() for tag in tags if tag and tag.strip()]
+    _reject_redaction_markers("tags", cleaned)
     return sorted(dict.fromkeys(cleaned))
 
 
@@ -126,7 +166,23 @@ def _clean_structured(structured: dict[str, Any] | None) -> dict[str, Any] | Non
         canonical_json(structured)
     except CanonicalizationError as error:
         raise InvalidContextEntry(f"structured não é canonizável: {error}") from error
+    _reject_redaction_markers("structured", structured)
     return structured
+
+
+def edit_hash_of(entry: ContextRegistryEntry) -> str:
+    """A versão de edição da entrada — **derivada**, nunca uma coluna.
+
+    Persistir seria criar um segundo lugar onde a verdade mora, com todos os modos de falha
+    de cache invalidado: uma escrita que esquecesse de atualizá-la produziria um `409`
+    fantasma, ou pior, deixaria passar a corrida que ela existe para pegar. Derivar custa um
+    `sha256` por leitura e não pode ficar defasado.
+    """
+    return compute_edit_hash(
+        content_hash=entry.content_hash,
+        tags=list(entry.tags),
+        source_refs=list(entry.source_refs),
+    )
 
 
 def _content_hash_of(entry: ContextRegistryEntry) -> str:
@@ -311,6 +367,7 @@ def update_entry(
     session: Session,
     entry: ContextRegistryEntry,
     *,
+    expected_edit_hash: str,
     title: str | _Unset = UNSET,
     body: str | _Unset = UNSET,
     structured: dict[str, Any] | None | _Unset = UNSET,
@@ -327,7 +384,38 @@ def update_entry(
 
     A ordem importa. O `content_hash` é recalculado a partir dos valores **já aplicados**,
     e o baseline só é mexido depois, e só se `source_refs` foi informado.
+
+    ## `expected_edit_hash` é obrigatório, e cobre **tudo** que o PATCH pode mudar
+
+    Ele é o `edit_hash` que o editor leu quando abriu a entrada. Divergiu, alguém escreveu no
+    meio e a edição é recusada com `409` sem sobrescrever nada — controle de concorrência
+    **otimista**: nada é travado, só detectado.
+
+    Ele substituiu `expected_content_hash` em E6-AUD5-004. O `content_hash` é normativo sobre
+    outra pergunta ([03] §2, "a entrada foi editada?") e cobre `domain`/`title`/`body`/
+    `structured` — **não** cobre `tags` nem `source_refs`. Usá-lo como versão da entrada
+    deixava passar a perda de atualização exatamente nesses dois campos: dois editores com a
+    mesma leitura mandavam `tags` diferentes, os dois recebiam `200`, e o segundo apagava o
+    primeiro. O `edit_hash` reaproveita o `content_hash` e acrescenta os dois — sem mudar o
+    que o `content_hash` significa.
+
+    Obrigatório porque opcional é a mesma inversão de modelo que três auditorias seguidas
+    encontraram na redação: uma garantia que o chamador precisa lembrar de pedir nasce
+    ausente em todo cliente novo, e o esquecimento é silencioso.
+
+    A comparação acontece **dentro da mesma transação** da escrita: o `edit_hash` atual é
+    recalculado a partir do estado que a sessão enxerga, e o `flush` da escrita acontece sem
+    sair dela.
     """
+    # A comparação vem antes de qualquer validação: recusar por conflito não deve depender
+    # de o corpo novo estar bem formado, e um `409` é mais informativo que um `422` quando
+    # as duas coisas são verdade.
+    if edit_hash_of(entry) != expected_edit_hash:
+        raise ContextChanged(
+            f"a entrada '{entry.id}' mudou desde a leitura: o estado atual não "
+            "corresponde ao expected_edit_hash enviado"
+        )
+
     # Tudo é validado e calculado antes de qualquer atribuição: uma recusa em `source_refs`
     # não pode deixar `title` e `body` já trocados no objeto.
     novo_titulo = _clean_title(title) if title is not UNSET else None

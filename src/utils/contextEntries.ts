@@ -4,7 +4,12 @@
 // como cada um dos quatro estados de docs/architecture/03 §3 é apresentado, e como o
 // `PATCH` distingue "campo ausente" de "campo informado".
 
-import type { ContextEntry, ContextEntryUpdateInput, ContextDomain } from '../services/contextApi'
+import type {
+  ContextEditView,
+  ContextEntry,
+  ContextEntryUpdateInput,
+  ContextDomain,
+} from '../services/contextApi'
 import { WorkspaceApiError } from '../services/workspaceApi'
 
 export function messageOf(error: unknown): string {
@@ -108,12 +113,23 @@ export function parseStructured(text: string): StructuredParse {
 // `source_refs` sempre — mesmo idêntico — faria o backend reconfirmar a linha de base a
 // cada correção de digitação no corpo, e uma entrada `stale` "curaria" sozinha ao ser
 // editada. Omitir o campo é o que preserva o baseline; mandá-lo é um ato deliberado.
+// O formulário partindo do conteúdo **cru** de `edit-view`, e não da projeção redigida.
+// `tags` e `sourceRefs` continuam vindo da projeção: o contrato de `ContextEditViewResponse`
+// carrega só os três campos que podem ser texto longo, e é de propósito estreito.
+export const editFormOf = (projecao: EntryForm, view: ContextEditView): EntryForm => ({
+  ...projecao,
+  title: view.title,
+  body: view.body,
+  structuredText: view.structured ? JSON.stringify(view.structured, null, 2) : '',
+})
+
 export function buildEntryPatch(
   form: EntryForm,
   baseline: EntryForm,
   structured: Record<string, unknown> | null,
+  expectedEditHash: string,
 ): ContextEntryUpdateInput {
-  const patch: ContextEntryUpdateInput = {}
+  const patch: ContextEntryUpdateInput = { expected_edit_hash: expectedEditHash }
   if (form.title !== baseline.title) patch.title = form.title
   if (form.body !== baseline.body) patch.body = form.body
   if (form.structuredText !== baseline.structuredText) patch.structured = structured

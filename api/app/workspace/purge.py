@@ -54,7 +54,7 @@ from app.workspace.errors import (
     WorkspaceBenchmarkProtected,
     WorkspacePurgeBlocked,
 )
-from app.workspace.purge_tokens import PurgeTokenStore
+from app.workspace.purge_tokens import PurgeTokenStore, workspace_subject
 from app.workspace.service import get_workspace
 
 _TERMINAL_TASK_STATUSES = (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED)
@@ -184,7 +184,7 @@ def execute_purge(
     (`status == archived`, nenhuma task não-terminal) → executar. Um token consumido não
     volta, mesmo que a revalidação falhe depois.
     """
-    if not store.consume(workspace_id, purge_token):
+    if not store.consume(workspace_subject(workspace_id), purge_token):
         raise PurgeTokenRejected("purga não autorizada")
 
     workspace = get_workspace(session, workspace_id)

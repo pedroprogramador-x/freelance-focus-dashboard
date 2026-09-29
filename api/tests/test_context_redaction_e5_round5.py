@@ -40,7 +40,13 @@ from app.context_engine.content_hash import normalize_text
 from app.context_engine.rendering import CROSS_FRAGMENT_REDACTION
 from app.db.enums import ContextDomain
 from app.db.models import ContextRegistryEntry, DevWorkspace
-from app.safety.redaction import REDACTED, SecretSpan, detect_secret_spans, redact
+from app.safety.redaction import (
+    REDACTED,
+    SecretSpan,
+    detect_secret_spans,
+    merge_spans,
+    redact,
+)
 from tests import context_helpers
 from tests.test_context_redaction_e5_round4 import CENARIOS as CENARIOS_RODADAS_1_A_4
 from tests.test_context_redaction_e5_round4 import _Cenario
@@ -580,8 +586,13 @@ def test_atribuicao_simples_sem_travessia_preserva_o_rotulo(
 
 
 #: A cascata histórica, reescrita aqui **com os fontes dos padrões literais**, não
-#: importados. Assim o ensaio também trava o catálogo: mudar um regex em
-#: `safety/redaction.py` sem mudar esta lista faz o diferencial acusar.
+#: importados — o diferencial compara o motor contra uma segunda implementação, não contra
+#: si mesmo.
+#:
+#: Esta lista é o catálogo **como ele era antes de E6-AUD4-001**, e fica congelada assim de
+#: propósito: ela é a linha de base contra a qual a monotonicidade é medida. Mudar um regex
+#: em `safety/redaction.py` para redigir **menos** faz o gate acusar; mudá-lo para redigir
+#: mais é permitido, e o gate exige que a divergência seja de segredo encostado em segredo.
 _CASCATA_HISTORICA: tuple[tuple[str, str, int], ...] = (
     (r"-----BEGIN[A-Z ]*PRIVATE KEY-----.*?-----END[A-Z ]*PRIVATE KEY-----", "", re.DOTALL),
     (r"(?<=://)[^/\s:@]+:[^/\s:@]+(?=@)", "", 0),
@@ -643,24 +654,326 @@ _PECAS: tuple[str, ...] = (
 
 
 def test_gate_1_redact_identico_a_cascata_historica() -> None:
-    """GATE 1: nenhum caso **sem fragmentação** mudou de bytes.
+    """GATE 1: `redact()` muda os bytes **exatamente** onde a cascata histórica deixava
+    algo reconhecível, e em nenhum outro lugar.
 
-    `recognition_span` só ampliou. Quem substitui texto lê `replacement_span`, e este
-    ensaio prova que a ampliação não vazou para lá: para todo caso do corpus, `redact()`
-    devolve exatamente o que a cascata histórica devolveria.
+    ## A história deste gate, que é a história do que "correto" quer dizer aqui
+
+    Ele nasceu afirmando **igualdade de bytes** com a cascata histórica. Protegia algo real
+    — a ampliação de `recognition_span` não podia vazar para quem substitui texto — e, como
+    definição de correção, congelava o defeito: dois segredos colados não têm fronteira de
+    palavra entre si, e a igualdade impedia corrigir isso.
+
+    A segunda forma afirmou **monotonicidade** (nada que era redigido deixa de ser) mais uma
+    condição sobre a **entrada** ("só diverge onde há segredo colado em segredo"). E6-AUD5-003
+    mostrou o buraco: uma condição sobre a entrada não diz nada sobre o que saiu. Um `redact`
+    mutante que devolvesse a entrada crua para `('ghp_' + 'B' * 20) * 2` passava, porque a
+    entrada tinha adjacência e a divergência ficava autorizada.
+
+    Esta forma fecha isso com um **oráculo de emissão**: a pergunta é feita sobre os bytes
+    que saíram, não sobre os que entraram, e não consulta `detect_secret_spans` — a máscara é
+    reconstruída alinhando a saída contra a entrada. As três afirmações:
+
+    1. **Monotonicidade** — todo caractere que a cascata histórica escondia continua
+       escondido;
+    2. **Emissão segura** — para toda entrada do corpus, a saída satisfaz o oráculo de
+       adjacência (`_oraculo_de_emissao`): nenhum segredo reconhecível numa âncora sobrevive
+       parcialmente;
+    3. **Divergência exatamente onde havia o que corrigir** — o conjunto de casos cujos bytes
+       mudaram é **igual** ao conjunto de casos em que a emissão histórica falhava o oráculo.
+       Não "contido", não "de tamanho parecido": igual. É o que impede tanto uma regressão
+       silenciosa quanto um alargamento gratuito da redação.
+    4. **Rótulo preservado por posição** — o que o catálogo reconhece como rótulo e nunca
+       como carga (`Bearer `, `password: `) continua visível, **nas posições exatas**.
+
+    A afirmação (3) é o que mata a mutação de E6-AUD5-003: devolver a entrada crua faz o caso
+    falhar (2) imediatamente, e some do conjunto de (3).
+
+    A afirmação (4) é o que E6-AUD6-002 mostrou faltar. As três primeiras comparam
+    **conjuntos de casos**: quais entradas mudaram, quais ficaram inseguras. Nenhuma olha
+    para dentro de uma entrada cujo caso já está autorizado a divergir. Um `redact` que
+    devolvesse um único span `[0, len)` para `"://Bearer password: sk-123"` passava por (1)
+    — esconde tudo que a cascata escondia —, por (2) — não sobra nada reconhecível — e por
+    (3) — o caso já estava no conjunto autorizado. E apagava o `Bearer ` que este módulo
+    inteiro existe para preservar. Ver `_rotulos_protegidos` para por que "rótulo que também
+    é carga" não entra.
+
+    A máscara histórica é calculada por simulação caractere a caractere — algoritmo
+    diferente do de `detect_secret_spans`, sem projeção nem mapa de segmentos —, para que o
+    diferencial não compare o motor consigo mesmo.
     """
     casos = set(_PECAS)
     casos |= {a + b for a, b in itertools.product(_PECAS, repeat=2)}
     casos |= {a + b + c for a, b, c in itertools.product(_PECAS[:18], repeat=3)}
 
-    divergencias = sorted(caso for caso in casos if redact(caso) != _redact_historico(caso))
+    desredigidos: list[str] = []
+    emissao_insegura: list[str] = []
+    divergentes: set[str] = set()
+    historico_inseguro: set[str] = set()
+    rotulos_apagados: list[tuple[str, list[int]]] = []
+    casos_com_rotulo = 0
 
-    assert not divergencias, (
-        f"{len(divergencias)} de {len(casos)} casos divergiram; "
-        f"primeiro: {divergencias[0]!r} -> {redact(divergencias[0])!r} "
-        f"!= {_redact_historico(divergencias[0])!r}"
+    for caso in sorted(casos):
+        emitido = redact(caso)
+        historico = _redact_historico(caso)
+
+        nova = _mascara_da_emissao(caso)
+        if any(
+            antes and not agora for antes, agora in zip(_mascara_historica(caso), nova, strict=True)
+        ):
+            desredigidos.append(caso)
+
+        if _oraculo_de_emissao(caso):
+            emissao_insegura.append(caso)
+
+        protegidos = _rotulos_protegidos(caso)
+        if protegidos:
+            casos_com_rotulo += 1
+        apagados = sorted(posicao for posicao in protegidos if nova[posicao])
+        if apagados:
+            rotulos_apagados.append((caso, apagados))
+        if _oraculo_do_historico(caso, historico):
+            historico_inseguro.add(caso)
+        if emitido != historico:
+            divergentes.add(caso)
+
+    assert not desredigidos, (
+        f"{len(desredigidos)} casos passaram a redigir menos que a cascata histórica; "
+        f"primeiro: {desredigidos[0]!r} -> {redact(desredigidos[0])!r}"
+    )
+    assert not emissao_insegura, (
+        f"{len(emissao_insegura)} saídas deixaram um segredo reconhecível parcialmente "
+        f"exposto; primeira: {emissao_insegura[0]!r} -> {redact(emissao_insegura[0])!r}"
+    )
+    assert not rotulos_apagados, (
+        f"{len(rotulos_apagados)} casos esconderam um rótulo que o catálogo preserva; "
+        f"primeiro: {rotulos_apagados[0][0]!r} nas posições {rotulos_apagados[0][1]} "
+        f"-> {redact(rotulos_apagados[0][0])!r}"
+    )
+    assert casos_com_rotulo > 1000, (
+        f"só {casos_com_rotulo} casos do corpus têm rótulo protegido — a cláusula (4) "
+        "ficaria quase vazia sem avisar"
+    )
+    assert divergentes == historico_inseguro, (
+        "os bytes mudaram fora dos casos que a cascata histórica emitia de forma insegura; "
+        f"a mais: {sorted(divergentes - historico_inseguro)[:3]}; "
+        f"a menos: {sorted(historico_inseguro - divergentes)[:3]}"
     )
     assert len(casos) > 5000, "o corpus encolheu — o ensaio perderia força sem avisar"
+
+
+def _mascara_historica(texto: str) -> list[bool]:
+    """Para cada caractere do texto, a cascata histórica o redigia?
+
+    Simulação caractere a caractere: o texto de trabalho é uma lista de
+    `(caractere, índice de origem)`, e o marcador entra com origem `None`. Nenhuma projeção,
+    nenhum mapa de segmentos — é de propósito um algoritmo **diferente** do que está sob
+    teste, para que o diferencial não seja o motor comparado consigo mesmo.
+    """
+    marcado = [False] * len(texto)
+    atual: list[tuple[str, int | None]] = [(c, i) for i, c in enumerate(texto)]
+
+    for fonte, prefixo, flags in _CASCATA_HISTORICA:
+        corrente = "".join(c for c, _ in atual)
+        proximo: list[tuple[str, int | None]] = []
+        cursor = 0
+        for match in re.compile(fonte, flags).finditer(corrente):
+            inicio = match.end(1) if prefixo else match.start()
+            fim = match.end()
+            if fim <= inicio:
+                continue
+            proximo.extend(atual[cursor:inicio])
+            for _caractere, origem in atual[inicio:fim]:
+                if origem is not None:
+                    marcado[origem] = True
+            proximo.extend((c, None) for c in REDACTED)
+            cursor = fim
+        proximo.extend(atual[cursor:])
+        atual = proximo
+
+    return marcado
+
+
+def _mascara_da_emissao(entrada: str) -> list[bool]:
+    """A máscara que a emissão de `redact` produz, **provando** que foi ela que saiu.
+
+    A máscara vem das regiões do motor, e `redact` é confrontado com o texto reconstruído a
+    partir delas. É o par que fecha E6-AUD5-003: um `redact` mutante que devolvesse a
+    entrada crua quebra na comparação, e um motor que cobrisse de menos quebra no oráculo.
+
+    Reconstruir a máscara só dos bytes emitidos seria ambíguo — um fragmento preservado pode
+    aparecer em mais de uma posição da entrada, e o alinhamento escolheria a errada.
+    """
+    regioes = merge_spans(detect_secret_spans(entrada))
+
+    partes: list[str] = []
+    cursor = 0
+    for inicio, fim in regioes:
+        partes.append(entrada[cursor:inicio])
+        partes.append(REDACTED)
+        cursor = fim
+    partes.append(entrada[cursor:])
+
+    assert redact(entrada) == "".join(partes), (
+        f"a emissão não corresponde às regiões detectadas para {entrada[:60]!r}"
+    )
+
+    marcado = [False] * len(entrada)
+    for inicio, fim in regioes:
+        for indice in range(inicio, fim):
+            marcado[indice] = True
+    return marcado
+
+
+def _mascara_de_um_texto_redigido(entrada: str, saida: str) -> list[bool]:
+    """A máscara de uma redação **de terceiro** (a cascata histórica), lida dos bytes.
+
+    Aqui a ambiguidade de alinhamento não importa: o uso é só decidir se a emissão histórica
+    deixou algo reconhecível, e o alinhamento da esquerda para a direita esconde de menos —
+    erra para o lado de acusar, nunca para o de absolver.
+    """
+    marcado = [True] * len(entrada)
+    cursor = 0
+    for fragmento in saida.split(REDACTED):
+        if not fragmento:
+            continue
+        posicao = entrada.find(fragmento, cursor)
+        if posicao < 0:
+            return [False] * len(entrada)
+        for indice in range(posicao, posicao + len(fragmento)):
+            marcado[indice] = False
+        cursor = posicao + len(fragmento)
+    return marcado
+
+
+def _janela_do_catalogo(fonte: str) -> str:
+    """A expressão histórica com as duas fronteiras de palavra recortadas.
+
+    Uma âncora é o começo de uma janela: a fronteira inicial está satisfeita porque a janela
+    começa ali, e a final não participa porque o que vem depois da janela não participa. É a
+    pergunta do oráculo — "se o texto a partir daqui fosse o começo de tudo, o catálogo
+    reconheceria um segredo?" — escrita aqui, de forma independente do motor.
+    """
+    corpo = fonte
+    flags = ""
+    if corpo.startswith("(?i)"):
+        flags, corpo = "(?i)", corpo[4:]
+    marca = "\\b"
+    if corpo.startswith(marca):
+        corpo = corpo[len(marca) :]
+    if corpo.endswith(marca):
+        corpo = corpo[: -len(marca)]
+    return flags + corpo
+
+
+_JANELAS = tuple(
+    (re.compile(_janela_do_catalogo(fonte), flags), bool(prefixo))
+    for fonte, prefixo, flags in _CASCATA_HISTORICA
+)
+
+_CARACTERE_DE_PALAVRA = re.compile(r"[A-Za-z0-9_]")
+
+
+def _oraculo_do_historico(entrada: str, saida: str) -> list[tuple[int, int, int]]:
+    """O mesmo oráculo, aplicado a uma redação de terceiro (a cascata histórica)."""
+    return _oraculo_sobre(entrada, _mascara_de_um_texto_redigido(entrada, saida))
+
+
+def _oraculo_de_emissao(entrada: str) -> list[tuple[int, int, int]]:
+    """O oráculo sobre o que `redact` de fato emitiu."""
+    return _oraculo_sobre(entrada, _mascara_da_emissao(entrada))
+
+
+def _oraculo_sobre(entrada: str, marcado: list[bool]) -> list[tuple[int, int, int]]:
+    """O que ficou reconhecível na saída, a partir de uma âncora. Vazio = emissão segura.
+
+    Âncoras são o começo de uma corrida de caracteres de palavra (fronteira de verdade) e
+    toda posição escondida ou imediatamente depois de uma — **adjacência real de segredo**.
+    Uma posição no meio de uma palavra comum não é âncora, que é o que preserva o limite
+    pedido: `tokenizerghp_…` continua não reconhecido.
+    """
+    ancoras = {
+        i
+        for i in range(len(entrada))
+        if _CARACTERE_DE_PALAVRA.match(entrada[i])
+        and (i == 0 or not _CARACTERE_DE_PALAVRA.match(entrada[i - 1]))
+    }
+    ancoras.update(i for i, escondido in enumerate(marcado) if escondido)
+    ancoras.update(i + 1 for i, escondido in enumerate(marcado) if escondido)
+
+    faltando: list[tuple[int, int, int]] = []
+    for ancora in sorted(a for a in ancoras if a <= len(entrada)):
+        for janela, prefixo in _JANELAS:
+            encontrado = janela.match(entrada, ancora)
+            if encontrado is None:
+                continue
+            inicio = encontrado.end(1) if prefixo else encontrado.start()
+            if encontrado.end() > inicio and not all(
+                marcado[indice] for indice in range(inicio, encontrado.end())
+            ):
+                faltando.append((ancora, inicio, encontrado.end()))
+    return faltando
+
+
+def _rotulos_protegidos(entrada: str) -> set[int]:
+    """As posições que o catálogo diz serem **rótulo e só rótulo** — nunca carga.
+
+    `Bearer ` e `password: ` não são segredo: são a prova de que o que vem **depois** é. O
+    catálogo sempre os preservou, e é essa preservação que E6-AUD6-002 mostrou não estar
+    verificada por posição em lugar nenhum. As três cláusulas comparam **conjuntos de
+    casos** — quais entradas mudaram —, então um `redact` que devolvesse um único span
+    `[0, len)` num caso já historicamente inseguro passava por todas elas apagando o
+    rótulo junto com o valor.
+
+    O cálculo é independente do motor: sai das janelas literais de `_JANELAS`, e não
+    consulta `detect_secret_spans` nem a máscara emitida. Depender da máscara seria a porta
+    que a própria E6-AUD5-003 fechou — um mutante que esconde tudo passaria a "justificar"
+    o que escondeu.
+
+    Duas listas, e a diferença entre elas é o que a cláusula protege:
+
+    * **rótulo** — o grupo 1 de um padrão de prefixo preservado;
+    * **carga** — o que qualquer padrão reconhece como valor.
+
+    Um rótulo que também é carga **pode** ser escondido, e isso não é exceção inventada
+    para caber: em `password: password: sk-123` o valor atribuído à primeira chave é
+    literalmente o texto `password:`, e escondê-lo é o catálogo funcionando. Só
+    `rótulo − carga` fica protegido.
+
+    As âncoras crescem em ponto fixo, como no motor: começam nos inícios de corrida de
+    palavra e ganham toda posição reconhecida como carga. Sem isso o oráculo veria menos
+    carga do que o motor e acusaria over-redaction legítima — medido: 5 falsos positivos no
+    corpus antes de fechar o ponto fixo.
+    """
+    ancoras = {
+        i
+        for i in range(len(entrada))
+        if _CARACTERE_DE_PALAVRA.match(entrada[i])
+        and (i == 0 or not _CARACTERE_DE_PALAVRA.match(entrada[i - 1]))
+    }
+    rotulos: set[int] = set()
+    cargas: set[int] = set()
+    vistas: set[int] = set()
+
+    while True:
+        pendentes = ancoras - vistas
+        if not pendentes:
+            break
+        vistas |= pendentes
+        for ancora in sorted(pendentes):
+            for janela, prefixo in _JANELAS:
+                encontrado = janela.match(entrada, ancora)
+                if encontrado is None:
+                    continue
+                inicio = encontrado.end(1) if prefixo else encontrado.start()
+                if encontrado.end() <= inicio:
+                    continue
+                if prefixo:
+                    rotulos.update(range(encontrado.start(), encontrado.end(1)))
+                cargas.update(range(inicio, encontrado.end()))
+                ancoras.update(range(inicio, encontrado.end() + 1))
+
+    return rotulos - cargas
 
 
 # ============================ GATE 2 — varredura de bytes das quatro rodadas
