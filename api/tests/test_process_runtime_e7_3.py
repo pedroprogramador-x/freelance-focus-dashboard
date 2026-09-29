@@ -1479,6 +1479,53 @@ def test_setsid_segurando_o_pipe_e_detectado(tmp_path: Path, watches: dict[str, 
 
 if sys.platform == "win32":
 
+    class _DiagProcessEntry32(ctypes.Structure):
+        _fields_ = (
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_wchar * 260),
+        )
+
+    _k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    _k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    _k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_DiagProcessEntry32)]
+    _k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_DiagProcessEntry32)]
+
+    def _diag_toolhelp() -> dict[int, dict[str, Any]]:
+        snap = _k32.CreateToolhelp32Snapshot(0x2, 0)
+        found: dict[int, dict[str, Any]] = {}
+        entry = _DiagProcessEntry32()
+        entry.dwSize = ctypes.sizeof(entry)
+        more = _k32.Process32FirstW(snap, ctypes.byref(entry))
+        while more:
+            found[int(entry.th32ProcessID)] = {
+                "exe": entry.szExeFile,
+                "parent": int(entry.th32ParentProcessID),
+            }
+            more = _k32.Process32NextW(snap, ctypes.byref(entry))
+        _k32.CloseHandle(snap)
+        return found
+
+    def _diag_image_error(pid: int) -> Any:
+        handle = backend_module._OpenProcess(
+            backend_module._PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return {"open_error": ctypes.get_last_error()}
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buffer))
+        ok = backend_module._QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size))
+        error = ctypes.get_last_error()
+        backend_module._CloseHandle(handle)
+        return {"ok": bool(ok), "error": None if ok else error, "value": buffer.value}
+
     def _diag_describe(tree: Any) -> dict[str, Any]:
         job = tree._job
         entries: list[dict[str, Any]] = []
@@ -1489,6 +1536,8 @@ if sys.platform == "win32":
         for pid in pids:
             entry: dict[str, Any] = {"pid": pid, "is_root": pid == tree.popen.pid}
             entry["image"] = backend_module._image_path(pid)
+            entry["image_error"] = _diag_image_error(pid)
+            entry["toolhelp"] = _diag_toolhelp().get(pid)
             entry["is_console_host"] = backend_module._is_console_host(pid)
             handle = backend_module._OpenProcess(
                 backend_module._SYNCHRONIZE | backend_module._PROCESS_QUERY_LIMITED_INFORMATION,
