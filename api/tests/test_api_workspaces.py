@@ -67,6 +67,9 @@ def test_cria_workspace_e_aparece_na_listagem(auth_api_client: TestClient, tmp_p
     assert corpo["linked_project_id"] is None
     assert corpo["repository_url"] is None
     assert Path(corpo["local_path"]).samefile(directory)
+    # `test_config` entrou na E6 ([04] §6): a `TestPolicy` do workspace. Nasce `null` —
+    # "sem Test Runner configurado" ([02] §7) —, e é o `PATCH` que a define.
+    assert corpo["test_config"] is None
     assert set(corpo) == {
         "id",
         "name",
@@ -76,6 +79,7 @@ def test_cria_workspace_e_aparece_na_listagem(auth_api_client: TestClient, tmp_p
         "repository_url",
         "default_branch",
         "status",
+        "test_config",
         "created_at",
         "updated_at",
     }

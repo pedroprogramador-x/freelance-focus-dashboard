@@ -4,6 +4,7 @@ import { Modal } from '../components/Modal'
 import { useWorkspaces } from '../context/WorkspaceProvider'
 import { messageOf } from '../utils/contextEntries'
 import { ContextTab } from './WorkspaceContext'
+import { TasksTab } from './WorkspaceTasks'
 import {
   getGitPreflight,
   getPurgePreview,
@@ -17,9 +18,9 @@ type WorkspaceTab = 'overview' | 'context' | 'tasks'
 
 const TABS: { id: WorkspaceTab; label: string; enabled: boolean }[] = [
   { id: 'overview', label: 'Visão geral', enabled: true },
-  // Ativa a partir da E4 (Context Registry). Tarefas continuam em fase futura (E6).
+  // Contexto desde a E4 (Context Registry); Tarefas desde a E6 (Orchestrator Planner).
   { id: 'context', label: 'Contexto', enabled: true },
-  { id: 'tasks', label: 'Tarefas', enabled: false },
+  { id: 'tasks', label: 'Tarefas', enabled: true },
 ]
 
 const PURGE_ROWS: { key: keyof PurgePreview; label: string }[] = [
@@ -244,6 +245,9 @@ export function WorkspaceDetail({ workspace, onBack }: { workspace: Workspace; o
           </div>
         )}
         {tab === 'context' && <ContextTab workspaceId={workspace.id} />}
+        {tab === 'tasks' && (
+          <TasksTab workspaceId={workspace.id} workspaceStatus={workspace.status} />
+        )}
       </section>
     </div>
   )

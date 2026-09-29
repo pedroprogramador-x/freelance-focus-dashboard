@@ -507,6 +507,651 @@ def test_expansor_e_o_unico_a_decidir_gramatica_dentro_do_safety() -> None:
     )
 
 
+def test_orchestrator_nao_importa_camadas_superiores_nem_adaptador() -> None:
+    """Regra de módulo da E6 ([01] §2, contrato de `orchestrator/`).
+
+    Pode importar `db`, `context_engine`, `git_runtime`, `safety`, `workspace` (leitura) e
+    `config`. **Não** pode importar `api` — isso inverteria a direção de L4→L3 — nem
+    `agent_runtime`/`tool_executor`, que são L1 e chegam **por injeção**.
+
+    A proibição de adaptador concreto já é coberta por
+    `test_nenhum_provider_ou_agente_e_importado`, que roda sobre todos os módulos.
+    """
+    proibidos = {
+        "app.api",
+        "app.main",
+        "app.agent_runtime",
+        "app.tool_executor",
+        "fastapi",
+        "starlette",
+    }
+
+    for path in (APP_ROOT / "orchestrator").rglob("*.py"):
+        for imported in _imports(path):
+            root = imported.split(".")[0]
+            assert imported not in proibidos and root not in proibidos, (
+                f"orchestrator/{path.name} importa `{imported}`: [01] §2 proíbe"
+            )
+
+
+def test_orchestrator_recebe_as_portas_por_injecao() -> None:
+    """[01] §2: o Orchestrator "recebe por injeção — não os procura".
+
+    As duas portas desta fase (`AnalyzerEnrichmentPort`, `CapabilityProver`) são
+    `Protocol` e chegam por parâmetro. Um *registry*, um `importlib` ou um dicionário de
+    nome→classe seria o lookup que a neutralidade de provider proíbe.
+    """
+    for path in (APP_ROOT / "orchestrator").rglob("*.py"):
+        imports = _imports(path)
+        assert "importlib" not in imports, (
+            f"orchestrator/{path.name} importa `importlib`: resolução dinâmica de "
+            "implementação é lookup, e o Orchestrator não faz lookup"
+        )
+        assert "pkgutil" not in imports
+        assert "entry_points" not in path.read_text(encoding="utf-8")
+
+
+def test_somente_o_orchestrator_escreve_as_quatro_entidades() -> None:
+    """[01] §2: "único módulo que escreve `WorkspaceTask`, `Run`, `AuditFinding` e
+    `SafetyEvent`".
+
+    A verificação é por **construção do modelo** (`WorkspaceTask(...)`, `SafetyEvent(...)`)
+    e por `session.delete`, que são as duas formas de um módulo criar ou remover uma dessas
+    linhas. `tests/` fica de fora: `context_helpers.make_task` existe justamente para
+    satisfazer FK sem passar pela máquina de estados, e é declarado como não-produção.
+
+    `workspace/purge.py` é a exceção **nomeada**: [02] §11 dá a purga de workspace ao
+    agregado `workspace/`, e a remoção em cascata leva as tasks junto. Ela remove linhas
+    por FK, nunca transiciona nem cria nenhuma.
+    """
+    entidades = {"WorkspaceTask", "Run", "AuditFinding", "SafetyEvent"}
+    dono = APP_ROOT / "orchestrator"
+    excecao_purga = APP_ROOT / "workspace" / "purge.py"
+
+    for path in ALL_FILES:
+        if path.is_relative_to(dono) or path == excecao_purga:
+            continue
+        # `db/models.py` **define** as classes; definir não é escrever.
+        if path.is_relative_to(APP_ROOT / "db"):
+            continue
+
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        construcoes = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in entidades
+        }
+        assert not construcoes, (
+            f"{_module_name(path)} constrói {sorted(construcoes)}: só o Execution Manager "
+            "escreve essas entidades ([01] §2)"
+        )
+
+
+def test_orchestrator_nao_reimplementa_hash_nem_casamento_de_padrao() -> None:
+    """Nenhuma segunda `canonical_json`, nenhum segundo casador de glob, nenhum `sha256`
+    solto.
+
+    O Orchestrator **compõe** hashes (`canonical_sha256` de `safety/`) e **consulta**
+    cobertura (`SourceRefMatcher` de `context_engine/`). Um `hashlib.sha256` direto aqui
+    seria uma segunda definição de "como se hasheia", que é o defeito que
+    `safety/canonical.py` existe para impedir ([02] §7: "uma única definição, para que dois
+    módulos não inventem duas normalizações").
+    """
+    for path in (APP_ROOT / "orchestrator").rglob("*.py"):
+        imports = _imports(path)
+        assert "hashlib" not in imports, (
+            f"orchestrator/{path.name} importa `hashlib`: hashing canônico é "
+            "`safety.canonical` ([02] §7)"
+        )
+        assert "json" not in imports, (
+            f"orchestrator/{path.name} importa `json`: serialização canônica é "
+            "`safety.canonical.canonical_json`"
+        )
+
+
+#: Onde `detect_sensitive_objective_signals` pode morar. É `safety/`, e só: ela compõe
+#: `is_sensitive_key` com `classify_path_secrecy`, e o Orchestrator a **consome**
+#: (E6-AUD-009).
+_OBJECTIVE_SIGNALS_OWNER = APP_ROOT / "safety" / "objective_signals.py"
+
+#: Quantos nomes canônicos, citados como literal, caracterizam uma cópia da lista. Um ou
+#: dois podem aparecer numa mensagem de erro legítima; três já é a tabela reescrita.
+_NOMES_QUE_CARACTERIZAM_COPIA = 3
+
+
+def test_sinal_de_segredo_no_objetivo_vive_so_em_safety() -> None:
+    """E6-AUD-009: o Orchestrator importa a função pronta; não a reimplementa.
+
+    Escrevê-la em `orchestrator/analyzer.py` exigiria uma segunda lista de nomes sensíveis
+    e uma segunda denylist de caminho — a mesma classe de defeito que E2-AUD-003 fechou
+    para glob e que `test_deteccao_de_segredo_tem_dono_unico` já barra para os padrões de
+    conteúdo. Aqui a regra é sobre a **função**: ela é definida num lugar só.
+    """
+    definidores = [
+        path
+        for path in ALL_FILES
+        if "def detect_sensitive_objective_signals" in path.read_text(encoding="utf-8")
+    ]
+
+    assert definidores == [_OBJECTIVE_SIGNALS_OWNER], (
+        "`detect_sensitive_objective_signals` tem de ser definida só em "
+        f"safety/objective_signals.py; encontrada em {[_module_name(p) for p in definidores]}"
+    )
+
+
+def test_orchestrator_nao_tem_segunda_lista_de_nomes_sensiveis_nem_denylist() -> None:
+    """Nenhuma tabela de segredo dentro de `orchestrator/`.
+
+    A verificação é sobre **conteúdo de dado**: os nomes de campo que
+    `safety/redaction.py` lista, e os padrões de caminho que `safety/secrets.py` lista.
+    `HIGH_RISK_PATH_RULES` do Analyzer é uma tabela de **risco** que cita alguns dos
+    mesmos caminhos de propósito ([03] §5 manda citá-los), então a regra não pode ser "não
+    mencione `.env`" — ela é "não redefina a *lista de nomes de credencial*", que é o que
+    duplicaria `_SENSITIVE_KEY_WORDS`.
+    """
+    from app.safety.redaction import _SENSITIVE_KEY_NAMES
+
+    for path in (APP_ROOT / "orchestrator").rglob("*.py"):
+        fonte = path.read_text(encoding="utf-8")
+        # Uma lista literal com ≥ 3 dos nomes canônicos é, na prática, a lista copiada.
+        repetidos = [nome for nome in _SENSITIVE_KEY_NAMES if f'"{nome}"' in fonte]
+        assert len(repetidos) < _NOMES_QUE_CARACTERIZAM_COPIA, (
+            f"orchestrator/{path.name} parece conter uma segunda lista de nomes "
+            f"sensíveis ({sorted(repetidos)}): ela pertence a safety/redaction.py"
+        )
+
+
+# ------------------------------------------------- boundary de saída ([04] §5, E6-AUD3)
+
+#: O único módulo autorizado a nomear o `JSONResponse` cru do Starlette: é onde
+#: `RedactingJSONResponse` o subclassa.
+_RESPONSE_BOUNDARY_OWNER = APP_ROOT / "api" / "responses.py"
+
+#: As únicas classes que uma rota pode declarar em `response_class=`.
+#:
+#: `HTMLResponse` e `Response` vivem fora do boundary porque não carregam JSON: o HTML de
+#: bootstrap e o `204` sem corpo, os dois com contrato próprio em [04] §5.
+#: `EditViewJSONResponse` carrega JSON e **não** redige — é a exceção estreita de
+#: E6-AUD4-004, e é `test_o_conjunto_de_respostas_sem_redacao_e_fechado` que a mantém em
+#: um único ponto de uso. Estar nesta lista autoriza o nome; não autoriza a segunda rota.
+_NON_JSON_RESPONSES = frozenset(
+    {"HTMLResponse", "Response", "RedactingJSONResponse", "EditViewJSONResponse"}
+)
+
+
+def _route_functions(tree: ast.Module) -> list[ast.FunctionDef]:
+    """Funções decoradas com `@router.<verbo>(...)` — os *endpoints* propriamente ditos."""
+    encontradas: list[ast.FunctionDef] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for decorator in node.decorator_list:
+            alvo = decorator.func if isinstance(decorator, ast.Call) else decorator
+            if isinstance(alvo, ast.Attribute) and ast.unparse(alvo).startswith("router."):
+                encontradas.append(node)
+                break
+    return encontradas
+
+
+def test_nenhuma_resposta_json_escapa_do_boundary_de_redacao() -> None:
+    """Nada em `api/` ou `main.py` constrói um `JSONResponse` cru ([04] §5, E6-AUD3-001).
+
+    A garantia de saída é *opt-out*: `RedactingJSONResponse` é o `default_response_class` e
+    a classe de todo *exception handler*. Um `JSONResponse` construído à mão em qualquer
+    outro lugar seria uma resposta fora do boundary — exatamente o que fazia o `422` de
+    validação ecoar `detail[].input` cru.
+
+    O único lugar onde o nome pode aparecer é `api/responses.py`, que o subclassa.
+    """
+    alvos = [*(APP_ROOT / "api").rglob("*.py"), APP_ROOT / "main.py"]
+
+    for caminho in alvos:
+        if caminho == _RESPONSE_BOUNDARY_OWNER:
+            continue
+        tree = ast.parse(caminho.read_text(encoding="utf-8"), filename=str(caminho))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == "JSONResponse":
+                raise AssertionError(
+                    f"{_module_name(caminho)}:{node.lineno} constrói `JSONResponse` cru; "
+                    "toda resposta JSON passa por `api.responses.RedactingJSONResponse`"
+                )
+            if isinstance(node, ast.ImportFrom) and "JSONResponse" in {
+                alias.name for alias in node.names
+            }:
+                raise AssertionError(
+                    f"{_module_name(caminho)}:{node.lineno} importa `JSONResponse`; o único "
+                    "módulo que pode nomeá-lo é api/responses.py"
+                )
+
+
+def test_nenhum_endpoint_devolve_dicionario_cru() -> None:
+    """Um *endpoint* devolve modelo Pydantic ou o response class central — nunca um `dict`.
+
+    Um `dict` literal devolvido por rota escapa da validação de forma **e** do
+    `response_model`, e o FastAPI o serializaria com o `default_response_class` — que hoje
+    redige, mas deixaria a rota sem contrato. É o par do teste acima: um proíbe a resposta
+    fora do boundary, este proíbe o corpo sem schema.
+    """
+    for caminho in (APP_ROOT / "api").rglob("*.py"):
+        tree = ast.parse(caminho.read_text(encoding="utf-8"), filename=str(caminho))
+        for funcao in _route_functions(tree):
+            for node in ast.walk(funcao):
+                if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
+                    raise AssertionError(
+                        f"{_module_name(caminho)}:{node.lineno} — a rota `{funcao.name}` "
+                        "devolve `dict` literal; devolva um modelo ou o response class"
+                    )
+
+
+def test_as_classes_de_resposta_das_rotas_sao_as_declaradas() -> None:
+    """`response_class=` explícito só para os casos sem JSON, e nomeados.
+
+    Uma rota que declare `response_class=JSONResponse` reintroduziria o bypass por uma
+    porta que o teste de construção não vê. As exceções legítimas são as de [04] §5: HTML
+    de bootstrap e `204` sem corpo.
+    """
+    for caminho in (APP_ROOT / "api").rglob("*.py"):
+        tree = ast.parse(caminho.read_text(encoding="utf-8"), filename=str(caminho))
+        for funcao in _route_functions(tree):
+            for decorator in funcao.decorator_list:
+                if not isinstance(decorator, ast.Call):
+                    continue
+                for keyword in decorator.keywords:
+                    if keyword.arg != "response_class":
+                        continue
+                    declarada = ast.unparse(keyword.value)
+                    assert declarada in _NON_JSON_RESPONSES, (
+                        f"{_module_name(caminho)}: a rota `{funcao.name}` declara "
+                        f"`response_class={declarada}`, fora do boundary de [04] §5"
+                    )
+
+
+# ------------------- toda subclasse de Response é enumerada (E6-AUD5-005)
+
+#: Nomes de classe de resposta que vêm do framework. Qualquer classe do projeto que herde
+#: de um destes — direta ou indiretamente — é uma saída HTTP, e portanto uma candidata a
+#: escapar do boundary de [04] §5.
+_FRAMEWORK_RESPONSES = frozenset(
+    {
+        "Response",
+        "JSONResponse",
+        "HTMLResponse",
+        "PlainTextResponse",
+        "FileResponse",
+        "StreamingResponse",
+        "RedirectResponse",
+        "ORJSONResponse",
+        "UJSONResponse",
+    }
+)
+
+#: As **únicas** subclasses de resposta que o projeto define, e onde cada uma pode ser
+#: construída. Uma terceira classe — mesmo que nunca declarada em `response_class=` —
+#: quebra esta lista antes de chegar perto de uma rota.
+_RESPONSES_DO_PROJETO: dict[str, str] = {
+    "RedactingJSONResponse": "app.api.responses",
+    "EditViewJSONResponse": "app.api.responses",
+}
+
+#: Onde cada classe de resposta pode ser **construída**. `Response` cru é o `204` sem corpo
+#: e o bootstrap; `HTMLResponse` é o HTML de bootstrap.
+_CONSTRUCAO_AUTORIZADA: dict[str, frozenset[str]] = {
+    "Response": frozenset({"app.api.context", "app.api.web", "app.main"}),
+    "HTMLResponse": frozenset({"app.api.web"}),
+    # `main` (handlers e middleware), `web` (o 404 de bootstrap) e as duas prévias de purga,
+    # que montam a resposta à mão porque o Pydantic rebaixa o `Unredacted` do `purge_token`.
+    "RedactingJSONResponse": frozenset(
+        {"app.main", "app.api.web", "app.api.tasks", "app.api.workspaces"}
+    ),
+    "EditViewJSONResponse": frozenset({"app.api.context"}),
+}
+
+
+def _subclasses_de_resposta(arvore: ast.Module) -> dict[str, str]:
+    """As classes do módulo que herdam de alguma classe de resposta conhecida."""
+    encontradas: dict[str, str] = {}
+    conhecidas = set(_FRAMEWORK_RESPONSES) | set(_RESPONSES_DO_PROJETO)
+    for node in ast.walk(arvore):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for base in node.bases:
+            nome = ast.unparse(base).split(".")[-1]
+            if nome in conhecidas:
+                encontradas[node.name] = nome
+    return encontradas
+
+
+def _apelidos_de_resposta(arvore: ast.Module) -> dict[str, str]:
+    """`from x import Y as Z` → `{"Z": "Y"}`, para os nomes de resposta que importam.
+
+    Sem isto a regra é contornável por uma linha: importar com outro nome e construir o
+    apelido. O mutante de E6-AUD5-005 nem precisou disso — construiu uma classe nova
+    diretamente —, mas a barreira tem de valer para as duas formas.
+    """
+    conhecidas = set(_FRAMEWORK_RESPONSES) | set(_RESPONSES_DO_PROJETO)
+    apelidos: dict[str, str] = {}
+    for node in ast.walk(arvore):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name in conhecidas and alias.asname:
+                    apelidos[alias.asname] = alias.name
+    return apelidos
+
+
+def test_o_projeto_nao_define_uma_terceira_classe_de_resposta() -> None:
+    """A lista de subclasses de `Response` do projeto é **fechada** (E6-AUD5-005).
+
+    A quinta auditoria mostrou o buraco da versão anterior: ela procurava nomes conhecidos e
+    inspecionava `response_class=`, então uma classe nova, importada e **construída
+    diretamente** dentro de uma rota, passava por todos os 143 testes e devolvia conteúdo
+    cru. Contar os usos das duas exceções conhecidas não enumera as que ainda não existem.
+
+    Esta regra inverte a pergunta: em vez de "esta classe conhecida está sendo usada onde
+    deve?", ela pergunta "existe alguma classe de resposta que eu não conheço?". Uma
+    `ThirdAuditResponse(JSONResponse)` quebra aqui no momento em que é **definida**, muito
+    antes de ser usada.
+    """
+    definidas: dict[str, tuple[str, str]] = {}
+    for caminho in ALL_FILES:
+        arvore = ast.parse(caminho.read_text(encoding="utf-8"), filename=str(caminho))
+        for nome, base in _subclasses_de_resposta(arvore).items():
+            definidas[nome] = (_module_name(caminho), base)
+
+    assert set(definidas) == set(_RESPONSES_DO_PROJETO), (
+        "o conjunto de subclasses de Response do projeto mudou: "
+        f"{sorted(definidas)} != {sorted(_RESPONSES_DO_PROJETO)}. Uma classe de resposta "
+        "nova é uma saída HTTP nova, e precisa entrar na lista de exceções de [04] §5 por "
+        "decisão, não por herança"
+    )
+    for nome, (modulo, _base) in definidas.items():
+        assert modulo == _RESPONSES_DO_PROJETO[nome], (
+            f"`{nome}` migrou para {modulo}; classes de resposta moram em api/responses.py"
+        )
+
+
+def test_nenhuma_classe_de_resposta_e_construida_fora_do_lugar() -> None:
+    """Onde cada classe de resposta pode ser **construída**, incluindo apelidos de import.
+
+    O par do teste acima: aquele proíbe a classe nova, este proíbe usar uma classe conhecida
+    num lugar novo. Juntos, cobrem a forma que E6-AUD5-005 reproduziu — uma rota que devolve
+    um objeto `Response` já construído, sem `response_class=` no decorador, e por isso
+    invisível para a regra que só lia decoradores.
+    """
+    alvos = [*(APP_ROOT / "api").rglob("*.py"), APP_ROOT / "main.py"]
+
+    # As classes conhecidas incluem **toda** subclasse de resposta que existir na árvore, e
+    # não só as duas declaradas: era essa a porta de E6-AUD5-005, em que uma classe nova
+    # construída direto na rota não era reconhecida como classe de resposta por ninguém.
+    conhecidas = set(_FRAMEWORK_RESPONSES) | set(_RESPONSES_DO_PROJETO)
+    for caminho in ALL_FILES:
+        conhecidas.update(_subclasses_de_resposta(ast.parse(caminho.read_text(encoding="utf-8"))))
+
+    for caminho in alvos:
+        modulo = _module_name(caminho)
+        arvore = ast.parse(caminho.read_text(encoding="utf-8"), filename=str(caminho))
+        apelidos = _apelidos_de_resposta(arvore)
+        locais = set(_subclasses_de_resposta(arvore))
+
+        for node in ast.walk(arvore):
+            if not isinstance(node, ast.Call):
+                continue
+            nome = ast.unparse(node.func).split(".")[-1]
+            nome = apelidos.get(nome, nome)
+            if nome not in conhecidas or nome in locais:
+                continue
+            autorizados = _CONSTRUCAO_AUTORIZADA.get(nome, frozenset())
+            assert modulo in autorizados, (
+                f"{modulo}:{node.lineno} constrói `{nome}`, que só pode ser construída em "
+                f"{sorted(autorizados) or 'nenhum módulo'}. Uma resposta construída à mão "
+                "escapa do `default_response_class` de [04] §5"
+            )
+
+
+# --------------------------- o conjunto fechado de saídas sem redação (E6-AUD3, E6-AUD4)
+
+#: **Toda** a lista de exceções à Camada 3 de [04] §5, em um lugar só. São duas, e cada uma
+#: tem um motivo que a outra não tem:
+#:
+#: * `Unredacted` — **um valor**: o `purge_token` de [02] §11, um segredo que a resposta tem
+#:   a função de entregar. Redigi-lo quebraria a confirmação forte da purga.
+#: * `EditViewJSONResponse` — **uma resposta inteira**: o conteúdo cru de uma entrada do
+#:   Context Registry, para quem vai editá-la. Sem ela o editor lê `«redigido»`, salva, e o
+#:   marcador vira conteúdo (E6-AUD4-004).
+#:
+#: Cada uma tem **um** ponto de uso, e este teste é o que impede uma terceira de aparecer.
+#: A pergunta que ele existe para forçar não é "esta rota precisa de conteúdo cru?" — é
+#: "por que a lista de exceções passou de duas para três?".
+_SAIDAS_SEM_REDACAO: dict[str, tuple[str, str]] = {
+    # nome -> (módulo onde pode ser usado, o que ele libera)
+    "Unredacted": ("app.workspace.purge_tokens", "o purge_token de [02] §11"),
+    "EditViewJSONResponse": ("app.api.context", "o conteúdo cru de edit-view"),
+}
+
+
+def _usos_de_nome(nome: str) -> list[str]:
+    """Onde `nome` aparece como chamada ou como valor de `response_class=`, em todo o app."""
+    encontrados: list[str] = []
+    for caminho in ALL_FILES:
+        if caminho == _RESPONSE_BOUNDARY_OWNER or caminho.name == "redaction.py":
+            continue  # onde os dois tipos são **definidos**
+        tree = ast.parse(caminho.read_text(encoding="utf-8"), filename=str(caminho))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and ast.unparse(node.func) == nome) or (
+                isinstance(node, ast.keyword)
+                and node.arg == "response_class"
+                and ast.unparse(node.value) == nome
+            ):
+                encontrados.append(f"{_module_name(caminho)}:{node.lineno}")
+    return encontrados
+
+
+def test_o_conjunto_de_respostas_sem_redacao_e_fechado() -> None:
+    """Exatamente duas saídas escapam da Camada 3, cada uma com **um** ponto de uso.
+
+    Uma terceira rota que queira devolver conteúdo não redigido quebra aqui — seja
+    construindo `Unredacted`, seja declarando `response_class=EditViewJSONResponse`, seja
+    inventando uma classe nova (que cai em `_NON_JSON_RESPONSES`).
+    """
+    for nome, (modulo, _papel) in _SAIDAS_SEM_REDACAO.items():
+        usos = _usos_de_nome(nome)
+        assert len(usos) == 1, (
+            f"esperava exatamente um uso de `{nome}` em todo o backend; encontrei {usos}. "
+            "Acrescentar uma exceção à Camada 3 é uma decisão de arquitetura, não uma "
+            "linha de código"
+        )
+        assert usos[0].split(":")[0] == modulo, f"`{nome}` migrou de {modulo} para {usos[0]}"
+
+
+def test_a_rota_de_edit_view_nao_escreve_em_canal_nenhum() -> None:
+    """A rota que devolve conteúdo cru não chama nada além de ler e projetar.
+
+    Um `record_safety_event`, um `logger.info` ou uma mensagem de erro composta com o
+    conteúdo entregariam ao disco exatamente o que a rota existe para manter na resposta —
+    e num canal que **não** passa pelo boundary. A regra é uma allowlist de chamadas porque
+    a lista negra ("não use logging") envelhece: qualquer canal novo passaria por ela.
+    """
+    tree = ast.parse((APP_ROOT / "api" / "context.py").read_text(encoding="utf-8"))
+    rota = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "edit_view"
+    )
+
+    # Só o corpo: o decorador `@router.post(...)` é uma chamada, e é a declaração da rota.
+    chamadas = {
+        ast.unparse(node.func)
+        for corpo in rota.body
+        for node in ast.walk(corpo)
+        if isinstance(node, ast.Call)
+    }
+
+    # A allowlist é literal de propósito: um canal novo (logging, evento, métrica) só entra
+    # aqui depois de alguém explicar por que o conteúdo cru pode passar por ele.
+    permitido = {
+        "get_entry",  # lê a entrada
+        "edit_hash_of",  # deriva a versão de edição
+        "ContextEditViewResponse",  # projeta
+        "ContextEntryUnreadable",  # erro tipado, mensagem constante (E6-AUD5-007)
+        "error.errors",  # só os nomes de campo do erro de forma
+        "str",  # idem, para compor o nome
+        "', '.join",  # idem
+    }
+    assert chamadas <= permitido, (
+        f"`edit_view` chama {sorted(chamadas - permitido)}, fora da lista autorizada; "
+        "só pode ler a entrada, derivar o hash e projetá-la"
+    )
+
+
+# ------------------------------------------------- escape hatch do `purge_token` (E6-AUD3)
+
+
+def test_unredacted_tem_exatamente_um_ponto_de_construcao() -> None:
+    """`Unredacted(...)` é construído **uma** vez em todo o backend ([04] §5).
+
+    É o que separa um *escape hatch* de uma flag: uma flag genérica pode ser adotada por
+    qualquer campo novo "porque também não deveria ser redigido", e a exceção deixa de ser
+    auditável. Um tipo nominal com um único `call site` mantém a lista de exceções em um
+    item, verificável por AST, e obriga qualquer segunda exceção a passar por revisão.
+
+    O ponto é `PurgeTokenStore.issue` — o `purge_token` de [02] §11, que a prévia de purga
+    existe para entregar.
+    """
+    esperado = APP_ROOT / "workspace" / "purge_tokens.py"
+    construcoes: list[str] = []
+
+    for caminho in ALL_FILES:
+        tree = ast.parse(caminho.read_text(encoding="utf-8"), filename=str(caminho))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == "Unredacted":
+                construcoes.append(f"{_module_name(caminho)}:{node.lineno}")
+
+    assert construcoes == [f"{_module_name(esperado)}:{_linha_do_issue(esperado)}"], (
+        f"esperava exatamente um `Unredacted(...)`, em {_module_name(esperado)}; "
+        f"encontrei {construcoes}"
+    )
+
+
+def _linha_do_issue(caminho: Path) -> int:
+    """Linha do `Unredacted(...)` dentro de `PurgeTokenStore.issue`, lida do próprio código.
+
+    Lida e não fixada: prender a linha exata faria o teste quebrar a cada edição de
+    docstring, e o que ele afirma é "existe um só", não "está na linha 87".
+    """
+    tree = ast.parse(caminho.read_text(encoding="utf-8"), filename=str(caminho))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "Unredacted":
+            return node.lineno
+    raise AssertionError(f"nenhum `Unredacted(...)` em {caminho}")
+
+
+# --------------------------------- unidade de trabalho de conflito de escrita (E6-AUD3-002)
+
+
+#: Funções públicas de `execution_manager` que recebem `session` e **não** são comandos.
+#: Duas naturezas, ambas legítimas:
+#:
+#: * leitura pura (`get_task`, `list_tasks`, `latest_manifest`, `workspace_of`) — não
+#:   escreve, logo não tem corrida de escrita a perder;
+#: * primitiva de escrita (`record_safety_event`) — escreve, mas **sempre dentro** de um
+#:   comando já envolvido. Um segundo boundary aqui capturaria o conflito no nível errado:
+#:   quem precisa decidir o que fazer com a transação é o comando, não o `INSERT`.
+#:
+#: A lista é explícita de propósito. Acrescentar um comando novo não exige tocá-la (ele
+#: só precisa do decorador); acrescentar uma função **sem** o decorador exige declarar
+#: aqui por que ela não é um comando — que é a revisão que este teste existe para forçar.
+_NAO_SAO_COMANDOS = frozenset(
+    {"get_task", "list_tasks", "latest_manifest", "workspace_of", "record_safety_event"}
+)
+
+
+def test_todo_comando_do_execution_manager_passa_pela_unidade_de_trabalho() -> None:
+    """Toda função pública que recebe `session` é decorada com `@command`.
+
+    E6-AUD3-002 aconteceu porque o tratamento de conflito vivia dentro de `_abort_planning`,
+    que só participa do `plan`: `approve` escrevia `SafetyEvent` e reverificava contexto
+    **antes** do *compare-and-set*, e essas escritas não tinham tradução — viravam `500`.
+
+    O decorador é o que torna a cobertura verificável em vez de lembrada. Este teste é a
+    metade que garante que ninguém esqueça: um comando novo sem `@command` quebra a suíte
+    aqui, e não em produção.
+    """
+    from app.orchestrator.execution_manager import GUARDED_COMMANDS
+
+    caminho = APP_ROOT / "orchestrator" / "execution_manager.py"
+    tree = ast.parse(caminho.read_text(encoding="utf-8"), filename=str(caminho))
+
+    faltando: list[str] = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or node.name.startswith("_"):
+            continue
+        argumentos = [arg.arg for arg in node.args.args]
+        if not argumentos or argumentos[0] != "session":
+            continue
+        if node.name in _NAO_SAO_COMANDOS:
+            continue
+        decoradores = {ast.unparse(decorator) for decorator in node.decorator_list}
+        if "command" not in decoradores:
+            faltando.append(node.name)
+
+    assert not faltando, (
+        f"funções públicas de execution_manager que recebem `session` sem `@command`: "
+        f"{faltando}. Toda escrita pode perder uma corrida ([02] §4)"
+    )
+    assert GUARDED_COMMANDS, "o registro de comandos guardados está vazio"
+
+
+def test_o_classificador_de_conflito_tem_dono_unico() -> None:
+    """`is_write_conflict` é definido só em `db/conflicts.py`.
+
+    Ele nasceu dentro do Orchestrator (E6-AUD-004), e **ficar** lá foi o que permitiu
+    E6-AUD3-002: `db.session.session_scope`, que é quem de fato commita, não podia
+    consultá-lo sem inverter a direção das dependências. Duas cópias divergiriam pelo mesmo
+    mecanismo que fez nascer a segunda lista de segredo do Analyzer.
+    """
+    dono = APP_ROOT / "db" / "conflicts.py"
+    definidores = [
+        _module_name(caminho)
+        for caminho in ALL_FILES
+        if any(
+            isinstance(node, ast.FunctionDef) and node.name == "is_write_conflict"
+            for node in ast.walk(ast.parse(caminho.read_text(encoding="utf-8")))
+        )
+    ]
+
+    assert definidores == [_module_name(dono)], (
+        f"`is_write_conflict` tem de ser definido só em db/conflicts.py; achei {definidores}"
+    )
+
+    # A checagem é sobre **código**, não sobre prosa: `execution_manager` cita
+    # `SQLITE_BUSY_SNAPSHOT` no docstring que explica de onde o conflito vem, e citar não é
+    # reimplementar. O que não pode reaparecer é o código como literal executável.
+    for caminho in ALL_FILES:
+        if caminho == dono:
+            continue
+        tree = ast.parse(caminho.read_text(encoding="utf-8"), filename=str(caminho))
+        docstrings = {
+            id(no.body[0].value)
+            for no in ast.walk(tree)
+            if isinstance(no, ast.Module | ast.ClassDef | ast.FunctionDef)
+            and no.body
+            and isinstance(no.body[0], ast.Expr)
+            and isinstance(no.body[0].value, ast.Constant)
+        }
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and node.value.startswith(("SQLITE_BUSY", "SQLITE_LOCKED"))
+                and id(node) not in docstrings
+            ):
+                raise AssertionError(
+                    f"{_module_name(caminho)}:{node.lineno} repete um código de conflito "
+                    "do SQLite como literal: a lista pertence a db/conflicts.py"
+                )
+
+
 def test_backend_nao_conhece_o_dominio_comercial() -> None:
     """[ADR-0002]: o backend não importa `Client`, `Proposal`, `Project` nem lê localStorage."""
     termos = ("localstorage", "freelance_focus_data", "projectplanning")

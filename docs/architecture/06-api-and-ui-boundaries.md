@@ -212,6 +212,65 @@ verdade sobre o que pode ser feito agora.
 `approval_state` não carrega hash nem entra no `execution_fingerprint` — é projeção pura
 de leitura, e trocar seu valor não é uma escrita observável em lugar nenhum.
 
+#### Adendo autorizado — E6-CONS4 (2026-09-23): `planning`, `plan_standing` e `reason` de `/context`
+
+> Adendo aprovado por Pedro (decisões D1, D2-A e D3 do diagnóstico CONS4). **Não
+> substitui** o texto acima: acrescenta três contratos de leitura e declara qual deles
+> passa a responder "o que dá para fazer agora". A coluna *Ações válidas* do quadro de
+> `approval_state` continua descrevendo as arestas; a disponibilidade **efetiva** de
+> planejar passa a vir de `planning`.
+
+**Motivo.** Quatro auditorias consolidadas seguidas (E6-CONS a E6-CONS4) encontraram a
+mesma falha: a orientação "planeje" era recalculada em vários pontos (texto de `/context`,
+botões e avisos da UI), cada um com uma parte das guardas que `POST /plan` de fato aplica —
+arquivamento, git, `HEAD`, `test_config`. A correção estrutural é uma derivação só, no
+backend, feita das **mesmas funções** que o planejamento usa para recusar.
+
+**`planning`** — campo somente leitura de `GET /api/tasks/{id}` e das respostas de
+comando da task. **Não** existe em `GET /api/workspaces/{id}/tasks`: a listagem nunca sonda
+git por task, e a ausência do campo é a representação disso.
+
+| Campo | Valores | Significado |
+| --- | --- | --- |
+| `transition` | `allowed` · `after_reject` · `forbidden` | A aresta: planejar direto (`draft`, `needs_fix`), depois de `reject` (`awaiting_approval`), ou impossível |
+| `checked` | bool | As pré-condições de workspace **e** git foram avaliadas. `false` com `forbidden` (nada é consultado) e com `after_reject` quando o plano ainda está vigente (git adiado) |
+| `blockers` | `workspace_archived` · `workspace_not_git_repo` · `repository_without_head` · `git_unverifiable` · `invalid_test_config` | Bloqueios encontrados, na ordem de execução de `plan()`. Com `checked = false` a lista é **parcial** |
+| `eligible` | bool | `transition = allowed` **e** `checked` **e** nenhum bloqueio. A **única** autorização para a UI oferecer *Planejar* |
+
+`checked = false` com `blockers = []` **nunca** é elegibilidade. `git_unverifiable`
+distingue "o git não pôde ser consultado agora" (ausente, `timeout`, falha de IO) de "não é
+repositório" e de "sem `HEAD`" (D3); nenhum deles expõe caminho local, argumentos ou
+`stderr`. A sondagem é `git_runtime.probe_head` — dois `rev-parse`, somente leitura, com o
+timeout fixo do `git_runtime` —, a mesma leitura que o Planner usa para congelar
+`planning_base_commit`.
+
+**`planning` é uma fotografia, não uma garantia.** `POST /plan` repete todas as guardas no
+momento da execução e continua sendo a autoridade. A recusa por pré-condição traz o mesmo
+slug em `reason` (`409 workspace_not_plannable`, `422 invalid_test_config`), e a UI relê a
+task depois dela. Recusas que não se pode prever sem planejar — concorrência, árvore
+ilegível durante a seleção, falha de IO — continuam possíveis com `eligible = true`, e
+mantêm o tratamento próprio.
+
+Com `requires_replan`, rejeitar é a ação de agora e planejar vem depois: `planning` traz
+`transition = after_reject` e os bloqueios que o planejamento **futuro** ainda enfrentará,
+para a UI dizer as duas coisas sem prometer a segunda. A reativação de workspace é o
+controle já existente (`PATCH /api/workspaces/{id}`, *Reativar* no cabeçalho).
+
+**`plan_standing`** — `none` · `current` · `historical` · `final`, somente leitura, derivado
+de colunas (D2-A). `reject` e o rollback recuperável de `planning → draft` **preservam** o
+`plan` — e o rollback preserva também o manifest e o fingerprint candidato — como registro
+do que foi planejado. `historical` diz que eles não estão em vigor: `draft`, `planning`
+(o plano exibido é o anterior) e `requires_replan`. `final` é o registro de uma task
+terminal. O manifest, quando existe, pertence ao mesmo plano e tem o mesmo *standing*; o
+fingerprint só é "vigente" com `current`.
+
+**`reason` de `GET /api/tasks/{id}/context`.** Todo `404 task_not_found` de uma task
+**existente** sem manifest traz `reason`: `not_planned` (estado vazio normal),
+`approval_invalidated`, `planning_in_progress`, `terminal_without_context` ou
+`unavailable_in_state` (combinação inconsistente, tratada como erro). Task **inexistente**
+continua `404 task_not_found` **sem** `reason`. As mensagens descrevem a situação e não
+ensinam sequência de comandos — as ações vêm de `planning`. A rota não consulta git.
+
 Antes de uma purga de workspace ou task, a UI mostra a prévia com as contagens de
 workspaces, tasks, runs, findings, manifests e artefatos, e exige confirmação forte.
 Arquivar não passa por isso — é reversível.

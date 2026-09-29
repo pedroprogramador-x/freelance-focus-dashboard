@@ -13,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AppProvider } from '../context/AppContext'
 import { ContextTab, type PlanningChoice } from '../pages/WorkspaceContext'
 import { __resetSessionTokenCache } from '../services/workspaceApi'
-import type { ContextEntry } from '../services/contextApi'
+import type { ContextEditView, ContextEntry } from '../services/contextApi'
 import type { ProjectPlanning } from '../types'
 
 type Route = { status?: number; body?: unknown }
@@ -37,6 +37,18 @@ function installRouter(router: Router) {
   vi.stubGlobal('fetch', spy)
   return spy
 }
+
+// O que `POST /context/{id}/edit-view` devolve: conteúdo **cru**, sem redação. A projeção
+// que a lista carrega pode estar redigida, e salvar ela de volta persistiria o marcador.
+const editViewFixture = (over: Partial<ContextEditView> = {}): ContextEditView => ({
+  entry_id: 'e1',
+  title: 'Módulo src',
+  body: 'Descreve o código sob src/.',
+  structured: null,
+  content_hash: 'c'.repeat(64),
+  edit_hash: 'e'.repeat(64),
+  ...over,
+})
 
 const entryFixture = (over: Partial<ContextEntry> = {}): ContextEntry => ({
   id: 'e1',
@@ -170,6 +182,7 @@ describe('ContextTab — editor', () => {
   it('editar só o texto manda um PATCH sem source_refs', async () => {
     const spy = installRouter((method, path) => {
       if (method === 'GET' && path === '/workspaces/w1/context') return { body: [entryFixture()] }
+      if (method === 'POST' && path === '/context/e1/edit-view') return { body: editViewFixture() }
       if (method === 'PATCH' && path === '/context/e1') {
         return { body: entryFixture({ body: 'Corpo revisado' }) }
       }
@@ -189,7 +202,10 @@ describe('ContextTab — editor', () => {
       const patch = spy.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === 'PATCH')
       expect(patch).toBeDefined()
       const sent = JSON.parse((patch?.[1] as RequestInit).body as string) as Record<string, unknown>
-      expect(sent).toEqual({ body: 'Corpo revisado' })
+      expect(sent).toEqual({
+        expected_edit_hash: 'e'.repeat(64),
+        body: 'Corpo revisado',
+      })
       expect('source_refs' in sent).toBe(false)
     })
   })
@@ -197,6 +213,7 @@ describe('ContextTab — editor', () => {
   it('alterar as fontes avisa que a linha de base vai ser reconfirmada, e as envia', async () => {
     const spy = installRouter((method, path) => {
       if (method === 'GET' && path === '/workspaces/w1/context') return { body: [entryFixture()] }
+      if (method === 'POST' && path === '/context/e1/edit-view') return { body: editViewFixture() }
       if (method === 'PATCH' && path === '/context/e1') return { body: entryFixture() }
       return { status: 404, body: {} }
     })
@@ -216,7 +233,61 @@ describe('ContextTab — editor', () => {
     await waitFor(() => {
       const patch = spy.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === 'PATCH')
       const sent = JSON.parse((patch?.[1] as RequestInit).body as string) as Record<string, unknown>
-      expect(sent).toEqual({ source_refs: ['src/**', 'docs/**'] })
+      expect(sent).toEqual({
+        expected_edit_hash: 'e'.repeat(64),
+        source_refs: ['src/**', 'docs/**'],
+      })
+    })
+  })
+
+  it('edita o conteúdo cru de edit-view, não a projeção redigida que a lista mostra', async () => {
+    // E6-AUD4-004, do lado do cliente. A lista carrega `«redigido»`; se o editor partisse
+    // dela, salvar gravaria o marcador por cima do texto que ele escondia — e o backend,
+    // que gerou o marcador sem guardar o original, não teria como desfazer.
+    const marcado = 'chave: ' + '«' + 'redigido' + '»'
+    const spy = installRouter((method, path) => {
+      if (method === 'GET' && path === '/workspaces/w1/context') {
+        return { body: [entryFixture({ body: marcado, content_hash: 'c'.repeat(64) })] }
+      }
+      if (method === 'POST' && path === '/context/e1/edit-view') {
+        return {
+          body: editViewFixture({
+            body: 'chave: sk-EXEMPLO0123456789ABCDEF',
+            content_hash: 'd'.repeat(64),
+            edit_hash: 'f'.repeat(64),
+          }),
+        }
+      }
+      if (method === 'PATCH' && path === '/context/e1') return { body: entryFixture() }
+      return { status: 404, body: {} }
+    })
+
+    renderTab()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Editar' }))
+    const dialog = await screen.findByRole('dialog')
+
+    // O campo mostra o conteúdo cru assim que `edit-view` responde.
+    await waitFor(() => {
+      expect(within(dialog).getByLabelText(/Conteúdo \*/)).toHaveValue(
+        'chave: sk-EXEMPLO0123456789ABCDEF',
+      )
+    })
+
+    fireEvent.change(within(dialog).getByLabelText(/Conteúdo \*/), {
+      target: { value: 'chave: sk-EXEMPLO0123456789ABCDEF e mais texto' },
+    })
+    fireEvent.click(within(dialog).getByRole('button', { name: /Salvar entrada/ }))
+
+    await waitFor(() => {
+      const patch = spy.mock.calls.find(
+        ([, init]) => (init as RequestInit | undefined)?.method === 'PATCH',
+      )
+      expect(patch).toBeDefined()
+      const sent = JSON.parse((patch?.[1] as RequestInit).body as string) as Record<string, unknown>
+      // O hash é o `edit_hash` de `edit-view`, e o corpo não carrega marcador nenhum.
+      expect(sent.expected_edit_hash).toBe('f'.repeat(64))
+      expect(sent.body).toBe('chave: sk-EXEMPLO0123456789ABCDEF e mais texto')
     })
   })
 

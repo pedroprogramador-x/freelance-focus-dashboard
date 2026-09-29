@@ -57,6 +57,62 @@ class InvalidSourceRefs(ContextError):
         self.rule_id = decision.rule_id
 
 
+class RedactedContentRejected(ContextError):
+    """O campo enviado carrega um **marcador de redação**. **422** — nada é persistido.
+
+    A Camada 3 de [04] §5 redige o que **sai**. Quem edita uma entrada no navegador vê a
+    projeção redigida, e um `PATCH` que devolva esse texto ao backend persistiria o
+    marcador como se fosse conteúdo autoral: `«redigido»` substituiria para sempre o trecho
+    que ele estava escondendo, e o `content_hash` passaria a atestar o texto mutilado
+    (E6-AUD4-004).
+
+    A recusa é a única resposta correta, porque o backend **não pode** saber o que estava
+    debaixo do marcador — ele o gerou sem guardar o original. Quem quer editar o conteúdo
+    cru pede `POST /api/context/{entry_id}/edit-view`, que existe exatamente para isso.
+
+    O preço é recusar um texto que legitimamente contenha `«redigido»` — alguém
+    documentando este mecanismo, por exemplo. É um preço aceito de propósito: o modo de
+    falha do outro lado é silencioso e destrutivo, e este é ruidoso e reversível.
+    """
+
+    code = "redacted_content_rejected"
+    status_code = 422
+
+
+class ContextChanged(ContextError):
+    """A entrada mudou entre a leitura de edição e o `PATCH`. **409** — nada é sobrescrito.
+
+    Concorrência **otimista** ([06] §2): a entrada não é travada em momento nenhum. O
+    cliente lê `content_hash` junto com o conteúdo cru (`edit-view`) e o devolve como
+    `expected_content_hash`; se o hash atual divergir, alguém escreveu no meio e a edição
+    é recusada em vez de apagar o trabalho do outro.
+
+    Travar seria pior num workspace local: um lock esquecido por um editor fechado deixaria
+    a entrada inacessível, e não há sessão nem dono para expirá-lo.
+    """
+
+    code = "context_changed"
+    status_code = 409
+
+
+class ContextEntryUnreadable(ContextError):
+    """A entrada está gravada numa forma que a projeção de edição não consegue ler. **500**.
+
+    Acontece com documento legado ou escrito por outro caminho — `structured` guardado como
+    lista, por exemplo: JSON válido para a coluna, inválido para o modelo que exige objeto.
+    As rotas normais de escrita não aceitam essa forma.
+
+    Existe para que esse caso **não** vire exceção não tratada (E6-AUD5-007). Uma
+    `ValidationError` do Pydantic subindo até o canal de exceções do servidor leva o
+    `input_value` junto — isto é, o conteúdo autoral cru — para o log do Uvicorn, um canal
+    que não passa pelo boundary de [04] §5. A mensagem daqui é constante e nomeia o campo,
+    nunca o valor.
+    """
+
+    code = "context_entry_unreadable"
+    status_code = 500
+
+
 class ContextEntryNotFound(ContextError):
     """Nenhuma `ContextRegistryEntry` com o `id` pedido. **404**."""
 

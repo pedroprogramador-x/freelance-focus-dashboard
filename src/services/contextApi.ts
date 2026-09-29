@@ -63,7 +63,13 @@ export type ContextEntryUpdateInput = Partial<{
   structured: Record<string, unknown> | null
   tags: string[]
   source_refs: string[]
-}>
+}> & {
+  // Concorrência otimista: o `edit_hash` lido em `edit-view`. Obrigatório — o backend
+  // responde 409 `context_changed` se a entrada mudou desde então, em vez de deixar a
+  // segunda gravação apagar a primeira em silêncio. Cobre também `tags` e `source_refs`,
+  // que o `content_hash` não cobria (E6-AUD5-004).
+  expected_edit_hash: string
+}
 
 export interface CoveredDivergence {
   path: string
@@ -96,6 +102,18 @@ export interface PlanningImportInput {
   risks?: { description: string; mitigation?: string }[]
 }
 
+// A resposta de `POST /context/{id}/edit-view`: conteúdo **cru**, para edição.
+// A projeção de leitura sai redigida (docs/architecture/04 §5); salvar o que ela mostra
+// persistiria o marcador no lugar do trecho escondido, e o backend recusa esse PATCH.
+export interface ContextEditView {
+  entry_id: string
+  title: string
+  body: string
+  structured: Record<string, unknown> | null
+  content_hash: string
+  edit_hash: string
+}
+
 export interface ContextImportResult {
   created: number
   entries: ContextEntry[]
@@ -124,6 +142,15 @@ export function updateContextEntry(
   return apiRequest<ContextEntry>(`/context/${encodeURIComponent(entryId)}`, {
     method: 'PATCH',
     body: JSON.stringify(input),
+  })
+}
+
+// `POST`, e não `GET`: é o que a coloca sob a guarda de mesma origem do backend, que só
+// se aplica a métodos mutantes. O que ela devolve é conteúdo não redigido.
+export function fetchContextEditView(entryId: string): Promise<ContextEditView> {
+  return apiRequest<ContextEditView>(`/context/${encodeURIComponent(entryId)}/edit-view`, {
+    method: 'POST',
+    body: JSON.stringify({}),
   })
 }
 

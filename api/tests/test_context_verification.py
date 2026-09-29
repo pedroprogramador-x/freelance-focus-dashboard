@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy.orm import Session
 
-from app.context_engine.service import create_entry, update_entry
+from app.context_engine.service import create_entry, edit_hash_of, update_entry
 from app.context_engine.verification import (
     FreshnessOutcome,
     read_workspace_tree,
@@ -35,6 +35,17 @@ from app.git_runtime import WorkingTreeChange, preflight
 from tests.context_helpers import GIT, commit_all, git, write
 
 pytestmark = pytest.mark.skipif(GIT is None, reason="git indisponível no PATH")
+
+
+def _update(
+    session: Session, entry: ContextRegistryEntry, **campos: object
+) -> ContextRegistryEntry:
+    """`update_entry` com o `expected_edit_hash` **atual** da entrada (E6-AUD4-004).
+
+    O conflito de concorrência tem testes próprios em `test_e6_audit_round_4.py`; aqui o
+    assunto é freshness, e o ajudante mantém os dois separados.
+    """
+    return update_entry(session, entry, expected_edit_hash=edit_hash_of(entry), **campos)  # type: ignore[arg-type]
 
 
 def state_of(entry: ContextRegistryEntry) -> ContextState:
@@ -203,7 +214,7 @@ def test_patch_de_conteudo_entre_verificacoes_nao_altera_o_baseline(
     _verify(session, workspace, entry)
     assert state_of(entry) is ContextState.STALE
 
-    update_entry(session, entry, title="Título revisado", body="Corpo revisado.\n")
+    _update(session, entry, title="Título revisado", body="Corpo revisado.\n")
 
     assert entry.source_hash == baseline
     assert entry.source_hash_commit == commit_baseline
@@ -226,7 +237,7 @@ def test_patch_de_source_refs_e_o_unico_caminho_que_move_o_baseline(
     _verify(session, workspace, entry)
     assert state_of(entry) is ContextState.STALE
 
-    update_entry(session, entry, source_refs=["src/**"])
+    _update(session, entry, source_refs=["src/**"])
 
     assert entry.source_hash != baseline
     assert state_of(entry) is ContextState.FRESH

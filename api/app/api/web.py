@@ -17,8 +17,9 @@ import html
 import re
 
 from fastapi import APIRouter, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 
+from app.api.responses import RedactingJSONResponse
 from app.api.security import SESSION_TOKEN_META_NAME
 
 router = APIRouter(include_in_schema=False)
@@ -64,7 +65,11 @@ def index(request: Request) -> Response:
     if index_path is None or not index_path.is_file():
         # Sem build compilado o mecanismo existe, mas não há o que servir. A mensagem não
         # revela o caminho procurado — [01] §4 mantém paths locais do lado do backend.
-        return JSONResponse(
+        #
+        # O corpo é constante, mas sai pelo boundary de [04] §5 como qualquer outro JSON:
+        # esta rota estava fora dele, e "o conteúdo aqui é seguro" é exatamente o raciocínio
+        # que E6-AUD3-001 encontrou errado em seis superfícies diferentes.
+        return RedactingJSONResponse(
             status_code=404,
             content={
                 "code": "web_ui_unavailable",

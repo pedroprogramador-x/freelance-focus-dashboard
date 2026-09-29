@@ -35,6 +35,7 @@ from app.context_engine import (
     normalize_text,
     update_entry,
 )
+from app.context_engine.service import edit_hash_of
 from app.db.enums import ContextDomain, ContextOrigin, ContextState, StaleReason
 from app.db.models import ContextRegistryEntry, DevWorkspace
 from app.git_runtime import preflight
@@ -42,6 +43,19 @@ from tests.context_helpers import GIT, commit_all, write
 
 #: Todo este arquivo monta repositórios git de verdade para exercitar o baseline.
 pytestmark = pytest.mark.skipif(GIT is None, reason="git indisponível no PATH")
+
+
+def _update(
+    session: Session, entry: ContextRegistryEntry, **campos: object
+) -> ContextRegistryEntry:
+    """`update_entry` com o `expected_edit_hash` **atual** da entrada.
+
+    Desde E6-AUD4-004 o hash lido é obrigatório: é o que faz uma escrita concorrente virar
+    `409` em vez de apagar a anterior em silêncio. Estes ensaios são sobre outra coisa —
+    baseline, hash de conteúdo, atomicidade —, e o conflito tem testes próprios em
+    `test_e6_audit_round_4.py`. O ajudante mantém os dois assuntos separados.
+    """
+    return update_entry(session, entry, expected_edit_hash=edit_hash_of(entry), **campos)  # type: ignore[arg-type]
 
 
 def _new(
@@ -199,9 +213,9 @@ def test_content_hash_muda_com_cada_campo_que_entra(
 ) -> None:
     base = _new(session, workspace, title="T", body="B\n")
 
-    outro_titulo = update_entry(session, _new(session, workspace, title="T", body="B\n"), title="U")
-    outro_corpo = update_entry(session, _new(session, workspace, title="T", body="B\n"), body="C\n")
-    outro_struct = update_entry(
+    outro_titulo = _update(session, _new(session, workspace, title="T", body="B\n"), title="U")
+    outro_corpo = _update(session, _new(session, workspace, title="T", body="B\n"), body="C\n")
+    outro_struct = _update(
         session, _new(session, workspace, title="T", body="B\n"), structured={"x": 1}
     )
     outro_dominio = _new(session, workspace, domain=ContextDomain.RISKS, title="T", body="B\n")
@@ -303,7 +317,7 @@ def test_patch_de_conteudo_nao_toca_o_baseline(
     write(repo_path, "src/app.py", "print('mudou')\n")
     commit_all(repo_path, "muda o código")
 
-    atualizada = update_entry(
+    atualizada = _update(
         session,
         entry,
         title="Outro título",
@@ -332,7 +346,7 @@ def test_patch_de_conteudo_nao_ressuscita_entrada_stale(
     entry.stale_reason = StaleReason.SOURCES_CHANGED
     session.flush()
 
-    atualizada = update_entry(session, entry, body="corpo revisado\n")
+    atualizada = _update(session, entry, body="corpo revisado\n")
 
     assert atualizada.state is ContextState.STALE
     assert atualizada.stale_reason is StaleReason.SOURCES_CHANGED
@@ -342,7 +356,7 @@ def test_patch_sem_nenhum_campo_e_inofensivo(session: Session, workspace: DevWor
     entry = _new(session, workspace, source_refs=["src/**"])
     antes = (entry.content_hash, entry.source_hash, entry.source_hash_commit, entry.state)
 
-    atualizada = update_entry(session, entry)
+    atualizada = _update(session, entry)
 
     assert (
         atualizada.content_hash,
@@ -367,7 +381,7 @@ def test_patch_de_source_refs_estabelece_novo_baseline_no_commit_do_momento(
     novo_head = preflight(str(repo_path)).head
     assert novo_head != commit_inicial
 
-    atualizada = update_entry(session, entry, source_refs=["src/**"])
+    atualizada = _update(session, entry, source_refs=["src/**"])
 
     assert atualizada.source_hash != baseline_inicial
     assert atualizada.source_hash_commit == novo_head, (
@@ -387,7 +401,7 @@ def test_patch_de_source_refs_para_lista_vazia_zera_o_baseline(
     session.flush()
     assert entry.source_hash is not None
 
-    atualizada = update_entry(session, entry, source_refs=[])
+    atualizada = _update(session, entry, source_refs=[])
 
     assert atualizada.source_refs == []
     assert atualizada.source_hash is None
@@ -408,7 +422,7 @@ def test_patch_de_source_refs_recusado_nao_altera_nada(
     conteudo = entry.content_hash
 
     with pytest.raises(InvalidSourceRefs):
-        update_entry(session, entry, source_refs=["config/*"], title="Novo título")
+        _update(session, entry, source_refs=["config/*"], title="Novo título")
 
     # A recusa acontece **antes** de qualquer atribuição: nem os campos de conteúdo, que
     # nem eram o problema, foram tocados. Sem isso, a atomicidade dependeria do `rollback`
@@ -440,7 +454,7 @@ def test_source_refs_informado_igual_ao_atual_ainda_refaz_o_baseline(
     commit_all(repo_path, "commit que não toca src/")
     novo_head = preflight(str(repo_path)).head
 
-    atualizada = update_entry(session, entry, source_refs=["src/app.py"])
+    atualizada = _update(session, entry, source_refs=["src/app.py"])
 
     assert atualizada.source_hash_commit == novo_head != commit_inicial
     assert atualizada.state is ContextState.FRESH
@@ -518,8 +532,8 @@ def test_ausente_e_lista_vazia_sao_caminhos_opostos(
     baseline = ausente.source_hash
     assert baseline is not None
 
-    update_entry(session, ausente, body="só o corpo\n")
-    update_entry(session, vazio, source_refs=[])
+    _update(session, ausente, body="só o corpo\n")
+    _update(session, vazio, source_refs=[])
 
     assert ausente.source_hash == baseline
     assert ausente.source_refs == ["src/**"]

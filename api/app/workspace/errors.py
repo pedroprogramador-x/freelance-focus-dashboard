@@ -116,3 +116,20 @@ class WorkspaceBenchmarkProtected(WorkspaceError):
 
     code = "workspace_purge_benchmark_protected"
     status_code = 409
+
+
+class InvalidTestConfig(WorkspaceError):
+    """`test_config` malformado no `PATCH /api/workspaces/{id}`. **422**.
+
+    Embrulha o `InvalidTestPolicy` que `safety.test_policy.parse_test_policy` levanta —
+    mesmo desenho de `context_engine.errors.InvalidSourceRefs` sobre uma `SafetyDecision`:
+    o kernel puro produz o veredito, e o módulo consumidor o traduz para a própria
+    hierarquia de erro de domínio.
+
+    O `code` é **idêntico** ao de `orchestrator.errors.InvalidTestConfig` de propósito: o
+    documento é o mesmo e o defeito é o mesmo, e o cliente não deve precisar saber se foi a
+    escrita ou a leitura que o recusou.
+    """
+
+    code = "invalid_test_config"
+    status_code = 422

@@ -71,25 +71,34 @@ describe('indicador de estado', () => {
 
 describe('corpo do PATCH', () => {
   const baseline = entryFormOf(entryFixture())
+  // O `edit_hash` lido ao abrir a entrada. Vai em **todo** PATCH: sem ele o backend
+  // recusa com 422, e é o que transforma uma escrita concorrente em 409 em vez de
+  // deixá-la apagar a anterior em silêncio.
+  const HASH = 'c'.repeat(64)
 
   it('omite source_refs quando só o conteúdo mudou — o baseline fica intacto', () => {
     const form: EntryForm = { ...baseline, title: 'Outro título', body: 'Outro corpo' }
 
-    const patch = buildEntryPatch(form, baseline, null)
+    const patch = buildEntryPatch(form, baseline, null, HASH)
 
-    expect(patch).toEqual({ title: 'Outro título', body: 'Outro corpo' })
+    expect(patch).toEqual({
+      expected_edit_hash: HASH,
+      title: 'Outro título',
+      body: 'Outro corpo',
+    })
     expect('source_refs' in patch).toBe(false)
   })
 
   it('omite source_refs até quando a lista é reordenada para o mesmo conteúdo', () => {
     const form: EntryForm = { ...baseline, sourceRefs: ['src/**'] }
-    expect('source_refs' in buildEntryPatch(form, baseline, null)).toBe(false)
+    expect('source_refs' in buildEntryPatch(form, baseline, null, HASH)).toBe(false)
   })
 
   it('inclui source_refs quando a lista realmente muda', () => {
     const form: EntryForm = { ...baseline, sourceRefs: ['src/**', 'docs/*.md'] }
 
-    expect(buildEntryPatch(form, baseline, null)).toEqual({
+    expect(buildEntryPatch(form, baseline, null, HASH)).toEqual({
+      expected_edit_hash: HASH,
       source_refs: ['src/**', 'docs/*.md'],
     })
   })
@@ -97,21 +106,26 @@ describe('corpo do PATCH', () => {
   it('inclui uma lista vazia — que é o pedido explícito de zerar o baseline', () => {
     const form: EntryForm = { ...baseline, sourceRefs: [] }
 
-    const patch = buildEntryPatch(form, baseline, null)
+    const patch = buildEntryPatch(form, baseline, null, HASH)
 
     expect(patch.source_refs).toEqual([])
     expect('source_refs' in patch).toBe(true)
   })
 
   it('não envia nada quando nada mudou', () => {
-    expect(buildEntryPatch({ ...baseline }, baseline, null)).toEqual({})
+    expect(buildEntryPatch({ ...baseline }, baseline, null, HASH)).toEqual({
+      expected_edit_hash: HASH,
+    })
   })
 
   it('envia structured nulo quando o campo foi esvaziado', () => {
     const comStruct = entryFormOf(entryFixture({ structured: { mitigation: 'x' } }))
     const form: EntryForm = { ...comStruct, structuredText: '' }
 
-    expect(buildEntryPatch(form, comStruct, null)).toEqual({ structured: null })
+    expect(buildEntryPatch(form, comStruct, null, HASH)).toEqual({
+      expected_edit_hash: HASH,
+      structured: null,
+    })
   })
 })
 
