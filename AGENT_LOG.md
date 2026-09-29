@@ -7136,3 +7136,103 @@ Auditoria Codex da E7.2: BLOCKED por um único P2. Ainda sem commit.
   Windows): 1 "volumes distintos" e 2 "symlink indisponível" em `test_path_runtime.py`;
   3 "symlink indisponível" em `test_security_regressions.py`.
 - Fora de escopo/inalterado: fingerprint v1, docs, arquitetura de pacotes.
+
+## 2026-09-29 — Claude Opus 5.5 (effort: high) — E7.3: Supervisor de Processos
+
+Branch `e7/03-process-supervisor`, criada de `main` em `2247197` (merge da E7.2, PR #3).
+Sem commit, push ou PR — aguarda auditoria independente.
+
+- Autorização registrada: Pedro aprovou o planejamento da E7.3 e as decisões D1–D7 — pacote
+  próprio `process_runtime/` (D1); Job Objects no Windows (D2); `subprocess` permitido só em
+  `git_runtime/` e `process_runtime/` (D3); término forçado no Windows na ausência de
+  mecanismo cooperativo comprovado (D4); executável e `cwd` absolutos, `.bat`/`.cmd`
+  recusados (D5); job de CI `windows-latest` só para o Supervisor (D6); `git_runtime` não
+  migra (D7). Ajustes aprovados: só APIs Win32 documentadas (retomada por Toolhelp32 +
+  `ResumeThread`, sem `NtResumeProcess`); limites > 0; saída limitada durante a leitura.
+  Autorizou também um adendo mínimo em `docs/` para registrar isso.
+- Arquivos criados: `api/app/process_runtime/{__init__,contracts,supervisor,_windows,_posix}.py`;
+  `api/tests/test_process_runtime_e7_3.py` (88 testes: 85 rodam no Windows, 3 só no Linux).
+- Arquivos alterados: `api/tests/test_architecture.py` (allowlist de `subprocess` + 5 gates
+  E7.3); `.github/workflows/api-ci.yml` (job `process-runtime-windows`);
+  `docs/architecture/01-v1-architecture.md` e `04-safety-and-git-runtime.md` (adendos E7.3,
+  só acréscimos). NÃO tocados: `agent_runtime/`, `tool_executor/`, `git_runtime/`,
+  `orchestrator/`, `safety/`, migrações, roadmap, ADRs, `src/`.
+- Decisões de implementação:
+  - API pública: `ProcessSpec`, `ProcessOutcome` (`exited`/`timeout`/`cancelled`/
+    `supervision_failed`), `ProcessResult`, `InvalidProcessSpec`, `run_supervised(spec,
+    is_cancelled)`. Cancelamento é um callable (`cancel_token.is_cancelled`), sem importar
+    `agent_runtime` nem duplicar `CancelToken`/`RunLimits`.
+  - Precedência: saída observada antes do primeiro sinal > cancelamento > timeout.
+    Cancelado antes do início não cria processo.
+  - Fail closed: árvore não confirmada morta ou captura sem EOF viram `supervision_failed`;
+    fora dele, `tree_confirmed_dead` e `output_complete` são sempre verdadeiros.
+  - Windows: a contabilidade do Job (`ActiveProcesses == 0`) zera 3–9 ms antes de os
+    processos ficarem sinalizados (medido); a confirmação também espera handles
+    `SYNCHRONIZE` dos membros capturados antes do término (validados por `IsProcessInJob`).
+  - Windows: o `conhost.exe` do `CREATE_NO_WINDOW` vive no Job ~4 ms após o raiz; é
+    excluído de `orphans_killed` pelo caminho da imagem no diretório de sistema (não por
+    espera), mas é encerrado como todos.
+  - Leitura: `PeekNamedPipe` (Windows) / `poll` (POSIX) + `os.read` em blocos de 64 KiB;
+    memória por stream ≤ limite + um bloco; threads leitoras sempre param em prazo fixo.
+- Gates (venv oficial; Python 3.11.9, pytest 8.4.2, ruff 0.9.10, mypy 1.20.2), Windows 11:
+  E7.3 **85 passed, 3 skipped** (Linux-only), estável em 5 repetições e sob carga;
+  architecture 183 passed; afetados (E7.3 + architecture + E7.2 + E7.1 + git_runtime) 488
+  passed, 3 skipped; suíte completa **2211 passed, 9 skipped, 0 failed** (810 s; skips = 6
+  preexistentes de symlink/volume + 3 Linux-only); `ruff check`, `ruff format --check`
+  (132 arquivos), `mypy` (129 arquivos) e `mypy --platform linux` exit 0.
+  10 mutantes deliberados (gates de arquitetura, limite de leitura, precedência,
+  confirmação, `KILL_ON_JOB_CLOSE`, órfãos, `.bat`) — todos detectados.
+- Pendências: caminho POSIX **não executado localmente** (sem WSL/Docker) — valida na CI
+  Linux; job Windows da CI ainda não rodou (só no push/PR); auditoria independente
+  (Codex); E7.4 não iniciada.
+
+## 2026-09-29 — Claude Opus 5.5 (effort: high) — E7.3: correção do P2 da auditoria (Windows)
+
+Auditoria Codex da E7.3: BLOCKED por um único P2 em `api/app/process_runtime/_windows.py`.
+Ainda sem commit, push ou PR; branch `e7/03-process-supervisor`.
+
+- Causa raiz (confirmada por sonda isolada antes de alterar código): `_job_process_ids`
+  aceitava resposta com sucesso e `NumberOfProcessIdsInList < NumberOfAssignedProcesses`
+  (lista parcial: 1 PID devolvido de 7 ativos); `_capture_members` tratava falha de
+  `OpenProcess` e falha da chamada `IsProcessInJob` como "membro ausente" — com o neto
+  inobservável ou nenhum membro capturado, `confirm_dead` devolvia `True`. A sonda mostrou
+  ainda que, após `TerminateJobObject`, a lista do Job e `ActiveProcesses` zeram na hora,
+  4–6 ms antes de os processos ficarem sinalizados: a evidência só pode vir de captura
+  anterior ao término, e essa captura precisa ser fechada.
+- Correção (só `_windows.py`; contratos, POSIX, docs e arquitetura intocados):
+  - `_job_process_ids`: só devolve lista completa (sucesso **e** listados == atribuídos);
+    parcial ou `ERROR_MORE_DATA` amplia o buffer (`max(2×, atribuídos+16)`); resposta
+    inconsistente, erro da API, teto de 2^20 processos ou 16 consultas sem completar →
+    `OSError`.
+  - `_freeze`: antes da captura, `ActiveProcessLimit = 1` (com `KILL_ON_JOB_CLOSE`
+    mantido). Medido: membros atuais seguem vivos e novo `CreateProcess` no Job falha com
+    `ERROR_NOT_ENOUGH_QUOTA` (1816) sem o filho existir.
+  - `_open_member`: (D) no Job → handle; (C) `OpenProcess` → `ERROR_INVALID_PARAMETER` →
+    já desmontado; (B) `IsProcessInJob` bem-sucedido dizendo que não → PID reutilizado,
+    membro já não existe; (A) qualquer outra falha de `OpenProcess` ou falha da chamada
+    `IsProcessInJob` → `OSError`. A nunca vira B.
+  - `_capture_members`: rodadas até a lista completa não trazer PID novo (máx. 8);
+    qualquer exceção (não só `OSError`) marca a captura como falha sem impedir o término.
+  - `confirm_dead`: `True` só com `ActiveProcesses == 0`, lista completa vazia, todo handle
+    capturado sinalizado, raiz colhido **e** captura completa. Sem captura completa espera
+    e colhe o raiz mesmo assim (nada fica pendurado), mas devolve `False`.
+- Testes: +18 de regressão em `test_process_runtime_e7_3.py` (lista parcial/`MORE_DATA`/
+  inconsistente/nunca completa/acima do teto; `OpenProcess` 87 vs 5; `IsProcessInJob`
+  falhando vs `FALSE`; lista que muda entre consultas; lista instável; exceção não-`OSError`;
+  `ActiveProcesses == 0` sem lista vazia; ponta a ponta com o neto inobservável →
+  `SUPERVISION_FAILED` e árvore morta; congelamento real; captura real com ordem
+  `freeze → terminate`). 10 reversões deliberadas ao comportamento anterior — todas
+  derrubam o teste correspondente.
+- Nota não bloqueante (`time.monotonic`): a anotação do teste foi reescrita com a fonte. No
+  Python 3.11 fixado pelo projeto, `time.get_clock_info("monotonic")` reporta
+  `GetTickCount64()` e resolução 0,015625 s (passo mínimo observado: 15 ms); a partir do
+  Python 3.13 o `monotonic` do Windows usa `QueryPerformanceCounter`. A afirmação anterior
+  valia para 3.11, mas não dizia a versão. Lógica de timeout inalterada.
+- Gates (venv oficial, Python 3.11.9, Windows 11): regressão P2 18 passed; E7.3 **103
+  passed, 3 skipped** (Linux-only), 3 repetições estáveis; árvore real 10 passed;
+  architecture 183 passed; afetados 506 passed, 3 skipped; suíte completa **2229 passed, 9
+  skipped, 0 failed** (768 s; skips = 6 preexistentes + 3 Linux-only); `ruff check`,
+  `ruff format --check` (132), `mypy` (129) e `mypy --platform linux` exit 0. Nenhum
+  processo residual.
+- Pendências: reverificação independente (Codex); CI Windows/Linux ainda não executada;
+  E7.4 não iniciada.

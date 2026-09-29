@@ -528,6 +528,46 @@ principal. O que **não** oferece: impedir que um script de teste comprometido e
 da árvore inteira (Windows: enumeração recursiva; POSIX: grupo de processos) → confirmação
 de que nenhum descendente sobreviveu. Aplica-se ao Test Runner e ao processo do provider.
 
+#### Adendo autorizado — E7.3 (2026-09-29): mecanismo de terminação de árvore
+
+> Adendo aprovado por Pedro (decisões D2, D4 e D5 do planejamento da E7.3). Mantém o
+> objetivo do parágrafo acima — nenhum descendente sobrevive, e isso é **verificado** — e
+> troca o mecanismo do Windows. Implementado em `api/app/process_runtime/` (módulo definido
+> no adendo E7.3 de [01](01-v1-architecture.md) §2).
+
+**Windows — Job Object no lugar da enumeração recursiva de PIDs.** O Windows não guarda o
+vínculo pai→filho depois que o pai sai, e PIDs são reutilizados: enumerar e matar perde quem
+nasce no intervalo. Por isso:
+
+1. Job Object criado com `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+2. Processo raiz criado com `CREATE_SUSPENDED` e associado ao Job **antes** de executar
+   qualquer instrução — todo descendente nasce dentro do Job, sem janela de corrida.
+3. Retomada só por API Win32 documentada (`CreateToolhelp32Snapshot` + `Thread32First`/
+   `Thread32Next` + `OpenThread` + `ResumeThread`); sem `NtResumeProcess`.
+4. Término por `TerminateJobObject`; confirmação por `ActiveProcesses == 0` **e** por cada
+   processo visto no Job estar com o objeto de processo sinalizado.
+5. `KILL_ON_JOB_CLOSE` faz parte do ciclo de vida: se o supervisor morrer, o SO fecha o
+   handle do Job e a árvore é encerrada.
+6. Sem mecanismo de término cooperativo comprovado para uma árvore arbitrária, o
+   encerramento no Windows é forçado — não há período de graça genérico (D4).
+7. Falha ao criar, configurar, associar ou retomar é fail closed: o que foi criado é
+   encerrado e o resultado é `supervision_failed`. Nenhum processo roda sem contenção.
+
+**POSIX — sessão/grupo de processos.** Nova sessão (`start_new_session`) → `SIGTERM` ao
+grupo → período de graça → `SIGKILL` → colheita do raiz → verificação de grupo vazio.
+Limitações declaradas: descendente que chame `setsid`/`setpgid` escapa do grupo; não há
+equivalente simples a `KILL_ON_JOB_CLOSE` (supervisor morto por `SIGKILL` pode deixar
+descendentes); sem cgroups, subreaper ou contêiner.
+
+**Executável (D5).** `argv[0]` e `cwd` absolutos; `.bat`/`.cmd` recusados — seriam
+interpretados pelo `cmd.exe`, com regras de citação próprias.
+
+**Supervisão de processo não é sandbox.** Timeout, Job Object, ausência de shell e
+encerramento de árvore controlam o **ciclo de vida** do processo. Não impedem leitura de
+arquivos, escrita fora da worktree, acesso à rede, acesso a segredos, uso de APIs do SO nem
+criação de processos por mecanismos externos à árvore (serviços, WMI, COM, Agendador de
+Tarefas). O que §6 declara sobre o Test Runner continua valendo integralmente.
+
 ### Aprovação vinculada
 
 `approve` exige o `execution_fingerprint` completo ([02](02-data-model.md) §7). Qualquer

@@ -121,6 +121,25 @@ api/
 | **Interface pública** | Ver [05](05-provider-contracts.md). |
 | **Nota** | **(1B.3)** O Developer tem `execute_commands = disabled`: seus efeitos passam pela superfície mediada e fechada do `tool_executor`. O **Test Runner é infraestrutura do sistema**, governado por `TestPolicy` — não é ferramenta do Developer. Adaptador que não prova o perfil exigido **recusa a execução** (fail closed). |
 
+#### Adendo autorizado — E7.3 (2026-09-29): `process_runtime/` — supervisão de processos
+
+> Adendo aprovado por Pedro (decisões D1, D3 e D7 do planejamento da E7.3). **Não
+> substitui** o texto acima: retira de `agent_runtime/` apenas a implementação de
+> "supervisionar processos com timeout e cancelamento" e a entrega a um pacote próprio.
+> O mecanismo de terminação está no adendo E7.3 de [04](04-safety-and-git-runtime.md) §7.
+
+| | |
+| --- | --- |
+| **Responsabilidade** | Ciclo de vida de processo: iniciar sem shell (`argv` estruturado, executável e `cwd` absolutos, ambiente explícito), timeout, cancelamento, encerramento da árvore inteira, confirmação de que nenhum descendente sobreviveu e captura de `stdout`/`stderr` limitada durante a leitura. |
+| **Pode importar** | stdlib. Nenhum `app.*` fora do próprio pacote. |
+| **NÃO pode importar** | `db`, `orchestrator`, `agent_runtime`, `tool_executor`, `git_runtime`, `context_engine`, `api`, SDKs de provider. |
+| **Interface pública** | `ProcessSpec`, `ProcessOutcome`, `ProcessResult`, `InvalidProcessSpec`, `run_supervised(spec, is_cancelled)`. |
+| **Consumidores** | `TestRunner` e adaptadores de provider (E8), ligados no composition root. O `ToolExecutor` não o usa — não existe `ExecCommand`. `git_runtime/` mantém o próprio `subprocess` de leitura e não migra na E7.3 (D7). |
+| **Nota** | `agent_runtime/` continua com os contratos de provider e test runner (e, a partir da E8, os adaptadores) — não com a implementação de processos. `subprocess` passa a ser permitido **só** em `git_runtime/` e `process_runtime/` (`test_architecture.py`). A worktree define **onde** o processo roda (o `cwd`, resolvido por quem chama); `process_runtime` define **como** ele é controlado. **Supervisão de processo não é sandbox.** |
+
+Na ordem interna de L1, `process_runtime` é folha (nenhuma dependência de projeto). A aresta
+`agent_runtime → process_runtime` só passa a existir na E8.
+
 #### `context_engine/` — conhecimento do workspace
 
 | | |
