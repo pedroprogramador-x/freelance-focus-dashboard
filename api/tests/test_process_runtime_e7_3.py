@@ -1414,9 +1414,14 @@ if sys.platform == "win32":
         snapshot: dict[int, tuple[str, int]] | Exception,
     ) -> Any:
         """`ProcessTree` com raiz `ROOT_PID` e Win32 falsificada: listas completas do Job em
-        sequência, caminho de imagem por PID (`None` = ilegível) e snapshot Toolhelp32."""
-        queries = iter(listed)
-        monkeypatch.setattr(backend_module, "_job_process_ids", lambda job: next(queries))
+        sequência — a última se repete, como um Job que não muda mais —, caminho de imagem
+        por PID (`None` = ilegível) e snapshot Toolhelp32."""
+        queries = list(listed)
+
+        def job_pids(job: int) -> list[int]:
+            return queries.pop(0) if len(queries) > 1 else list(queries[0])
+
+        monkeypatch.setattr(backend_module, "_job_process_ids", job_pids)
         monkeypatch.setattr(backend_module, "_image_path", lambda pid: images.get(pid))
 
         def take_snapshot() -> dict[int, tuple[str, int]]:
@@ -1429,72 +1434,139 @@ if sys.platform == "win32":
         tree._job = 1  # não é handle real: só precisa não ser `None`
         return tree
 
+    @windows_only
+    def test_conhost_homonimo_que_permanece_no_job_e_orfao(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Finding P2 (reverificação do PR #4): nome `conhost.exe` + pai = raiz com imagem
+        ilegível **não** prova console host — um `C:\\Temp\\conhost.exe` filho do raiz
+        passaria. Candidato que continua no Job até o prazo é órfão."""
+        tree = _orphan_tree(
+            monkeypatch,
+            listed=[[CONHOST_PID]],
+            images={CONHOST_PID: None},
+            snapshot={CONHOST_PID: ("conhost.exe", ROOT_PID)},
+        )
+        started = time.monotonic()
+        assert tree.orphans_alive() is True
+        elapsed = time.monotonic() - started
+        assert backend_module._CONSOLE_SETTLE_S <= elapsed < 5  # esperou o prazo, e só ele
+
     @pytest.mark.parametrize(
-        ("listed", "snapshot", "orphan"),
+        ("listed", "images", "snapshot", "orphan"),
         [
             pytest.param(
-                [[CONHOST_PID]],
+                [[CONHOST_PID], [CONHOST_PID], []],
+                {CONHOST_PID: None},
                 {CONHOST_PID: ("conhost.exe", ROOT_PID)},
                 False,
-                id="1-conhost-filho-direto-do-raiz",
+                id="A-candidato-sai-sozinho",
             ),
             pytest.param(
-                [[CONHOST_PID]],
+                [[CONHOST_PID], []],
+                {CONHOST_PID: None},
                 {CONHOST_PID: ("CONHOST.EXE", ROOT_PID)},
                 False,
-                id="1b-nome-sem-diferenca-de-caixa",
+                id="A2-nome-sem-diferenca-de-caixa",
             ),
             pytest.param(
                 [[CONHOST_PID]],
-                {CONHOST_PID: ("conhost.exe", 999)},
+                {CONHOST_PID: None},
+                {CONHOST_PID: ("conhost.exe", ROOT_PID)},
                 True,
-                id="2-conhost-com-outro-pai",
+                id="B-candidato-permanece",
+            ),
+            pytest.param(
+                [[CONHOST_PID], [400]],
+                {CONHOST_PID: None, 400: None},
+                {CONHOST_PID: ("conhost.exe", ROOT_PID), 400: ("python.exe", CONHOST_PID)},
+                True,
+                id="C-candidato-sai-e-surge-outro-pid",
+            ),
+            pytest.param(
+                [[CONHOST_PID], [400]],
+                {CONHOST_PID: None, 400: "C:\\Temp\\filho.exe"},
+                {CONHOST_PID: ("conhost.exe", ROOT_PID)},
+                True,
+                id="C2-surge-outro-pid-com-imagem-legivel",
+            ),
+            pytest.param(
+                [[CONHOST_PID, 300], [300]],
+                {CONHOST_PID: None, 300: None},
+                {CONHOST_PID: ("conhost.exe", ROOT_PID), 300: ("conhost.exe", ROOT_PID)},
+                True,
+                id="D-candidato-sai-mas-outro-ja-existente-permanece",
             ),
             pytest.param(
                 [[CONHOST_PID]],
+                {CONHOST_PID: None},
                 {CONHOST_PID: ("python.exe", ROOT_PID)},
                 True,
-                id="3-outro-executavel",
+                id="E-outro-nome",
             ),
             pytest.param(
                 [[CONHOST_PID]],
+                {CONHOST_PID: None},
                 {CONHOST_PID: ("OpenConsole.exe", ROOT_PID)},
                 True,
-                id="3b-openconsole",
+                id="E2-openconsole",
             ),
-            pytest.param([[CONHOST_PID], []], {}, False, id="4-fora-do-snapshot-e-do-job"),
             pytest.param(
-                [[CONHOST_PID], [CONHOST_PID]], {}, True, id="5-fora-do-snapshot-ainda-no-job"
+                [[CONHOST_PID]],
+                {CONHOST_PID: None},
+                {CONHOST_PID: ("conhost.exe", 999)},
+                True,
+                id="F-outro-pai",
             ),
-            pytest.param([[CONHOST_PID]], OSError("snapshot"), True, id="6-snapshot-falha"),
+            pytest.param(
+                [[CONHOST_PID]],
+                {CONHOST_PID: None},
+                OSError("snapshot"),
+                True,
+                id="G-snapshot-falha",
+            ),
+            pytest.param(
+                [[CONHOST_PID], [CONHOST_PID]],
+                {CONHOST_PID: None},
+                {},
+                True,
+                id="J-fora-do-snapshot-ainda-no-job",
+            ),
+            pytest.param(
+                [[CONHOST_PID], []],
+                {CONHOST_PID: None},
+                {},
+                False,
+                id="J2-fora-do-snapshot-e-do-job",
+            ),
         ],
     )
     @windows_only
-    def test_imagem_ilegivel_usa_toolhelp_com_parentesco(
+    def test_imagem_ilegivel_exige_parentesco_e_saida_natural(
         monkeypatch: pytest.MonkeyPatch,
         listed: list[list[int]],
+        images: dict[int, str | None],
         snapshot: dict[int, tuple[str, int]] | Exception,
         orphan: bool,
     ) -> None:
-        """Imagem ilegível: só é console host o `conhost.exe` filho **direto** do raiz."""
-        tree = _orphan_tree(
-            monkeypatch, listed=listed, images={CONHOST_PID: None}, snapshot=snapshot
-        )
+        """Imagem ilegível: `conhost.exe` filho do raiz é só candidato e precisa sair sozinho
+        do Job; toda volta reclassifica a lista inteira, inclusive PIDs novos."""
+        tree = _orphan_tree(monkeypatch, listed=listed, images=images, snapshot=snapshot)
         assert tree.orphans_alive() is orphan
 
     @pytest.mark.parametrize(
         ("image", "orphan"),
         [
-            pytest.param("C:\\Windows\\System32\\conhost.exe", False, id="conhost-do-sistema"),
-            pytest.param("C:\\Temp\\conhost.exe", True, id="conhost-fora-do-sistema"),
-            pytest.param("C:\\Python\\python.exe", True, id="descendente-real"),
+            pytest.param("C:\\Windows\\System32\\conhost.exe", False, id="I-conhost-do-sistema"),
+            pytest.param("C:\\Temp\\conhost.exe", True, id="H-conhost-fora-do-sistema"),
+            pytest.param("C:\\Python\\python.exe", True, id="H2-descendente-real"),
         ],
     )
     @windows_only
     def test_imagem_legivel_mantem_regra_do_caminho(
         monkeypatch: pytest.MonkeyPatch, image: str, orphan: bool
     ) -> None:
-        """(7/8) Com a imagem legível decide o caminho, e o Toolhelp nem é consultado: um
+        """(H/I) Com a imagem legível decide o caminho, e o Toolhelp nem é consultado: um
         `conhost.exe` fora do diretório de sistema, mesmo filho do raiz, é órfão."""
         system_host = backend_module._CONSOLE_HOST
         assert system_host is not None
@@ -1509,7 +1581,7 @@ if sys.platform == "win32":
 
     @windows_only
     def test_console_host_nao_esconde_descendente_real(monkeypatch: pytest.MonkeyPatch) -> None:
-        """(8) Console host legítimo ao lado de um descendente real: continua órfão."""
+        """Candidato a console host ao lado de um descendente real: continua órfão."""
         tree = _orphan_tree(
             monkeypatch,
             listed=[[CONHOST_PID, 300]],

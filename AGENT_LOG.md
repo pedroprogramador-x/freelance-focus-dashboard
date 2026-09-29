@@ -7259,3 +7259,24 @@ imagem ilegível era contada como órfã. Localmente não reproduz (0/30); no ru
   passed, 3 skipped; ruff check/format, mypy e mypy --platform linux exit 0. Suíte completa
   não repetida (só `orphans_alive` mudou; baseline do PR: 2229 passed).
 - Pendências: CI do PR; reverificação do Codex; merge não autorizado; E7.4 não iniciada.
+
+## 2026-09-29 — Claude Opus 5.5 (effort: medium) — E7.3: P2 do `conhost.exe` homônimo (PR #4)
+
+Reverificação do Codex sobre `4b63e539`: P2 — no fallback Toolhelp32 (imagem ilegível), nome
+`conhost.exe` + pai = raiz bastava para não contar como órfão; um `C:\Temp\conhost.exe` real,
+filho do raiz, vivo no Job, seria escondido (`orphans_killed=False`). `tree_confirmed_dead`
+não era afetado.
+
+- Correção (só `ProcessTree.orphans_alive`; por AST, `_freeze`, `_job_process_ids`,
+  `_open_member`, `_capture_members`, `confirm_dead`, `kill`, `close`, `start` idênticos):
+  nome + pai passam a ser só **candidato**; ele precisa sair sozinho da lista completa do
+  Job em até `_CONSOLE_SETTLE_S = 0,25 s` (runner: < 50 ms), senão é órfão. Cada volta
+  relê e reclassifica a lista inteira, então PID novo ou remanescente durante a janela é
+  classificado normalmente. Imagem legível: regra do caminho inalterada. A janela só
+  observa; não sinaliza nada (D4 inalterada) e não entra na confirmação de morte.
+- Testes: `test_conhost_homonimo_que_permanece_no_job_e_orfao` + 12 casos (A–J), e o caso
+  simples real repetido 25× preservado. O teste do finding e os casos B, C, C2 e D falham
+  com o `_windows.py` de `4b63e539` e passam com a correção.
+- Gates locais (Windows): E7.3 121 passed, 3 skipped (2×); architecture 183; afetados 524
+  passed, 3 skipped; ruff check/format, mypy e mypy --platform linux exit 0.
+- Pendências: CI do PR; reverificação pontual do Codex; merge não autorizado; E7.4 não iniciada.

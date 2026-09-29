@@ -99,6 +99,13 @@ _PIPE_POLL_S = 0.01
 #: Nome da imagem do console host, usado só no fallback Toolhelp32 de `orphans_alive`.
 _CONSOLE_HOST_NAME = "conhost.exe"
 
+#: Prazo para um candidato a console host (imagem ilegível, `conhost.exe`, filho do raiz)
+#: sair sozinho do Job. No runner ele sai em < 50 ms (PR #4); 0,25 s dá folga de 5x sem
+#: pesar no caso normal, em que a espera termina assim que ele sai. Não é término
+#: cooperativo: nada é sinalizado durante a janela.
+_CONSOLE_SETTLE_S = 0.25
+_CONSOLE_SETTLE_POLL_S = 0.005
+
 #: `JOBOBJECT_BASIC_PROCESS_ID_LIST`: capacidade inicial, folga ao ampliar, teto defensivo
 #: (Job maior que isto é recusado — fail closed) e número máximo de consultas.
 _PID_LIST_INITIAL = 64
@@ -577,57 +584,65 @@ class ProcessTree:
             _CloseHandle(handle)
 
     def orphans_alive(self) -> bool:
-        """Chamado quando o raiz já saiu: resta no Job algum processo além do console host?
+        """Chamado quando o raiz já saiu: resta no Job algum descendente deixado para trás?
 
         `CREATE_NO_WINDOW` dá ao raiz um console próprio, e o `conhost.exe` desse console
-        roda **dentro** do Job e sobrevive alguns milissegundos à saída do raiz. Ele não é um
-        descendente deixado para trás — é infraestrutura do console — e é identificado pelo
-        caminho da imagem no diretório de sistema, não por tempo de espera.
+        roda **dentro** do Job e sobrevive alguns milissegundos à saída do raiz. Ele é
+        infraestrutura do console, não descendente deixado para trás. Cada volta relê a lista
+        **completa** do Job e classifica todo PID nela:
 
-        No runner `windows-latest` o `conhost.exe` em desmontagem nega
-        `QueryFullProcessImageNameW` (`ERROR_ACCESS_DENIED`, observado no PR #4). Só para PID
-        cuja imagem não pôde ser lida, o fallback é um snapshot Toolhelp32:
+        * imagem legível: só `System32\\conhost.exe` não é órfão; qualquer outro caminho é;
+        * imagem ilegível (o runner `windows-latest` nega `QueryFullProcessImageNameW` ao
+          `conhost.exe` em desmontagem — PR #4): snapshot Toolhelp32. Outro nome ou outro pai
+          → órfão. Nome `conhost.exe` com pai exatamente o raiz é só **candidato**: não prova
+          nada, porque qualquer executável pode se chamar assim. O candidato precisa **sair
+          sozinho** da lista do Job em até `_CONSOLE_SETTLE_S`; se ainda estiver listado no
+          prazo, é órfão;
+        * ausente do snapshot: se ainda estiver na lista relida, órfão.
 
-        * presente, nome exatamente `conhost.exe` **e** pai exatamente o raiz → console host
-          do raiz, não é órfão;
-        * presente com outro nome ou outro pai → órfão;
-        * ausente → relê a lista completa do Job: fora dela, terminou (não é órfão); ainda
-          nela, sem identidade → órfão;
-        * snapshot que falha → órfão.
+        Como toda volta reclassifica a lista inteira, um PID que surja ou permaneça enquanto
+        o candidato sai (por exemplo, filho de um falso `conhost.exe`) é classificado
+        normalmente. Toolhelp que falha → órfão. Falha da lista do Job sobe como `OSError`.
 
-        Na dúvida, sinaliza em vez de esconder. Isto só decide `orphans_killed`: todos,
-        console host incluído, são encerrados do mesmo jeito por `kill`, e a confirmação de
-        morte (`confirm_dead`) não usa esta classificação.
+        A janela só **observa** a retirada natural do console; não é término cooperativo
+        (D4 inalterada) e não participa da confirmação de morte. Isto decide apenas
+        `orphans_killed`: todos, console host incluído, são encerrados por `kill`, e
+        `confirm_dead` não usa esta classificação.
         """
         if self._job is None or self._confirmed_dead:
             return False
         job = self._job
-        unreadable: list[int] = []
-        for pid in _job_process_ids(job):
-            path = _image_path(pid)
-            if path is None:
-                unreadable.append(pid)
-            elif not _is_console_host_path(path):
+        root = self.popen.pid
+        deadline = time.monotonic() + _CONSOLE_SETTLE_S
+        while True:
+            unreadable: list[int] = []
+            for pid in _job_process_ids(job):
+                path = _image_path(pid)
+                if path is None:
+                    unreadable.append(pid)
+                elif not _is_console_host_path(path):
+                    return True
+            if not unreadable:
+                return False
+            try:
+                snapshot = _process_snapshot()
+            except OSError:
                 return True
-        if not unreadable:
-            return False
-        try:
-            snapshot = _process_snapshot()
-        except OSError:
-            return True
-        vanished: list[int] = []
-        for pid in unreadable:
-            entry = snapshot.get(pid)
-            if entry is None:
-                vanished.append(pid)
-                continue
-            name, parent = entry
-            if name.lower() != _CONSOLE_HOST_NAME or parent != self.popen.pid:
+            unidentified: list[int] = []
+            for pid in unreadable:
+                entry = snapshot.get(pid)
+                if entry is None:
+                    unidentified.append(pid)
+                    continue
+                name, parent = entry
+                if name.lower() != _CONSOLE_HOST_NAME or parent != root:
+                    return True
+            if unidentified and set(unidentified) & set(_job_process_ids(job)):
                 return True
-        if vanished:
-            still_listed = set(_job_process_ids(job))
-            return any(pid in still_listed for pid in vanished)
-        return False
+            # Só candidatos a console host (ou PIDs que já saíram) restam: esperar a saída.
+            if time.monotonic() >= deadline:
+                return True
+            time.sleep(_CONSOLE_SETTLE_POLL_S)
 
     def kill(self, grace_s: float) -> None:
         """Encerra a árvore inteira. `grace_s` é ignorado no Windows (D4)."""
