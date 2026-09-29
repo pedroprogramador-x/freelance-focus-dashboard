@@ -1471,3 +1471,74 @@ def test_setsid_segurando_o_pipe_e_detectado(tmp_path: Path, watches: dict[str, 
         pid_file = tmp_path / "esc.pid"
         if pid_file.exists() and "esc" not in watches:
             watches["esc"] = Watch(int(pid_file.read_text()))
+
+
+# ============================================ DIAGNÓSTICO TEMPORÁRIO (PR #4) — NÃO MERGEAR
+# Descobre qual processo faz `orphans_alive()` responder True no windows-latest. Falha de
+# propósito com os dados na mensagem para que apareçam no log da CI. Será removido.
+
+if sys.platform == "win32":
+
+    def _diag_describe(tree: Any) -> dict[str, Any]:
+        job = tree._job
+        entries: list[dict[str, Any]] = []
+        try:
+            pids = backend_module._job_process_ids(job)
+        except OSError as exc:
+            return {"job_list_error": str(exc)}
+        for pid in pids:
+            entry: dict[str, Any] = {"pid": pid, "is_root": pid == tree.popen.pid}
+            entry["image"] = backend_module._image_path(pid)
+            entry["is_console_host"] = backend_module._is_console_host(pid)
+            handle = backend_module._OpenProcess(
+                backend_module._SYNCHRONIZE | backend_module._PROCESS_QUERY_LIMITED_INFORMATION,
+                False,
+                pid,
+            )
+            if not handle:
+                entry["open_error"] = ctypes.get_last_error()
+            else:
+                in_job = wintypes.BOOL()
+                ok = backend_module._IsProcessInJob(handle, job, ctypes.byref(in_job))
+                entry["in_job"] = bool(in_job.value) if ok else f"erro {ctypes.get_last_error()}"
+                entry["signaled"] = backend_module._WaitForSingleObject(handle, 0) == 0
+                backend_module._CloseHandle(handle)
+            entries.append(entry)
+        return {
+            "root_pid": tree.popen.pid,
+            "root_returncode": tree.popen.returncode,
+            "active": backend_module._active_processes(job),
+            "members": entries,
+        }
+
+    def test_zz_diagnostico_orfaos_windows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import platform
+
+        observations: list[dict[str, Any]] = []
+        real = backend_module.ProcessTree.orphans_alive
+
+        def spy(self: Any) -> bool:
+            answer = bool(real(self))
+            if answer:
+                first = _diag_describe(self)
+                time.sleep(0.05)
+                observations.append({"t0": first, "t+50ms": _diag_describe(self)})
+            return answer
+
+        monkeypatch.setattr(backend_module.ProcessTree, "orphans_alive", spy)
+        code = "import sys; sys.stdout.write('ok'); sys.stderr.write('aviso')"
+        flagged = 0
+        for _ in range(30):
+            result = run_supervised(spec(tmp_path, "-c", code), never)
+            flagged += result.orphans_killed
+        header = {
+            "platform": platform.platform(),
+            "python": sys.version,
+            "executable": PYTHON,
+            "console_host_expected": backend_module._CONSOLE_HOST,
+            "runs": 30,
+            "orphans_killed": flagged,
+        }
+        raise AssertionError(
+            "DIAGNOSTICO " + json.dumps({"header": header, "observations": observations[:5]})
+        )
