@@ -1566,27 +1566,51 @@ if sys.platform == "win32":
         observations: list[dict[str, Any]] = []
         real = backend_module.ProcessTree.orphans_alive
 
+        identities: dict[int, Any] = {}
+        stops: dict[int, threading.Event] = {}
+        real_start = backend_module.start
+
+        def watched_start(spec_: ProcessSpec) -> Any:
+            tree = real_start(spec_)
+            stop = threading.Event()
+
+            def watch() -> None:
+                while not stop.is_set() and tree._job is not None:
+                    try:
+                        pids = backend_module._job_process_ids(tree._job)
+                    except OSError:
+                        return
+                    unknown = [pid for pid in pids if pid not in identities]
+                    if unknown:
+                        snap = _diag_toolhelp()
+                        for pid in unknown:
+                            identities[pid] = snap.get(pid, "fora do snapshot")
+                    time.sleep(0.002)
+
+            thread = threading.Thread(target=watch, daemon=True)
+            thread.start()
+            stops[id(tree)] = stop
+            return tree
+
         def spy(self: Any) -> bool:
-            snapshot = _diag_toolhelp()  # antes de qualquer consulta lenta
             job_pids = backend_module._job_process_ids(self._job)
             answer = bool(real(self))
+            stops[id(self)].set()
             if answer:
                 root = self.popen.pid
                 observations.append(
                     {
                         "root_pid": root,
-                        "root_in_snapshot": snapshot.get(root),
-                        "job_pids_before": [
-                            {"pid": pid, "snapshot": snapshot.get(pid)} for pid in job_pids
+                        "root_identity": identities.get(root),
+                        "flagged": [
+                            {"pid": pid, "identity": identities.get(pid, "nunca visto")}
+                            for pid in job_pids
                         ],
-                        "children_of_root": {
-                            pid: info for pid, info in snapshot.items() if info["parent"] == root
-                        },
-                        "t0": _diag_describe(self),
                     }
                 )
             return answer
 
+        monkeypatch.setattr(backend_module, "start", watched_start)
         monkeypatch.setattr(backend_module.ProcessTree, "orphans_alive", spy)
         code = "import sys; sys.stdout.write('ok'); sys.stderr.write('aviso')"
         flagged = 0
