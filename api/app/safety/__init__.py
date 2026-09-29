@@ -17,10 +17,25 @@ sinais de segredo no texto do objetivo, [03] §5). A segunda existe para que
 `orchestrator/` **não** ganhe uma segunda lista de nomes sensíveis nem uma segunda
 denylist de caminho — ela reaproveita `is_sensitive_key` e `classify_path_secrecy`.
 
+A E7.1 acrescenta `capability_profile`: o contrato puro das sete capabilities e a política
+de aceitação da V1 — vocabulário e veredito, sem prova nem provider.
+
 Fora da E2 (fica para o Full Safety Runtime, E7): política de comandos, enforcement de
 escrita, `ToolExecutor`, capability, processos, timeout, worktree.
 """
 
+from app.safety.capability_profile import (
+    Capability,
+    CapabilityProfileRejected,
+    EnforcementMode,
+    InvalidCapabilityProfile,
+    ProviderCapabilityProfile,
+    ProviderRole,
+    check_v1,
+    fingerprint_v1_projection,
+    parse_capability_profile,
+    require_v1,
+)
 from app.safety.objective_signals import (
     OBJECTIVE_MENTIONS_SECRET,
     AnalyzerSignal,
@@ -53,26 +68,36 @@ from app.safety.types import (
 __all__ = [
     "OBJECTIVE_MENTIONS_SECRET",
     "AnalyzerSignal",
+    "Capability",
+    "CapabilityProfileRejected",
+    "EnforcementMode",
+    "InvalidCapabilityProfile",
     "ObjectIdentity",
     "PathFacts",
     "PathForm",
     "PathIntent",
+    "ProviderCapabilityProfile",
+    "ProviderRole",
     "SafetyDecision",
     "SafetyPolicy",
     "SecretPolicy",
     "SecretVerdict",
     "SourceRefResult",
     "Tri",
+    "check_v1",
     "classify_path_form",
     "classify_path_secrecy",
     "contains_redaction_marker",
     "decide_path",
     "decide_post_open",
     "detect_sensitive_objective_signals",
+    "fingerprint_v1_projection",
     "is_sensitive_key",
+    "parse_capability_profile",
     "policy_hash",
     "prevalidate_path_syntax",
     "redact",
     "redact_document",
+    "require_v1",
     "validate_source_ref",
 ]

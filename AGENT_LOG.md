@@ -6958,3 +6958,129 @@ nada — o relatório é preventivo, sinalizando antes de qualquer staging.
 * Nada commitado. Nada pushado. Nenhum código, teste ou documento normativo alterado por esta
   tarefa — só `AGENT_LOG.md` (esta entrada), `docs/audits/e6-final-release-review.md` (novo) e
   `docs/audits/e6-final-inventory.md` (corrigido).
+
+## 2026-09-29 — Claude Sonnet 5 (effort: high) — Atualização da main pós-merge E6 e planejamento da E7 (Vercel/Supabase)
+
+Tarefa somente-análise/planejamento, sem escopo de implementação. `git fetch origin` + `git
+switch main` + `git pull --ff-only origin main`, confirmando `main` local e `origin/main`
+sincronizados em `0fe357e57242392d7a955049c62f60234554660d` (merge do PR #1, integrando
+`e6/fechamento-cons5v`). A branch `e6/fechamento-cons5v` foi preservada, local e em
+`origin`, em `caa5a4b`. Working tree limpa antes e depois.
+
+Leitura direta do código atual (não do roadmap) para calibrar o escopo da E7:
+`orchestrator/execution_manager.py`, `orchestrator/resource_router.py`,
+`orchestrator/planner.py`, `orchestrator/state_machine.py`, `git_runtime/__init__.py`,
+`safety/test_policy.py`, `orchestrator/fingerprint.py`, além de
+`docs/architecture/04-safety-and-git-runtime.md`, `05-provider-contracts.md`,
+`07-roadmap-v1.md`, ADR-0001, ADR-0004, ADR-0009. Confirmado: `state_machine.CapabilityProver`
+(Protocol) e a guarda de entrada `check_entry_guard`/`_check_capability` já existem e já
+recusam fail-closed com `prover=None`; `execution_manager.start_execution` já aplica todas as
+guardas de `approved → executing` e levanta `NotImplementedError` de propósito — o ponto de
+extensão da E7 está pronto e fechado, não é lacuna. `git_runtime/` é hoje **só leitura**
+(`preflight`, `probe_head`, `list_tree`, diffs de working tree); nenhuma criação de worktree
+existe ainda. `agent_runtime/` e `tool_executor/` (nomeados nas ADRs 0005/0009) **não
+existem**. `safety/test_policy.py` já valida e hasheia `TestPolicy`, mas não executa nada.
+
+- Arquivos alterados:
+  - `AGENT_LOG.md` — esta entrada.
+  - Nenhum outro arquivo. Nenhum código, ADR, documento de `docs/architecture/` ou roadmap
+    foi tocado, conforme restrição explícita da tarefa.
+
+- Decisões tomadas: nenhuma decisão de arquitetura foi **fixada** — a tarefa é uma proposta,
+  apresentada ao Pedro no chat e aguardando aprovação. Resumo do que foi proposto:
+  - **Model Router**: tabela determinística `(risk, complexity, agent_role) → (tier, reasoning_effort)`,
+    sem LLM, no mesmo padrão do Resource Router; resolve para `model_id` concreto via config
+    do adaptador (preserva neutralidade de provider); entra no fingerprint via
+    `model_policy_hash`, nascendo **inerte em E7** (mesmo padrão que `MAX_FIX_ROUNDS` já usa
+    desde a E6) e ativando em E8 junto com `developer_binding`.
+  - **Escopo mínimo da E7**, em 8 incrementos: `ProviderCapabilityProfile` em `safety/`;
+    interfaces/DTOs de `agent_runtime/` (sem adaptador concreto); supervisor de processo
+    (timeout/cancelamento/kill de árvore); criação de worktree em `git_runtime/` (só
+    `worktree add/remove/prune`, nenhum verbo mutante novo); `ToolExecutor`/`ToolExecutorFactory`
+    em `tool_executor/` com a superfície fechada de 9 operações; enforcement de capability
+    fail-closed com um `CapabilityProver` **fake** (sem adaptador real); verificação
+    pós-execução + `start_execution` fim-a-fim (ainda só com fakes de Developer/TestRunner);
+    tabela do Model Router inerte.
+  - **Vercel/Supabase**: recomendado **não implementar antes de E11/E12**. Worker local deve
+    ser sempre quem **puxa** tarefas (poll autenticado ou canal Realtime), nunca quem escuta
+    porta aberta. FastAPI permanece local durante E7–E11; controle de estado/aprovação só
+    migraria para um control-plane hospedado depois, como decisão separada. SQLite→Postgres:
+    nenhuma mudança necessária agora (SQLAlchemy + Alembic já são migration-friendly); único
+    ponto real de atenção identificado é `db/conflicts.py`, que classifica conflito de
+    escrita por código de erro **específico do SQLite** (`SQLITE_BUSY_SNAPSHOT`) e vai
+    precisar de um classificador irmão para Postgres quando a migração acontecer — registrado,
+    não corrigido (fora de escopo).
+  - Adaptador do Claude Code para E8: recomendado o **Agent SDK** (loop de tool-use
+    programático) em vez de envolver a CLI interativa, para que `MediatedTools` mapeie
+    diretamente no schema de ferramentas do SDK (`enforcement_method = api_tool_schema`).
+
+- Pendências (decisões que aguardam aprovação do Pedro, listadas na análise apresentada no
+  chat): nomes/local exato de `agent_runtime/`/`tool_executor/`; adaptador do Claude Code
+  (Agent SDK vs. CLI); local do supervisor de processo; ativar Model Router inerte já em E7
+  vs. adiar para E8; momento de revisitar divisão control-plane/execution-plane para
+  Vercel/Supabase; autorização para iniciar a implementação de E7; confirmação de que a
+  branch de trabalho de E7 nasce de `main` (`0fe357e`).
+
+Nada commitado. Nada pushado. Nenhuma branch criada. Nenhum código de E7 escrito — tarefa
+era só análise e planejamento, conforme solicitado.
+
+## 2026-09-29 — Claude Sonnet 5.5 (effort: high) — E7.1: Provider Capability Profile (contrato puro)
+
+Implementação restrita da E7.1, autorizada pelo Pedro com as seis decisões da revisão
+independente. Branch `e7/01-capability-profile`, criada a partir de `main` em `0fe357e` com o
+`AGENT_LOG.md` (entrada anterior de planejamento, sem commit) preservado. Sem commit, sem
+push, sem PR.
+
+O que foi feito: contrato tipado das **sete** capabilities (`read_files`, `write_files`,
+`execute_commands`, `git_read`, `git_write`, `network`, `external_paths`) e dos **quatro**
+modos (`disabled`, `mediated`, `fixed_operations_only`, `unmediated`), com política de
+aceitação da V1 = igualdade **exata** com o perfil oficial do papel (Developer/Auditor).
+`unmediated` é representável (diagnóstico) e nunca aceito. `fingerprint_v1_projection` valida
+o perfil completo (`require_v1`, Developer) **antes** de projetar o documento histórico —
+necessário porque o documento v1 só cobre 4 capabilities (`network` sai como `network_access`;
+`git_read`, `git_write` e `external_paths` não entram no hash).
+
+- Arquivos alterados:
+  - `api/app/safety/capability_profile.py` — novo.
+  - `api/app/safety/__init__.py` — exports + nota de docstring.
+  - `api/tests/test_capability_profile_e7_1.py` — novo. Vetores literais capturados em
+    `0fe357e` antes da edição: JSON do perfil requerido, hash `22995a18…040aa1`, e
+    fingerprint v1 completo `ac3adc91…27731c`.
+  - `AGENT_LOG.md` — esta entrada.
+  - NÃO tocados: `docs/`, ADRs, `orchestrator/` (`fingerprint.py` intacto), migrações, `src/`.
+
+- Decisões tomadas:
+  - `execution_fingerprint` v1 e `REQUIRED_TOOL_PROFILE` preservados byte a byte; sem
+    `model_policy_hash`; `developer_binding`/`auditor_binding` intocados.
+  - `orchestrator/` não importa o módulo novo (teste garante); a ligação com a guarda
+    `approved → executing` fica para incremento posterior.
+  - `enforcement_method`/`enforcement_evidence` ficam fora: pertencem à prova, não ao perfil.
+  - Testes usam só dados puros; nenhuma prova de enforcement real foi feita nem alegada.
+
+- Gates: ruff check, ruff format --check e mypy limpos; suíte completa do backend com exit 0
+  (3 testes `skipped`, causa não investigada nesta sessão — a linha-resumo do pytest não foi
+  capturada). Um mutante deliberado na projeção foi detectado pelos testes.
+
+- Pendências: auditoria independente (Codex); E7.2–E7.8 não iniciadas; decisão Agent SDK vs
+  CLI e Model Router ficam para E8; testes reais no Windows para supervisão/isolamento nas
+  etapas futuras.
+
+## 2026-09-29 — Claude Sonnet 5.5 (effort: medium) — E7.1: evidências de gates (pós-BLOCKED do Codex)
+
+Só validação; nenhum código alterado. Venv oficial
+`C:\Users\pedro\AppData\Local\FreelanceFocus\venvs\api` (Python 3.11.9, pytest 8.4.2,
+fastapi 0.115.14, alembic 1.14.1, sqlalchemy 2.0.54, starlette 0.46.2, anyio 4.14.2,
+ruff 0.9.10, mypy 1.20.2 — todos dentro das faixas do `pyproject.toml`).
+
+- E7.1: 96 passed. Afetados (E7.1 + architecture + fingerprint + state_machine + planner):
+  488 passed. Suíte completa: **2005 passed, 6 skipped, 0 failed, 0 errors** (666 s).
+- Skips (6, todos preexistentes, ambiente Windows): 1 "volumes distintos" e 2 "symlink
+  indisponível" em `test_path_runtime.py`; 3 "symlink indisponível" em
+  `test_security_regressions.py`.
+- Correção: a entrada anterior dizia "3 skipped". Estava errada — o `tail` só mostrava o
+  segundo grupo de `sss`; o primeiro (78%) ficou fora da janela. O número real é 6.
+- ruff check, ruff format --check (118 arquivos) e mypy (115 arquivos): limpos.
+- Logs fora do repo: scratchpad da sessão (`run1_e71.log`, `run2_affected.log`,
+  `run3_full.log`, `static_*.log`).
+- As falhas/erros do Codex (3 failed, 622 errors) vieram de Python 3.14/pytest 9/FastAPI
+  0.135 fora das faixas do projeto; não reproduzem no ambiente correto.
