@@ -75,6 +75,7 @@ _THREAD_SUSPEND_RESUME = 0x0002
 _SYNCHRONIZE = 0x00100000
 _WAIT_OBJECT_0 = 0
 
+_TH32CS_SNAPPROCESS = 0x00000002
 _TH32CS_SNAPTHREAD = 0x00000004
 _ERROR_NO_MORE_FILES = 18
 _ERROR_INVALID_PARAMETER = 87
@@ -94,6 +95,9 @@ _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _TERMINATED_EXIT_CODE = 1
 
 _PIPE_POLL_S = 0.01
+
+#: Nome da imagem do console host, usado só no fallback Toolhelp32 de `orphans_alive`.
+_CONSOLE_HOST_NAME = "conhost.exe"
 
 #: `JOBOBJECT_BASIC_PROCESS_ID_LIST`: capacidade inicial, folga ao ampliar, teto defensivo
 #: (Job maior que isto é recusado — fail closed) e número máximo de consultas.
@@ -170,6 +174,21 @@ class _ThreadEntry32(ctypes.Structure):
     )
 
 
+class _ProcessEntry32W(ctypes.Structure):
+    _fields_ = (
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", ctypes.c_wchar * 260),
+    )
+
+
 # ------------------------------------------------------------------------------- kernel32
 
 #: Instância própria: `argtypes`/`restype` definidos aqui não vazam para `ctypes.windll`.
@@ -221,6 +240,12 @@ _Thread32First = _bind(
 )
 _Thread32Next = _bind(
     "Thread32Next", wintypes.BOOL, wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)
+)
+_Process32FirstW = _bind(
+    "Process32FirstW", wintypes.BOOL, wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W)
+)
+_Process32NextW = _bind(
+    "Process32NextW", wintypes.BOOL, wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W)
 )
 _QueryFullProcessImageNameW = _bind(
     "QueryFullProcessImageNameW",
@@ -391,7 +416,7 @@ def _system_console_host() -> str | None:
     length = _GetSystemDirectoryW(buffer, len(buffer))
     if not length or length >= len(buffer):
         return None
-    return os.path.normcase(os.path.join(buffer.value, "conhost.exe"))
+    return os.path.normcase(os.path.join(buffer.value, _CONSOLE_HOST_NAME))
 
 
 #: `%SystemRoot%\System32\conhost.exe`, obtido do SO e não do ambiente.
@@ -412,11 +437,32 @@ def _image_path(pid: int) -> str | None:
         _CloseHandle(process)
 
 
-def _is_console_host(pid: int) -> bool:
-    path = _image_path(pid)
-    if _CONSOLE_HOST is None or path is None:
-        return False
-    return os.path.normcase(path) == _CONSOLE_HOST
+def _is_console_host_path(path: str) -> bool:
+    return _CONSOLE_HOST is not None and os.path.normcase(path) == _CONSOLE_HOST
+
+
+def _process_snapshot() -> dict[int, tuple[str, int]]:
+    """`{pid: (nome do executável, PID do pai)}` de todo processo do sistema (Toolhelp32).
+
+    Snapshot que não pode ser tirado ou percorrido até `ERROR_NO_MORE_FILES` → `OSError`.
+    """
+    snapshot = _CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    if not snapshot or snapshot == _INVALID_HANDLE_VALUE:
+        raise OSError(_win_error("CreateToolhelp32Snapshot"))
+    try:
+        entry = _ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(_ProcessEntry32W)
+        found: dict[int, tuple[str, int]] = {}
+        more = _Process32FirstW(snapshot, ctypes.byref(entry))
+        while more:
+            found[int(entry.th32ProcessID)] = (entry.szExeFile, int(entry.th32ParentProcessID))
+            entry.dwSize = ctypes.sizeof(_ProcessEntry32W)
+            more = _Process32NextW(snapshot, ctypes.byref(entry))
+        if ctypes.get_last_error() != _ERROR_NO_MORE_FILES:
+            raise OSError(_win_error("Process32NextW"))
+        return found
+    finally:
+        _CloseHandle(snapshot)
 
 
 def _assign(popen: subprocess.Popen[bytes], job: int) -> None:
@@ -536,13 +582,52 @@ class ProcessTree:
         `CREATE_NO_WINDOW` dá ao raiz um console próprio, e o `conhost.exe` desse console
         roda **dentro** do Job e sobrevive alguns milissegundos à saída do raiz. Ele não é um
         descendente deixado para trás — é infraestrutura do console — e é identificado pelo
-        caminho da imagem no diretório de sistema, não por tempo de espera. Processo que não
-        pôde ser identificado conta como órfão (sinaliza em vez de esconder). Todos, console
-        host incluído, são encerrados do mesmo jeito por `kill`.
+        caminho da imagem no diretório de sistema, não por tempo de espera.
+
+        No runner `windows-latest` o `conhost.exe` em desmontagem nega
+        `QueryFullProcessImageNameW` (`ERROR_ACCESS_DENIED`, observado no PR #4). Só para PID
+        cuja imagem não pôde ser lida, o fallback é um snapshot Toolhelp32:
+
+        * presente, nome exatamente `conhost.exe` **e** pai exatamente o raiz → console host
+          do raiz, não é órfão;
+        * presente com outro nome ou outro pai → órfão;
+        * ausente → relê a lista completa do Job: fora dela, terminou (não é órfão); ainda
+          nela, sem identidade → órfão;
+        * snapshot que falha → órfão.
+
+        Na dúvida, sinaliza em vez de esconder. Isto só decide `orphans_killed`: todos,
+        console host incluído, são encerrados do mesmo jeito por `kill`, e a confirmação de
+        morte (`confirm_dead`) não usa esta classificação.
         """
         if self._job is None or self._confirmed_dead:
             return False
-        return any(not _is_console_host(pid) for pid in _job_process_ids(self._job))
+        job = self._job
+        unreadable: list[int] = []
+        for pid in _job_process_ids(job):
+            path = _image_path(pid)
+            if path is None:
+                unreadable.append(pid)
+            elif not _is_console_host_path(path):
+                return True
+        if not unreadable:
+            return False
+        try:
+            snapshot = _process_snapshot()
+        except OSError:
+            return True
+        vanished: list[int] = []
+        for pid in unreadable:
+            entry = snapshot.get(pid)
+            if entry is None:
+                vanished.append(pid)
+                continue
+            name, parent = entry
+            if name.lower() != _CONSOLE_HOST_NAME or parent != self.popen.pid:
+                return True
+        if vanished:
+            still_listed = set(_job_process_ids(job))
+            return any(pid in still_listed for pid in vanished)
+        return False
 
     def kill(self, grace_s: float) -> None:
         """Encerra a árvore inteira. `grace_s` é ignorado no Windows (D4)."""

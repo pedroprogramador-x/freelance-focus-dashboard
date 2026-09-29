@@ -7236,3 +7236,26 @@ Ainda sem commit, push ou PR; branch `e7/03-process-supervisor`.
   processo residual.
 - Pendências: reverificação independente (Codex); CI Windows/Linux ainda não executada;
   E7.4 não iniciada.
+
+## 2026-09-29 — Claude Opus 5.5 (effort: medium) — E7.3: falso `orphans_killed` no windows-latest (PR #4)
+
+Primeiro gate real da CI Windows falhou em `test_processo_simples_conclui` (`orphans_killed=True`
+num processo sem filhos). Quatro commits de diagnóstico temporários no PR #4 identificaram,
+no runner (Windows 10.0.26100), o PID extra: `conhost.exe`, filho direto do raiz, ainda no
+Job, com `QueryFullProcessImageNameW` negado (`ERROR_ACCESS_DENIED`) e extinto em < 50 ms —
+imagem ilegível era contada como órfã. Localmente não reproduz (0/30); no runner, 21/30.
+
+- Correção (só `orphans_alive` e auxiliares em `_windows.py`; `confirm_dead`, `_freeze`,
+  `_capture_members` e a correção do P2 intocados): imagem legível segue a regra do caminho
+  `System32\conhost.exe`; imagem ilegível usa snapshot Toolhelp32 (`Process32FirstW`/
+  `Process32NextW`) — só não é órfão o `conhost.exe` cujo pai é exatamente o raiz; outro
+  nome/pai → órfão; ausente do snapshot → relê a lista completa do Job (fora = terminou,
+  ainda listado = órfão); snapshot falho → órfão. Afeta só `orphans_killed`.
+- Diagnóstico removido integralmente (arquivo de testes voltou ao de `3651664` antes dos
+  testes novos). `test_architecture.py`: as duas APIs novas na lista Win32 permitida.
+- Testes: 12 unitários de classificação + snapshot real + caso simples repetido 25×.
+  4 mutantes da classificação, todos detectados.
+- Gates locais (Windows): E7.3 116 passed, 3 skipped (2×); architecture 183; afetados 519
+  passed, 3 skipped; ruff check/format, mypy e mypy --platform linux exit 0. Suíte completa
+  não repetida (só `orphans_alive` mudou; baseline do PR: 2229 passed).
+- Pendências: CI do PR; reverificação do Codex; merge não autorizado; E7.4 não iniciada.

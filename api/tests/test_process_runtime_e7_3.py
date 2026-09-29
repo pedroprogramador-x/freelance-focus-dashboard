@@ -669,15 +669,18 @@ def test_leitor_nunca_guarda_mais_que_o_limite(monkeypatch: pytest.MonkeyPatch) 
 
 @os_process
 def test_processo_simples_conclui(tmp_path: Path) -> None:
-    """(A)"""
+    """(A) Repetido: no `windows-latest` o `conhost.exe` do raiz, ainda no Job e com a imagem
+    ilegível, virava falso órfão em cerca de 2 de cada 3 execuções (PR #4). Um processo sem
+    filhos nunca deixa órfão."""
     code = "import sys; sys.stdout.write('ok'); sys.stderr.write('aviso')"
-    result = run_supervised(spec(tmp_path, "-c", code), never)
-    assert result.outcome is ProcessOutcome.EXITED
-    assert result.exit_code == 0
-    assert (result.stdout, result.stderr) == (b"ok", b"aviso")
-    assert not (result.stdout_truncated or result.stderr_truncated)
-    assert not result.orphans_killed
-    assert_clean_result(result)
+    for _ in range(25):
+        result = run_supervised(spec(tmp_path, "-c", code), never)
+        assert result.outcome is ProcessOutcome.EXITED
+        assert result.exit_code == 0
+        assert (result.stdout, result.stderr) == (b"ok", b"aviso")
+        assert not (result.stdout_truncated or result.stderr_truncated)
+        assert not result.orphans_killed
+        assert_clean_result(result)
 
 
 @os_process
@@ -1397,6 +1400,131 @@ if sys.platform == "win32":
                     stream.close()
 
 
+# ============================= Windows: console host transitório (falso órfão no PR #4)
+
+if sys.platform == "win32":
+    ROOT_PID = 100
+    CONHOST_PID = 200
+
+    def _orphan_tree(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        listed: list[list[int]],
+        images: dict[int, str | None],
+        snapshot: dict[int, tuple[str, int]] | Exception,
+    ) -> Any:
+        """`ProcessTree` com raiz `ROOT_PID` e Win32 falsificada: listas completas do Job em
+        sequência, caminho de imagem por PID (`None` = ilegível) e snapshot Toolhelp32."""
+        queries = iter(listed)
+        monkeypatch.setattr(backend_module, "_job_process_ids", lambda job: next(queries))
+        monkeypatch.setattr(backend_module, "_image_path", lambda pid: images.get(pid))
+
+        def take_snapshot() -> dict[int, tuple[str, int]]:
+            if isinstance(snapshot, Exception):
+                raise snapshot
+            return snapshot
+
+        monkeypatch.setattr(backend_module, "_process_snapshot", take_snapshot)
+        tree: Any = backend_module.ProcessTree(SimpleNamespace(pid=ROOT_PID), 0)  # type: ignore[arg-type]
+        tree._job = 1  # não é handle real: só precisa não ser `None`
+        return tree
+
+    @pytest.mark.parametrize(
+        ("listed", "snapshot", "orphan"),
+        [
+            pytest.param(
+                [[CONHOST_PID]],
+                {CONHOST_PID: ("conhost.exe", ROOT_PID)},
+                False,
+                id="1-conhost-filho-direto-do-raiz",
+            ),
+            pytest.param(
+                [[CONHOST_PID]],
+                {CONHOST_PID: ("CONHOST.EXE", ROOT_PID)},
+                False,
+                id="1b-nome-sem-diferenca-de-caixa",
+            ),
+            pytest.param(
+                [[CONHOST_PID]],
+                {CONHOST_PID: ("conhost.exe", 999)},
+                True,
+                id="2-conhost-com-outro-pai",
+            ),
+            pytest.param(
+                [[CONHOST_PID]],
+                {CONHOST_PID: ("python.exe", ROOT_PID)},
+                True,
+                id="3-outro-executavel",
+            ),
+            pytest.param(
+                [[CONHOST_PID]],
+                {CONHOST_PID: ("OpenConsole.exe", ROOT_PID)},
+                True,
+                id="3b-openconsole",
+            ),
+            pytest.param([[CONHOST_PID], []], {}, False, id="4-fora-do-snapshot-e-do-job"),
+            pytest.param(
+                [[CONHOST_PID], [CONHOST_PID]], {}, True, id="5-fora-do-snapshot-ainda-no-job"
+            ),
+            pytest.param([[CONHOST_PID]], OSError("snapshot"), True, id="6-snapshot-falha"),
+        ],
+    )
+    @windows_only
+    def test_imagem_ilegivel_usa_toolhelp_com_parentesco(
+        monkeypatch: pytest.MonkeyPatch,
+        listed: list[list[int]],
+        snapshot: dict[int, tuple[str, int]] | Exception,
+        orphan: bool,
+    ) -> None:
+        """Imagem ilegível: só é console host o `conhost.exe` filho **direto** do raiz."""
+        tree = _orphan_tree(
+            monkeypatch, listed=listed, images={CONHOST_PID: None}, snapshot=snapshot
+        )
+        assert tree.orphans_alive() is orphan
+
+    @pytest.mark.parametrize(
+        ("image", "orphan"),
+        [
+            pytest.param("C:\\Windows\\System32\\conhost.exe", False, id="conhost-do-sistema"),
+            pytest.param("C:\\Temp\\conhost.exe", True, id="conhost-fora-do-sistema"),
+            pytest.param("C:\\Python\\python.exe", True, id="descendente-real"),
+        ],
+    )
+    @windows_only
+    def test_imagem_legivel_mantem_regra_do_caminho(
+        monkeypatch: pytest.MonkeyPatch, image: str, orphan: bool
+    ) -> None:
+        """(7/8) Com a imagem legível decide o caminho, e o Toolhelp nem é consultado: um
+        `conhost.exe` fora do diretório de sistema, mesmo filho do raiz, é órfão."""
+        system_host = backend_module._CONSOLE_HOST
+        assert system_host is not None
+        images: dict[int, str | None] = {CONHOST_PID: system_host if "System32" in image else image}
+        tree = _orphan_tree(
+            monkeypatch,
+            listed=[[CONHOST_PID]],
+            images=images,
+            snapshot=AssertionError("Toolhelp não deveria ser consultado"),
+        )
+        assert tree.orphans_alive() is orphan
+
+    @windows_only
+    def test_console_host_nao_esconde_descendente_real(monkeypatch: pytest.MonkeyPatch) -> None:
+        """(8) Console host legítimo ao lado de um descendente real: continua órfão."""
+        tree = _orphan_tree(
+            monkeypatch,
+            listed=[[CONHOST_PID, 300]],
+            images={CONHOST_PID: None, 300: None},
+            snapshot={CONHOST_PID: ("conhost.exe", ROOT_PID), 300: ("python.exe", CONHOST_PID)},
+        )
+        assert tree.orphans_alive() is True
+
+    @windows_only
+    def test_snapshot_toolhelp_real_identifica_o_proprio_processo() -> None:
+        snapshot = backend_module._process_snapshot()
+        name, parent = snapshot[os.getpid()]
+        assert name.lower().endswith(".exe") and parent > 0
+
+
 # ================================================================== específicos do POSIX
 
 
@@ -1471,160 +1599,3 @@ def test_setsid_segurando_o_pipe_e_detectado(tmp_path: Path, watches: dict[str, 
         pid_file = tmp_path / "esc.pid"
         if pid_file.exists() and "esc" not in watches:
             watches["esc"] = Watch(int(pid_file.read_text()))
-
-
-# ============================================ DIAGNÓSTICO TEMPORÁRIO (PR #4) — NÃO MERGEAR
-# Descobre qual processo faz `orphans_alive()` responder True no windows-latest. Falha de
-# propósito com os dados na mensagem para que apareçam no log da CI. Será removido.
-
-if sys.platform == "win32":
-
-    class _DiagProcessEntry32(ctypes.Structure):
-        _fields_ = (
-            ("dwSize", wintypes.DWORD),
-            ("cntUsage", wintypes.DWORD),
-            ("th32ProcessID", wintypes.DWORD),
-            ("th32DefaultHeapID", ctypes.c_size_t),
-            ("th32ModuleID", wintypes.DWORD),
-            ("cntThreads", wintypes.DWORD),
-            ("th32ParentProcessID", wintypes.DWORD),
-            ("pcPriClassBase", wintypes.LONG),
-            ("dwFlags", wintypes.DWORD),
-            ("szExeFile", ctypes.c_wchar * 260),
-        )
-
-    _k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    _k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-    _k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_DiagProcessEntry32)]
-    _k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_DiagProcessEntry32)]
-
-    def _diag_toolhelp() -> dict[int, dict[str, Any]]:
-        snap = _k32.CreateToolhelp32Snapshot(0x2, 0)
-        found: dict[int, dict[str, Any]] = {}
-        entry = _DiagProcessEntry32()
-        entry.dwSize = ctypes.sizeof(entry)
-        more = _k32.Process32FirstW(snap, ctypes.byref(entry))
-        while more:
-            found[int(entry.th32ProcessID)] = {
-                "exe": entry.szExeFile,
-                "parent": int(entry.th32ParentProcessID),
-            }
-            more = _k32.Process32NextW(snap, ctypes.byref(entry))
-        _k32.CloseHandle(snap)
-        return found
-
-    def _diag_image_error(pid: int) -> Any:
-        handle = backend_module._OpenProcess(
-            backend_module._PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-        )
-        if not handle:
-            return {"open_error": ctypes.get_last_error()}
-        buffer = ctypes.create_unicode_buffer(32768)
-        size = wintypes.DWORD(len(buffer))
-        ok = backend_module._QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size))
-        error = ctypes.get_last_error()
-        backend_module._CloseHandle(handle)
-        return {"ok": bool(ok), "error": None if ok else error, "value": buffer.value}
-
-    def _diag_describe(tree: Any) -> dict[str, Any]:
-        job = tree._job
-        entries: list[dict[str, Any]] = []
-        try:
-            pids = backend_module._job_process_ids(job)
-        except OSError as exc:
-            return {"job_list_error": str(exc)}
-        for pid in pids:
-            entry: dict[str, Any] = {"pid": pid, "is_root": pid == tree.popen.pid}
-            entry["image"] = backend_module._image_path(pid)
-            entry["image_error"] = _diag_image_error(pid)
-            entry["toolhelp"] = _diag_toolhelp().get(pid)
-            entry["is_console_host"] = backend_module._is_console_host(pid)
-            handle = backend_module._OpenProcess(
-                backend_module._SYNCHRONIZE | backend_module._PROCESS_QUERY_LIMITED_INFORMATION,
-                False,
-                pid,
-            )
-            if not handle:
-                entry["open_error"] = ctypes.get_last_error()
-            else:
-                in_job = wintypes.BOOL()
-                ok = backend_module._IsProcessInJob(handle, job, ctypes.byref(in_job))
-                entry["in_job"] = bool(in_job.value) if ok else f"erro {ctypes.get_last_error()}"
-                entry["signaled"] = backend_module._WaitForSingleObject(handle, 0) == 0
-                backend_module._CloseHandle(handle)
-            entries.append(entry)
-        return {
-            "root_pid": tree.popen.pid,
-            "root_returncode": tree.popen.returncode,
-            "active": backend_module._active_processes(job),
-            "members": entries,
-        }
-
-    def test_zz_diagnostico_orfaos_windows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        import platform
-
-        observations: list[dict[str, Any]] = []
-        real = backend_module.ProcessTree.orphans_alive
-
-        identities: dict[int, Any] = {}
-        stops: dict[int, threading.Event] = {}
-        real_start = backend_module.start
-
-        def watched_start(spec_: ProcessSpec) -> Any:
-            tree = real_start(spec_)
-            stop = threading.Event()
-
-            def watch() -> None:
-                while not stop.is_set() and tree._job is not None:
-                    try:
-                        pids = backend_module._job_process_ids(tree._job)
-                    except OSError:
-                        return
-                    unknown = [pid for pid in pids if pid not in identities]
-                    if unknown:
-                        snap = _diag_toolhelp()
-                        for pid in unknown:
-                            identities[pid] = snap.get(pid, "fora do snapshot")
-                    time.sleep(0.002)
-
-            thread = threading.Thread(target=watch, daemon=True)
-            thread.start()
-            stops[id(tree)] = stop
-            return tree
-
-        def spy(self: Any) -> bool:
-            job_pids = backend_module._job_process_ids(self._job)
-            answer = bool(real(self))
-            stops[id(self)].set()
-            if answer:
-                root = self.popen.pid
-                observations.append(
-                    {
-                        "root_pid": root,
-                        "root_identity": identities.get(root),
-                        "flagged": [
-                            {"pid": pid, "identity": identities.get(pid, "nunca visto")}
-                            for pid in job_pids
-                        ],
-                    }
-                )
-            return answer
-
-        monkeypatch.setattr(backend_module, "start", watched_start)
-        monkeypatch.setattr(backend_module.ProcessTree, "orphans_alive", spy)
-        code = "import sys; sys.stdout.write('ok'); sys.stderr.write('aviso')"
-        flagged = 0
-        for _ in range(30):
-            result = run_supervised(spec(tmp_path, "-c", code), never)
-            flagged += result.orphans_killed
-        header = {
-            "platform": platform.platform(),
-            "python": sys.version,
-            "executable": PYTHON,
-            "console_host_expected": backend_module._CONSOLE_HOST,
-            "runs": 30,
-            "orphans_killed": flagged,
-        }
-        raise AssertionError(
-            "DIAGNOSTICO " + json.dumps({"header": header, "observations": observations[:5]})
-        )

@@ -1353,6 +1353,8 @@ _WIN32_DOCUMENTADAS = {
     "CreateToolhelp32Snapshot",
     "Thread32First",
     "Thread32Next",
+    "Process32FirstW",
+    "Process32NextW",
     "QueryFullProcessImageNameW",
     "GetSystemDirectoryW",
     "PeekNamedPipe",
