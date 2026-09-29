@@ -1567,11 +1567,24 @@ if sys.platform == "win32":
         real = backend_module.ProcessTree.orphans_alive
 
         def spy(self: Any) -> bool:
+            snapshot = _diag_toolhelp()  # antes de qualquer consulta lenta
+            job_pids = backend_module._job_process_ids(self._job)
             answer = bool(real(self))
             if answer:
-                first = _diag_describe(self)
-                time.sleep(0.05)
-                observations.append({"t0": first, "t+50ms": _diag_describe(self)})
+                root = self.popen.pid
+                observations.append(
+                    {
+                        "root_pid": root,
+                        "root_in_snapshot": snapshot.get(root),
+                        "job_pids_before": [
+                            {"pid": pid, "snapshot": snapshot.get(pid)} for pid in job_pids
+                        ],
+                        "children_of_root": {
+                            pid: info for pid, info in snapshot.items() if info["parent"] == root
+                        },
+                        "t0": _diag_describe(self),
+                    }
+                )
             return answer
 
         monkeypatch.setattr(backend_module.ProcessTree, "orphans_alive", spy)
