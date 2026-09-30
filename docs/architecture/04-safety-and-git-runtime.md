@@ -656,3 +656,45 @@ criada a partir do **SHA congelado no planejamento** — nunca de um nome de bra
 
 O `git_runtime` nunca escreve no banco: devolve fatos, e o Execution Manager persiste. É a
 **fonte autoritativa** de `files_changed` e `diff_stat` ([02](02-data-model.md) §10).
+
+#### Adendo autorizado — E7.4 (2026-09-30): criação de worktree
+
+> Adendo aprovado por Pedro (decisões D2, D3, D6 e D8 do planejamento da E7.4; **revisado**
+> na correção dos P2-001/P2-002 da auditoria, também autorizada por Pedro). **Estritamente
+> aditivo**: a lista "Nunca executa" acima e a tabela de situações continuam valendo sem
+> alteração. A aresta de módulo está no adendo E7.4 de [01](01-v1-architecture.md) §2.
+
+1. **O Git não materializa conteúdo.** A criação usa `git worktree add --no-checkout` (branch,
+   metadata e o arquivo `.git` da worktree; nenhum arquivo do projeto) e depois
+   `git read-tree` **sem `-u`** (só o índice recebe o `base_commit`, com
+   `--no-sparse-checkout`). O runtime escreve cada arquivo a partir do **blob cru** do commit
+   (`git cat-file --batch`, oid recalculado), pelo escritor verificado do `path_runtime`.
+   Nenhum checkout, `reset --hard`, `checkout-index`, `read-tree -u`, `restore`, `switch` ou
+   `archive` participa — e portanto nenhum filtro (`smudge`/`process`/`clean`), atributo ou
+   `git-lfs`: o pipeline de conversão de working tree do Git fica fora da E7.4, qualquer que
+   seja a configuração (`includeIf`, `info/attributes` mudando no meio da operação). Um ponteiro
+   LFS versionado é materializado como o ponteiro; nenhuma conversão de fim de linha é
+   aplicada. Isto **substitui** a neutralização por enumeração de drivers da versão anterior
+   deste adendo, que tinha dois furos reproduzidos (valor literal `set`/`unset`/`unspecified`
+   e corrida em `info/attributes`).
+2. **Árvore validada antes do primeiro byte.** Só `100644`/`100755` são materializados; symlink
+   e gitlink são recusados explicitamente (`UNSUPPORTED_TREE_ENTRY`), sem aproximação. Todo
+   caminho passa pela política de path do `safety` (mais: sem `.git`, sem colisão por caixa —
+   também entre prefixos de diretório, como `Dir/a` × `dir/b` —, sem conflito arquivo ×
+   diretório, dentro de `MAX_PATH` no Windows). Todo blob precisa
+   existir localmente: `--no-lazy-fetch` e `GIT_NO_LAZY_FETCH=1` — nunca fetch, nunca rede.
+3. **Limpeza verificada sem `git status`.** Reuso e pós-condição usam a **mesma** verificação:
+   índice exatamente igual ao `base_commit` — estrutura **e** flags de entrada
+   (`ls-files --stage`/`-v`, e `diff-index --cached --ita-invisible-in-index`, que não lê o
+   working tree e enxerga `intent-to-add`) — e filesystem exatamente
+   igual ao snapshot (sem seguir link; oid de blob calculado dos bytes crus; bit de execução
+   no POSIX). Arquivo ou diretório extra, ignorado incluído, é sujo.
+4. **Supervisão.** Os dois passos Git mutantes (`worktree add --no-checkout`, `read-tree`)
+   rodam sob `process_runtime` — árvore contida, timeout, cancelamento, confirmação de morte.
+   Motivo empírico: encerrar só o `git.exe` deixava vivos os processos filhos que ele cria.
+   A materialização consulta o cancelamento entre arquivos. Nada é limpo em falha. Leituras
+   Git permanecem no runner atual. Isso não dá ao provider acesso a `process_runtime` nem a Git.
+5. **Hooks desligados por comando**: `-c core.hooksPath=/dev/null` nos dois passos (o `add`
+   atualiza refs; o `read-tree` escreve o índice), sem alterar configuração persistente. O
+   `git worktree add` ainda executa, ele próprio, um `git branch` interno; o runtime continua
+   **proibido** de construir ou invocar `git reset --hard` (ou qualquer checkout) diretamente.

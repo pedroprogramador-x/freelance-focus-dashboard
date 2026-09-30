@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Protocol
 
 
 class Tri(str, Enum):
@@ -97,6 +98,81 @@ class PathFacts:
     post_open_target: str | None = None
     post_open_identity: ObjectIdentity | None = None
     inspection_error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WorktreeRootFacts:
+    """Fatos sobre a raiz de worktrees (E7.4). Preenchido por `app.path_runtime`.
+
+    Tudo é observado sobre o caminho **canônico** (`resolve(strict=True)`): neste ambiente o
+    `%LOCALAPPDATA%` léxico pode ser virtualizado (MSIX) para outro lugar, e é o caminho real
+    que o Git grava. ``reparse_in_canonical_chain`` cobre **todos** os componentes do caminho
+    canônico, da raiz do volume até o próprio diretório — um reparse point que o `resolve()`
+    não atravessa (placeholder de nuvem, por exemplo) continua visível.
+
+    Os três ``overlaps_*`` são relações de contenção **nos dois sentidos** (um dentro do outro,
+    ou iguais), calculadas sobre caminhos canônicos com `normcase` + `commonpath`, nunca por
+    substring. ``UNKNOWN`` quando o outro lado não pôde ser canonizado.
+    """
+
+    requested_path: str
+    requested_is_absolute: bool
+    canonical_path: str | None
+    exists: bool
+    is_directory: Tri
+    reparse_in_canonical_chain: Tri
+    #: Algum componente **pedido** (léxico) é link/junction/reparse? A raiz nunca é aceita
+    #: por um caminho que passe por link, mesmo que o destino canônico fosse aceitável.
+    reparse_in_requested_chain: Tri
+    identity: ObjectIdentity | None
+    overlaps_sync_root: Tri
+    overlaps_repository_toplevel: Tri
+    overlaps_git_common_dir: Tri
+    repository_toplevel: str | None = None
+    repository_toplevel_identity: ObjectIdentity | None = None
+    git_common_dir: str | None = None
+    git_common_dir_identity: ObjectIdentity | None = None
+    inspection_error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WorktreeRoot:
+    """Raiz de worktrees **já validada** para **um** repositório (E7.4, D7).
+
+    Construída só por `app.path_runtime.prepare_worktree_root`, depois que
+    `app.safety.worktree_location.decide_worktree_root` permitiu — `test_architecture.py` trava
+    o ponto único de construção. `app.git_runtime` a recebe pronta e **não** reavalia política:
+    só confere, antes e depois de agir, que as identidades registradas aqui não mudaram
+    (a janela TOCTOU é estreitada, não fechada — [04] §4).
+
+    ``repository_*`` e ``git_common_dir*`` amarram a raiz ao repositório para o qual ela foi
+    validada: usada com outro repositório, a identidade não confere e a criação é recusada.
+    """
+
+    canonical_path: str
+    identity: ObjectIdentity
+    repository_toplevel: str
+    repository_toplevel_identity: ObjectIdentity
+    git_common_dir: str
+    git_common_dir_identity: ObjectIdentity
+
+
+class TreeWriter(Protocol):
+    """Escreve os arquivos de **uma** worktree nova (E7.4). Implementado só em `path_runtime`.
+
+    Cada `write_file` cria um arquivo **novo** (nunca sobrescreve, nunca segue link) sob a raiz
+    com que o escritor foi aberto, criando os diretórios intermediários de forma verificada.
+    Qualquer recusa ou falha levanta `OSError` (a negação de política é `PathAccessDenied`,
+    subclasse de `PermissionError`); o que já foi escrito fica para diagnóstico.
+    """
+
+    def write_file(self, relative: str, content: bytes, *, executable: bool) -> None: ...
+
+
+class TreeWriterFactory(Protocol):
+    """Abre um `TreeWriter` sobre a raiz já criada pelo Git, conferindo a identidade dela."""
+
+    def __call__(self, root: str, root_identity: ObjectIdentity) -> TreeWriter: ...
 
 
 @dataclass(frozen=True, slots=True)

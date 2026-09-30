@@ -20,9 +20,12 @@ Git e o ciclo de vida de worktree. Até aqui existem **três leituras**, todas s
 
 Invariantes congelados ([01] contrato de `git_runtime/`, [07] gate E3):
 
-* **Só leitura.** Nenhum subcomando que altere o repositório do usuário — sem `commit`,
-  `merge`, `push`, `rebase`, `reset`, `checkout`, `clean`, `init`, `apply`, `stash`.
-  `test_architecture.py::test_git_runtime_e_somente_leitura` transforma isso em falha de
+* **Só leitura, aqui.** Nenhum subcomando deste arquivo altera o repositório do usuário —
+  sem `commit`, `merge`, `push`, `rebase`, `reset`, `checkout`, `clean`, `init`, `apply`,
+  `stash`. As **únicas** operações mutantes do pacote são `git worktree add --no-checkout` e
+  `git read-tree` sem `-u`, e elas vivem em `worktree.py` (E7.4), sob `process_runtime` e com
+  hooks desligados; o conteúdo da worktree vem dos blobs crus, nunca do checkout do Git —
+  adendos E7.4 de [01] §2 e [04] §8. `test_architecture.py` transforma as regras em falha de
   suíte.
 * **Nunca lança.** Qualquer falha de IO, `timeout`, `git` ausente do `PATH` ou saída
   inesperada vira o resultado neutro. Para `preflight` esse resultado é `_NOT_A_REPO`;
@@ -87,9 +90,14 @@ Invariantes congelados ([01] contrato de `git_runtime/`, [07] gate E3):
   motivo cresceu (barra invertida literal, ou bytes que não são UTF-8 válido), a resposta
   continua sendo a mesma.
 
-`git_runtime/` pode importar `safety`, `config` e stdlib — e nada mais ([01]). O
-`subprocess` fica confinado a este pacote — o único ponto de chamada é `_run_git` — e
-qualquer outro uso continua proibido até o Full Safety Runtime (E7).
+`git_runtime/` pode importar `safety`, `config` e stdlib ([01]) e, desde o adendo E7.4,
+`process_runtime` — **só** para a operação mutante de `worktree.py`. O `subprocess` de
+leitura fica confinado a este arquivo — o único ponto de chamada é `_run_git`.
+
+A superfície de worktree (`task_worktree_names`, `repository_layout`, `list_worktrees`,
+`inspect_task_worktree`, `classify_task_worktree`, `create_worktree`) é reexportada no fim
+deste arquivo: `worktree.py` usa os auxiliares de leitura daqui, então a importação dele
+vem depois de todos estarem definidos.
 """
 
 from __future__ import annotations
@@ -197,10 +205,12 @@ _GIT_ENV_ALLOWLIST = frozenset(
     )
 )
 
-#: As duas únicas variáveis que `_git_env` **adiciona** ao ambiente filtrado.
+#: As únicas variáveis que `_git_env` **adiciona** ao ambiente filtrado.
 _GIT_ENV_OVERRIDES = {
     "GIT_OPTIONAL_LOCKS": "0",  # nada de refresh/lock do índice num comando de leitura
     "GIT_TERMINAL_PROMPT": "0",  # nunca abre prompt de credencial
+    # E7.4: num partial clone, objeto ausente é erro — nunca fetch preguiçoso, nunca rede.
+    "GIT_NO_LAZY_FETCH": "1",
 }
 
 
@@ -237,19 +247,23 @@ def _git_env(source: Mapping[str, str] | None = None) -> dict[str, str]:
     return env
 
 
-def _run_git(git: str, local_path: str, *args: str) -> subprocess.CompletedProcess[bytes] | None:
+def _run_git(
+    git: str, local_path: str, *args: str, stdin: bytes | None = None
+) -> subprocess.CompletedProcess[bytes] | None:
     """Executa `git -c core.fsmonitor=false -C <local_path> <args>` sem shell, ambiente mínimo.
 
     Devolve `None` em qualquer falha. `stdout`/`stderr` saem como **bytes**, nunca texto
     (E4-AUD4-001, E4-AUD4-002 — ver a docstring do módulo): decidir texto aqui dentro do
     `subprocess` arrisca tradução de quebra de linha e decodificação numa thread que este
     `except` não alcança. A conversão para texto é sempre um passo explícito de quem chama,
-    via `_decode_text`.
+    via `_decode_text`. ``stdin`` (bytes, E7.4) alimenta leituras em lote como o
+    `cat-file --batch` — lista de objetos sem limite de linha de comando.
     """
     try:
         return subprocess.run(  # noqa: S603 — sem shell; argv literal; git resolvido por shutil.which
             [git, *_READONLY_GIT_OPTIONS, "-C", local_path, *args],
             capture_output=True,
+            input=stdin,
             timeout=_TIMEOUT_SECONDS,
             check=False,
             env=_git_env(),
@@ -1440,3 +1454,58 @@ def _ordinary_kind(xy: str) -> WorkingTreeChange:
     if staged != ".":
         return WorkingTreeChange.STAGED
     return WorkingTreeChange.MODIFIED
+
+
+# ------------------------------------------------ E7.4: worktree de task (reexportação)
+#
+# No fim de propósito: `worktree.py` importa `_run_git`, `_git_env`, `_decode_text`,
+# `_has_git_marker` e `_workspace_prefix` deste módulo, que já existem neste ponto.
+from app.git_runtime.worktree import (  # noqa: E402
+    InvalidWorktreeRequest,
+    RepositoryLayout,
+    TaskWorktreeFacts,
+    TaskWorktreeNames,
+    WorktreeInventory,
+    WorktreeOutcome,
+    WorktreeRecord,
+    WorktreeVerdict,
+    classify_task_worktree,
+    create_worktree,
+    inspect_task_worktree,
+    list_worktrees,
+    repository_layout,
+    task_worktree_names,
+)
+
+__all__ = [
+    "PROBE_NOT_A_REPO",
+    "PROBE_OK",
+    "PROBE_UNVERIFIABLE",
+    "PROBE_WITHOUT_HEAD",
+    "GitPreflight",
+    "HeadProbe",
+    "InvalidWorktreeRequest",
+    "RepositoryLayout",
+    "TaskWorktreeFacts",
+    "TaskWorktreeNames",
+    "TreeListing",
+    "UnrepresentablePath",
+    "WorkingTreeChange",
+    "WorkingTreeEntry",
+    "WorkingTreeListing",
+    "WorktreeInventory",
+    "WorktreeOutcome",
+    "WorktreeRecord",
+    "WorktreeVerdict",
+    "classify_task_worktree",
+    "create_worktree",
+    "inspect_task_worktree",
+    "list_tree",
+    "list_worktrees",
+    "preflight",
+    "probe_head",
+    "repository_layout",
+    "task_worktree_names",
+    "working_tree_diff_against",
+    "working_tree_status",
+]

@@ -50,6 +50,25 @@ def default_data_dir() -> Path:
     return Path.home() / ".local" / "share" / "freelance-focus"
 
 
+#: Variáveis que o cliente do OneDrive define com a raiz de cada conta sincronizada.
+_ONEDRIVE_ENV_VARS = ("OneDrive", "OneDriveConsumer", "OneDriveCommercial")
+
+
+def detected_sync_roots() -> tuple[Path, ...]:
+    """Raízes de sincronização conhecidas pelo ambiente (E7.4): hoje, as do OneDrive.
+
+    Lidas aqui porque este é o único módulo que lê ambiente. **Não** são um campo de
+    configuração: nenhuma variável `FF_*` consegue esvaziar a lista — só acrescentar
+    (`extra_sync_roots`).
+    """
+    roots: list[Path] = []
+    for name in _ONEDRIVE_ENV_VARS:
+        value = os.environ.get(name)
+        if value:
+            roots.append(Path(value))
+    return tuple(roots)
+
+
 class SecretSettings(BaseSettings):
     """Segredos de provider.
 
@@ -92,6 +111,15 @@ class AppSettings(BaseSettings):
     #: responde `404 web_ui_unavailable` — a API segue funcionando normalmente.
     web_dist_dir: Path | None = None
 
+    #: Raiz das worktrees de task (E7.4). `None` resolve para `<data_dir>/worktrees`
+    #: ([04] §8). O caminho canônico — não este léxico — é o que vale: ver
+    #: `path_runtime.prepare_worktree_root`.
+    worktrees_dir: Path | None = None
+
+    #: Raízes de sincronização **adicionais** às detectadas (`detected_sync_roots`). Só
+    #: acrescenta; a detecção do OneDrive não pode ser desligada por configuração.
+    extra_sync_roots: tuple[Path, ...] = ()
+
     @field_validator("host")
     @classmethod
     def _loopback_only(cls, value: str) -> str:
@@ -133,10 +161,29 @@ class AppSettings(BaseSettings):
     def web_assets_dir(self) -> Path:
         return self.resolved_web_dist_dir / "assets"
 
+    @property
+    def resolved_worktrees_dir(self) -> Path:
+        """Raiz das worktrees: override explícito ou `<data_dir>/worktrees`."""
+        if self.worktrees_dir is not None:
+            return self.worktrees_dir
+        return self.data_dir / "worktrees"
+
+    @property
+    def sync_roots(self) -> tuple[Path, ...]:
+        """Detectadas (OneDrive) mais as extras configuradas. Nunca menos que as detectadas."""
+        return detected_sync_roots() + tuple(self.extra_sync_roots)
+
     def ensure_data_dir(self) -> Path:
         """Cria o diretório de dados. **Chamada explícita**, nunca no import."""
         self.data_dir.mkdir(parents=True, exist_ok=True)
         return self.data_dir
+
+    def ensure_worktrees_dir(self) -> Path:
+        """Cria a raiz das worktrees. Chamada explícita; a validação vem depois, no
+        `path_runtime.prepare_worktree_root`."""
+        root = self.resolved_worktrees_dir
+        root.mkdir(parents=True, exist_ok=True)
+        return root
 
 
 @lru_cache(maxsize=1)

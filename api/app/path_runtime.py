@@ -23,10 +23,16 @@ O risco residual está declarado em [04] §4 e não é contornado aqui.
 Escopo E2 (*foundation*): inspeção e abertura para **leitura**, sobre alvos
 pré-existentes. Criação, escrita e truncamento pertencem ao Full Safety Runtime (E7) —
 por isso nenhuma flag de truncamento aparece neste módulo.
+
+E7.4 (D7): `inspect_worktree_root` coleta os fatos da raiz de worktrees (caminho canônico,
+reparse na cadeia, identidade, sobreposição com OneDrive/repositório/`.git`) e
+`prepare_worktree_root` compõe com `safety.decide_worktree_root`, no mesmo padrão de
+`open_checked`, devolvendo a `WorktreeRoot` que o `git_runtime` recebe pronta.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import stat
@@ -45,7 +51,15 @@ from app.safety.paths import (
     prevalidate_path_syntax,
 )
 from app.safety.policy import SafetyPolicy
-from app.safety.types import ObjectIdentity, PathFacts, SafetyDecision, Tri
+from app.safety.types import (
+    ObjectIdentity,
+    PathFacts,
+    SafetyDecision,
+    Tri,
+    WorktreeRoot,
+    WorktreeRootFacts,
+)
+from app.safety.worktree_location import decide_worktree_root
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -404,3 +418,306 @@ def open_checked(
         yield fd, post_facts
     finally:
         os.close(fd)
+
+
+# ------------------------------------------------------------ E7.4: raiz de worktrees
+
+
+def _has_reparse(info: os.stat_result) -> bool:
+    """Link/reparse no próprio objeto (sem seguir). POSIX: symlink; Windows: atributo."""
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    attributes = getattr(info, "st_file_attributes", 0)
+    return bool(attributes & _REPARSE_ATTRIBUTE)
+
+
+def _reparse_in_chain(path: Path) -> Tri:
+    """Algum componente de `path` (absoluto), da raiz do volume até ele, é reparse/link?
+
+    Usado nas duas cadeias da raiz de worktrees: a **pedida** (um link em qualquer ponto
+    recusa) e a **canônica** — depois de `resolve()` não deveria haver link nenhum, e o que
+    sobra é reparse point que o `resolve()` não atravessa (placeholder de nuvem, por
+    exemplo). Falha de `lstat` num componente é `UNKNOWN`, nunca `FALSE`.
+    """
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            info = current.lstat()
+        except (OSError, ValueError):
+            return Tri.UNKNOWN
+        if _has_reparse(info):
+            return Tri.TRUE
+    return Tri.FALSE
+
+
+def _overlaps(a: Path, b: Path) -> bool:
+    """`a` e `b` (já canônicos) são iguais ou um contém o outro. `normcase` + `commonpath`."""
+    left, right = os.path.normcase(str(a)), os.path.normcase(str(b))
+    try:
+        common = os.path.commonpath([left, right])
+    except ValueError:  # volumes diferentes, ou absoluto × relativo: não se sobrepõem
+        return False
+    return common in (left, right)
+
+
+def _canonical_identity(value: str) -> tuple[Path, ObjectIdentity] | None:
+    try:
+        canonical = Path(value).resolve(strict=True)
+        return canonical, _identity(canonical.stat())
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def inspect_worktree_root(
+    requested: Path | str,
+    *,
+    sync_roots: tuple[Path | str, ...],
+    repository_toplevel: str,
+    git_common_dir: str,
+) -> WorktreeRootFacts:
+    """Coleta `WorktreeRootFacts` para a raiz de worktrees de **um** repositório. Não decide.
+
+    ``sync_roots`` são as raízes de sincronização conhecidas (`config`), canonizadas com
+    `strict=False` — uma pasta do OneDrive ainda inexistente continua proibindo o lugar onde
+    ela nasceria. ``repository_toplevel`` e ``git_common_dir`` vêm do `git_runtime` e precisam
+    existir: o que não canoniza vira `UNKNOWN`, e a política fecha.
+    """
+    text = str(requested)
+    absolute = classify_path_form(text) is PathForm.ABSOLUTE_QUALIFIED and "\x00" not in text
+    base = WorktreeRootFacts(
+        requested_path=text,
+        requested_is_absolute=absolute,
+        canonical_path=None,
+        exists=False,
+        is_directory=Tri.UNKNOWN,
+        reparse_in_canonical_chain=Tri.UNKNOWN,
+        reparse_in_requested_chain=Tri.UNKNOWN,
+        identity=None,
+        overlaps_sync_root=Tri.UNKNOWN,
+        overlaps_repository_toplevel=Tri.UNKNOWN,
+        overlaps_git_common_dir=Tri.UNKNOWN,
+    )
+    if not absolute:
+        return base
+    if ".." in Path(text).parts:
+        # `a\..\b` é colapsado léxicamente no Windows e atravessa `a` no POSIX: a cadeia
+        # pedida deixaria de descrever o caminho que o SO segue. Fail closed.
+        return replace(base, inspection_error="componente `..` no caminho pedido")
+
+    try:
+        canonical = Path(text).resolve(strict=True)
+    except FileNotFoundError:
+        return base
+    except (OSError, ValueError, RuntimeError) as error:
+        return replace(base, inspection_error=f"raiz irresolúvel: {type(error).__name__}")
+
+    try:
+        info = canonical.lstat()
+    except (OSError, ValueError) as error:
+        return replace(base, canonical_path=str(canonical), inspection_error=type(error).__name__)
+
+    sync_overlap = Tri.FALSE
+    for root in sync_roots:
+        try:
+            sync_canonical = Path(root).resolve(strict=False)
+        except (OSError, ValueError, RuntimeError):
+            sync_overlap = _combine(sync_overlap, Tri.UNKNOWN)
+            continue
+        sync_overlap = _combine(sync_overlap, Tri.of(_overlaps(canonical, sync_canonical)))
+
+    repository = _canonical_identity(repository_toplevel)
+    common = _canonical_identity(git_common_dir)
+
+    return replace(
+        base,
+        canonical_path=str(canonical),
+        exists=True,
+        is_directory=Tri.of(stat.S_ISDIR(info.st_mode)),
+        reparse_in_canonical_chain=_reparse_in_chain(canonical),
+        reparse_in_requested_chain=_reparse_in_chain(Path(text)),
+        identity=_identity(info),
+        overlaps_sync_root=sync_overlap,
+        overlaps_repository_toplevel=(
+            Tri.UNKNOWN if repository is None else Tri.of(_overlaps(canonical, repository[0]))
+        ),
+        overlaps_git_common_dir=(
+            Tri.UNKNOWN if common is None else Tri.of(_overlaps(canonical, common[0]))
+        ),
+        repository_toplevel=None if repository is None else str(repository[0]),
+        repository_toplevel_identity=None if repository is None else repository[1],
+        git_common_dir=None if common is None else str(common[0]),
+        git_common_dir_identity=None if common is None else common[1],
+    )
+
+
+def prepare_worktree_root(
+    requested: Path | str,
+    *,
+    sync_roots: tuple[Path | str, ...],
+    repository_toplevel: str,
+    git_common_dir: str,
+) -> WorktreeRoot:
+    """Inspeciona, decide e devolve a `WorktreeRoot` validada — o **único** ponto que a constrói.
+
+    Mesmo padrão de `open_checked`: fatos aqui, decisão em `safety`, `PathAccessDenied` na
+    negação. Não cria diretório nenhum: a raiz precisa existir (`AppSettings.ensure_worktrees_dir`).
+    """
+    facts = inspect_worktree_root(
+        requested,
+        sync_roots=sync_roots,
+        repository_toplevel=repository_toplevel,
+        git_common_dir=git_common_dir,
+    )
+    decision = decide_worktree_root(facts)
+    if not decision.allow:
+        raise PathAccessDenied(decision)
+    assert facts.canonical_path is not None and facts.identity is not None
+    assert facts.repository_toplevel is not None and facts.repository_toplevel_identity is not None
+    assert facts.git_common_dir is not None and facts.git_common_dir_identity is not None
+    return WorktreeRoot(
+        canonical_path=facts.canonical_path,
+        identity=facts.identity,
+        repository_toplevel=facts.repository_toplevel,
+        repository_toplevel_identity=facts.repository_toplevel_identity,
+        git_common_dir=facts.git_common_dir,
+        git_common_dir_identity=facts.git_common_dir_identity,
+    )
+
+
+# ------------------------------------------------------ E7.4: materialização da worktree
+
+
+def _deny_write(rule_id: str, reason: str, subject: str) -> PathAccessDenied:
+    return PathAccessDenied(SafetyDecision(False, rule_id, reason, subject))
+
+
+class CheckedTreeWriter:
+    """`TreeWriter` da E7.4: cria os arquivos do `base_commit` numa worktree **nova**.
+
+    A worktree nasce com `git worktree add --no-checkout`; o conteúdo não passa pelo checkout
+    do Git (filtros, atributos, hooks), e sim por aqui, a partir dos blobs crus. Regras:
+
+    * o caminho relativo passa por `prevalidate_path_syntax` — a mesma política de sempre —
+      e não pode ter barra invertida nem componente `.git`;
+    * **antes de cada operação** (cada `mkdir`, a abertura do arquivo e, de novo, antes dos
+      bytes) a cadeia inteira é revalidada: nenhum reparse/link do volume até a raiz, a raiz
+      com a identidade recebida, e cada componente até o pai final diretório de verdade, sem
+      reparse, com a identidade registrada quando foi criado. O registro é só a
+      **expectativa** do que cada componente precisa continuar sendo — nunca autoriza nada
+      sozinho (reauditoria P2-001: raiz movida e trocada por junction entre duas chamadas);
+    * diretórios são criados **um nível por vez** (`os.mkdir`, nunca `makedirs`); a
+      identidade de um diretório novo é estabelecida pelo `lstat` logo depois de criá-lo;
+    * o arquivo é criado com `O_CREAT | O_EXCL` (e `O_NOFOLLOW` no POSIX): nunca sobrescreve
+      nem segue um link pré-existente no nome final. Depois de aberto, `fstat` precisa ser
+      arquivo regular com a mesma identidade que o `lstat` do caminho; só então os bytes
+      são escritos;
+    * `executable` vira `0o777`/`0o666` (menos a umask), como o Git faz; no Windows o bit não
+      existe e não se finge que existe.
+
+    **Não é sandbox**: entre as reconferências e a escrita resta a janela TOCTOU declarada em
+    [04] §4. Falha deixa o que já foi escrito — nada é apagado.
+    """
+
+    def __init__(self, root: str, root_identity: ObjectIdentity) -> None:
+        self._root = root
+        try:
+            info = os.lstat(root)
+        except OSError as error:
+            raise _deny_write("tree_write.root_missing", type(error).__name__, root) from error
+        if not stat.S_ISDIR(info.st_mode) or _has_reparse(info) or _identity(info) != root_identity:
+            raise _deny_write("tree_write.root_changed", "raiz da worktree mudou", root)
+        self._root_identity = root_identity
+        #: Identidade **esperada** de cada diretório já criado. Expectativa, nunca prova.
+        self._expected: dict[tuple[str, ...], ObjectIdentity] = {}
+        self._verify_chain(())
+
+    def _join(self, parts: tuple[str, ...]) -> str:
+        return os.path.join(self._root, *parts)
+
+    def _verify_chain(self, parts: tuple[str, ...]) -> None:
+        """Revalida do volume até ``parts``: é chamada antes de **toda** criação ou escrita.
+
+        A raiz participa sempre: nenhum reparse/link em nenhum ancestral nem nela (um link
+        no lugar da raiz faria um `lstat` de componente atravessá-lo sem ver nada de
+        errado), e a mesma identidade de quando o escritor foi criado. Depois, cada
+        componente, em ordem: diretório, sem reparse, identidade igual à registrada.
+        """
+        if _reparse_in_chain(Path(self._root)) is not Tri.FALSE:
+            raise _deny_write("tree_write.root_changed", "link na cadeia da raiz", self._root)
+        try:
+            info = os.lstat(self._root)
+        except OSError as error:
+            raise _deny_write(
+                "tree_write.root_missing", type(error).__name__, self._root
+            ) from error
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or _has_reparse(info)
+            or _identity(info) != self._root_identity
+        ):
+            raise _deny_write("tree_write.root_changed", "raiz da worktree mudou", self._root)
+        for depth in range(1, len(parts) + 1):
+            prefix = parts[:depth]
+            subject = "/".join(prefix)
+            expected = self._expected.get(prefix)
+            if expected is None:
+                raise _deny_write("tree_write.dir_unknown", "diretório não criado aqui", subject)
+            try:
+                info = os.lstat(self._join(prefix))
+            except OSError as error:
+                raise _deny_write(
+                    "tree_write.dir_missing", type(error).__name__, subject
+                ) from error
+            if not stat.S_ISDIR(info.st_mode) or _has_reparse(info) or _identity(info) != expected:
+                raise _deny_write("tree_write.dir_changed", "diretório trocado", subject)
+
+    def _ensure_dirs(self, parts: tuple[str, ...]) -> None:
+        """Cria o que falta de ``parts``, um nível por vez, revalidando a cadeia antes de cada
+        `mkdir`. A identidade de um nível novo nasce do `lstat` logo depois de criá-lo."""
+        for depth in range(1, len(parts) + 1):
+            prefix = parts[:depth]
+            if prefix in self._expected:
+                continue
+            self._verify_chain(prefix[:-1])
+            path = self._join(prefix)
+            with contextlib.suppress(FileExistsError):
+                os.mkdir(path)
+            info = os.lstat(path)
+            if not stat.S_ISDIR(info.st_mode) or _has_reparse(info):
+                raise _deny_write(
+                    "tree_write.not_directory", "componente não é diretório", "/".join(prefix)
+                )
+            self._expected[prefix] = _identity(info)
+
+    def write_file(self, relative: str, content: bytes, *, executable: bool) -> None:
+        if "\\" in relative:
+            raise _deny_write("tree_write.backslash", "barra invertida", relative)
+        syntax = prevalidate_path_syntax(relative, allow_absolute=False)
+        if not syntax.allow:
+            raise PathAccessDenied(syntax)
+        parts = tuple(relative.split("/"))
+        if any(part.casefold() == ".git" for part in parts):
+            raise _deny_write("tree_write.dot_git", "componente .git", relative)
+        parent = parts[:-1]
+        self._ensure_dirs(parent)
+        self._verify_chain(parent)
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        for extra in ("O_NOFOLLOW", "O_BINARY", "O_CLOEXEC"):
+            flags |= getattr(os, extra, 0)
+        path = self._join(parts)
+        fd = os.open(path, flags, 0o777 if executable else 0o666)
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise _deny_write("tree_write.not_regular", "alvo aberto não é arquivo", relative)
+            if _identity(os.lstat(path)) != _identity(opened):
+                raise _deny_write("tree_write.toctou", "caminho trocado após a abertura", relative)
+            self._verify_chain(parent)
+            view = memoryview(content)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+        finally:
+            os.close(fd)
