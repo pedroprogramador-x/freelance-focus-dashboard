@@ -37,10 +37,15 @@ FORBIDDEN_EVERYWHERE = (
 #: Safety Runtime (E7) e ao Test Runner, nenhum dos dois existindo ainda.
 FORBIDDEN_PROCESS = ("multiprocessing", "pty")
 
-#: `subprocess` é liberado **exclusivamente** em `git_runtime/`, e só para o preflight de
-#: LEITURA da E3 ([01] contrato de `git_runtime/`, [07] gate E3). Em qualquer outro módulo
-#: continua proibido até E7.
-SUBPROCESS_ALLOWED_UNDER = APP_ROOT / "git_runtime"
+#: `subprocess` é liberado **exclusivamente** em:
+#:
+#: * `git_runtime/` — só para o preflight de LEITURA da E3 ([01] contrato de `git_runtime/`,
+#:   [07] gate E3);
+#: * `process_runtime/` — o Supervisor de Processos da E7.3 (adendo E7.3 a [01] §2, D3).
+#:
+#: Em `orchestrator`, `agent_runtime`, `tool_executor`, `safety`, `api`, `db` e em qualquer
+#: outro módulo continua proibido.
+SUBPROCESS_ALLOWED_UNDER = (APP_ROOT / "git_runtime", APP_ROOT / "process_runtime")
 
 
 def _python_files() -> list[Path]:
@@ -90,9 +95,9 @@ def test_nenhuma_execucao_de_processo(path: Path) -> None:
             f"{_module_name(path)} importa `{imported}`: execução de processo é E7"
         )
         if root == "subprocess":
-            assert path.is_relative_to(SUBPROCESS_ALLOWED_UNDER), (
-                f"{_module_name(path)} importa `subprocess` fora de git_runtime/: "
-                "execução de processo fora do preflight de leitura é E7"
+            assert any(path.is_relative_to(allowed) for allowed in SUBPROCESS_ALLOWED_UNDER), (
+                f"{_module_name(path)} importa `subprocess` fora de git_runtime/ e "
+                "process_runtime/: execução de processo só nesses dois pacotes"
             )
 
 
@@ -1303,3 +1308,165 @@ def test_nao_ha_adaptador_concreto_nem_executor_concreto_na_e7_2() -> None:
         "contracts.py",
         "validation.py",
     }
+
+
+# ------------------------------------------------------------------------------ E7.3
+
+_PROCESS_RUNTIME = APP_ROOT / "process_runtime"
+
+#: Stdlib que o Supervisor pode usar. Sem `psutil`, `pywin32` ou qualquer dependência nova.
+_STDLIB_DO_PROCESS_RUNTIME = {
+    "__future__",
+    "collections",
+    "contextlib",
+    "ctypes",
+    "dataclasses",
+    "enum",
+    "math",
+    "msvcrt",
+    "os",
+    "pathlib",
+    "select",
+    "signal",
+    "subprocess",
+    "sys",
+    "threading",
+    "time",
+    "types",
+    "typing",
+}
+
+#: As únicas funções Win32 que `_windows.py` pode ligar: todas documentadas e todas de
+#: `kernel32` (nada de `ntdll`/`NtResumeProcess`).
+_WIN32_DOCUMENTADAS = {
+    "CreateJobObjectW",
+    "SetInformationJobObject",
+    "QueryInformationJobObject",
+    "AssignProcessToJobObject",
+    "IsProcessInJob",
+    "TerminateJobObject",
+    "OpenProcess",
+    "OpenThread",
+    "WaitForSingleObject",
+    "ResumeThread",
+    "CloseHandle",
+    "CreateToolhelp32Snapshot",
+    "Thread32First",
+    "Thread32Next",
+    "Process32FirstW",
+    "Process32NextW",
+    "QueryFullProcessImageNameW",
+    "GetSystemDirectoryW",
+    "PeekNamedPipe",
+}
+
+#: Maneiras de criar processo que o Supervisor **não** usa: tudo passa por um único
+#: `subprocess.Popen` com `argv` em lista.
+_CRIACAO_DE_PROCESSO_PROIBIDA = {
+    ("os", "system"),
+    ("os", "popen"),
+    ("os", "startfile"),
+    ("os", "posix_spawn"),
+    ("os", "posix_spawnp"),
+    ("subprocess", "run"),
+    ("subprocess", "call"),
+    ("subprocess", "check_call"),
+    ("subprocess", "check_output"),
+    ("subprocess", "getoutput"),
+    ("subprocess", "getstatusoutput"),
+}
+
+
+def _calls(path: Path) -> list[ast.Call]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+
+
+def _dotted(node: ast.expr) -> tuple[str, str] | None:
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return node.value.id, node.attr
+    return None
+
+
+def test_process_runtime_e_folha_so_stdlib() -> None:
+    """Adendo E7.3 a [01] §2: nenhum `app.*` de fora e nenhuma dependência externa."""
+    for path in _PROCESS_RUNTIME.rglob("*.py"):
+        for imported in _imports(path):
+            root = imported.split(".")[0]
+            if root == "app":
+                assert imported.startswith("app.process_runtime"), (
+                    f"process_runtime/{path.name} importa `{imported}`: o pacote é folha"
+                )
+            else:
+                assert root in _STDLIB_DO_PROCESS_RUNTIME, (
+                    f"process_runtime/{path.name} importa `{imported}`: fora da stdlib permitida"
+                )
+
+
+def test_ninguem_importa_process_runtime_na_e7_3() -> None:
+    """Consumidores (TestRunner/adaptadores, composition root) chegam na E8. Até lá, nenhum
+    módulo — em especial `orchestrator`, `agent_runtime`, `tool_executor`, `safety`, `api` e
+    `db` — depende do Supervisor."""
+    for path in ALL_FILES:
+        if path.is_relative_to(_PROCESS_RUNTIME):
+            continue
+        for imported in _imports(path):
+            assert not imported.startswith("app.process_runtime"), (
+                f"{_module_name(path)} importa `{imported}`: ninguém usa o Supervisor na E7.3"
+            )
+
+
+def test_nenhuma_chamada_liga_shell() -> None:
+    """Complementa `test_nenhum_shell_true` (textual) com a forma estrutural: nenhum
+    argumento `shell` diferente do literal falso, em lugar nenhum; no Supervisor, nem isso."""
+    for path in ALL_FILES:
+        for call in _calls(path):
+            for keyword in call.keywords:
+                if keyword.arg != "shell":
+                    continue
+                assert not path.is_relative_to(_PROCESS_RUNTIME), (
+                    f"{_module_name(path)} passa `shell`: o Supervisor nunca menciona shell"
+                )
+                assert isinstance(keyword.value, ast.Constant) and keyword.value.value is False, (
+                    f"{_module_name(path)} liga shell"
+                )
+
+
+def test_process_runtime_so_cria_processo_por_popen_com_argv_estruturado() -> None:
+    popens = 0
+    for path in _PROCESS_RUNTIME.rglob("*.py"):
+        for call in _calls(path):
+            dotted = _dotted(call.func)
+            assert dotted not in _CRIACAO_DE_PROCESSO_PROIBIDA, (
+                f"process_runtime/{path.name} usa `{dotted}`: só `subprocess.Popen`"
+            )
+            if dotted and dotted[0] == "os" and dotted[1].startswith(("spawn", "exec", "fork")):
+                raise AssertionError(f"process_runtime/{path.name} usa `os.{dotted[1]}`")
+            if dotted != ("subprocess", "Popen"):
+                continue
+            popens += 1
+            argv = ast.unparse(call.args[0]) if call.args else None
+            executable = {k.arg: ast.unparse(k.value) for k in call.keywords}.get("executable")
+            assert argv == "list(spec.argv)", f"{path.name}: argv precisa ser a lista da spec"
+            assert executable == "spec.argv[0]", f"{path.name}: executável precisa ser argv[0]"
+    assert popens == 2, "um `Popen` por backend (Windows e POSIX)"
+
+
+def test_backend_windows_so_liga_apis_documentadas_de_kernel32() -> None:
+    windows = _PROCESS_RUNTIME / "_windows.py"
+    bound: set[str] = set()
+    for call in _calls(windows):
+        func = call.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name in {"WinDLL", "CDLL", "OleDLL", "PyDLL", "LoadLibrary"}:
+            assert [ast.unparse(a) for a in call.args[:1]] == ["'kernel32'"], (
+                "só kernel32 pode ser carregada"
+            )
+        if name == "_bind":
+            first = call.args[0]
+            assert isinstance(first, ast.Constant) and isinstance(first.value, str)
+            bound.add(first.value)
+    assert bound == _WIN32_DOCUMENTADAS
+    tree = ast.parse(windows.read_text(encoding="utf-8"))
+    attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    assert not attributes & {"windll", "oledll", "NtResumeProcess", "NtSuspendProcess"}
