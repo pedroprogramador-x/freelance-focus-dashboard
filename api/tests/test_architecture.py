@@ -39,8 +39,9 @@ FORBIDDEN_PROCESS = ("multiprocessing", "pty")
 
 #: `subprocess` é liberado **exclusivamente** em:
 #:
-#: * `git_runtime/` — só para o preflight de LEITURA da E3 ([01] contrato de `git_runtime/`,
-#:   [07] gate E3);
+#: * `git_runtime/` — para as leituras (E3+, [01] contrato de `git_runtime/`, [07] gate E3); a
+#:   operação mutante de worktree da E7.4 não usa `subprocess` direto, e sim o
+#:   `process_runtime` (adendo E7.4; ver `test_worktree_py_so_cria_processo_pelo_supervisor`);
 #: * `process_runtime/` — o Supervisor de Processos da E7.3 (adendo E7.3 a [01] §2, D3).
 #:
 #: Em `orchestrator`, `agent_runtime`, `tool_executor`, `safety`, `api`, `db` e em qualquer
@@ -102,15 +103,23 @@ def test_nenhuma_execucao_de_processo(path: Path) -> None:
 
 
 def test_git_runtime_e_somente_leitura() -> None:
-    """[01]: `git_runtime/` nunca executa verbo que altere o repositório do usuário."""
+    """[01]/[04] §8: `git_runtime/` nunca **constrói** verbo que altere o repositório.
+
+    A única exceção é `worktree add` (adendo E7.4), travada à parte em
+    `test_worktree_add_e_o_unico_verbo_mutante`. `reset --hard` continua proibido como comando
+    direto — o `reset` que o próprio `git worktree add` executa dentro da worktree nova é
+    detalhe interno do Git (adendo E7.4 de [04] §8, item 2).
+    """
     mutating_verbs = (
         "commit",
         "merge",
         "push",
         "rebase",
         "reset",
+        "--hard",
         "checkout",
         "clean",
+        "-fdx",
         "init",
         "apply",
         "stash",
@@ -122,6 +131,16 @@ def test_git_runtime_e_somente_leitura() -> None:
         "pull",
         "gc",
         "prune",
+        "repair",
+        "remove",
+        "move",
+        "lock",
+        "unlock",
+        "update-ref",
+        "filter-branch",
+        "set-url",
+        "--global",
+        "--system",
     )
     for path in (APP_ROOT / "git_runtime").rglob("*.py"):
         source = path.read_text(encoding="utf-8")
@@ -129,6 +148,217 @@ def test_git_runtime_e_somente_leitura() -> None:
             assert f'"{verb}"' not in source, (
                 f"git_runtime/{path.name} usa o verbo git `{verb}`: o adaptador é só leitura"
             )
+
+
+_WORKTREE_MODULE = APP_ROOT / "git_runtime" / "worktree.py"
+
+#: P2-001/P2-002: nada no módulo de worktree passa conteúdo pela conversão de working tree
+#: do Git nem consulta atributos. Conferido por **constante no AST** (não por texto: a
+#: docstring nomeia esses comandos justamente para dizer que não são usados).
+_MATERIALIZADORES_E_ATRIBUTOS_PROIBIDOS = (
+    "checkout",
+    "checkout-index",
+    "switch",
+    "restore",
+    "reset",
+    "--hard",
+    "-u",
+    "--update",
+    "archive",
+    "status",
+    "check-attr",
+    "--attr-source",
+    "--filters",
+    "--textconv",
+    "update-index",
+    "--refresh",
+    "diff",
+)
+
+
+def _enclosing_functions(path: Path, value: str) -> list[str]:
+    """Nome da função que envolve cada constante `value` no módulo (ou `<module>`)."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    found: list[str] = []
+
+    def visit(node: ast.AST, owner: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            name = child.name if isinstance(child, ast.FunctionDef) else owner
+            if isinstance(child, ast.Constant) and child.value == value:
+                found.append(owner)
+            visit(child, name)
+
+    visit(tree, "<module>")
+    return found
+
+
+def test_worktree_add_e_read_tree_sao_os_unicos_verbos_mutantes() -> None:
+    """Adendo E7.4: `worktree add` só em `_add_argv`, `read-tree` só em `_read_tree_argv`,
+    uma vez cada, e só em `git_runtime/worktree.py`."""
+    for path in (APP_ROOT / "git_runtime").rglob("*.py"):
+        for verb, owner in (("add", "_add_argv"), ("read-tree", "_read_tree_argv")):
+            owners = _enclosing_functions(path, verb)
+            if path == _WORKTREE_MODULE:
+                assert owners == [owner], f"`{verb}` fora de `{owner}`: {owners}"
+            else:
+                assert owners == [], f"git_runtime/{path.name} constrói `{verb}`"
+
+
+def test_worktree_nao_materializa_pelo_git_nem_consulta_atributos() -> None:
+    for literal in _MATERIALIZADORES_E_ATRIBUTOS_PROIBIDOS:
+        assert _enclosing_functions(_WORKTREE_MODULE, literal) == [], (
+            f"worktree.py constrói `{literal}`: materialização é raw (P2-001/P2-002)"
+        )
+
+
+def test_diff_index_so_compara_arvore_e_indice() -> None:
+    """Reauditoria P2-002: `diff-index` só em `_index_diff_argv`, e só na forma que não lê o
+    working tree nem gera conteúdo de diff (`--cached --raw`, sem textconv/externo/rename)."""
+    from app.git_runtime import worktree
+
+    for path in (APP_ROOT / "git_runtime").rglob("*.py"):
+        owners = _enclosing_functions(path, "diff-index")
+        assert owners == (["_index_diff_argv"] if path == _WORKTREE_MODULE else []), owners
+    argv = worktree._index_diff_argv("a" * 40)
+    assert argv[argv.index("diff-index") + 1 :] == (
+        "--cached",
+        "--ita-invisible-in-index",
+        "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=none",
+        "--raw",
+        "-z",
+        "--exit-code",
+        "a" * 40 + "^{commit}",
+        "--",
+    )
+    assert "--no-lazy-fetch" in argv
+
+
+def test_passos_mutantes_sao_add_sem_checkout_e_read_tree_sem_u() -> None:
+    """D2/P2: argv endurecido, `--no-checkout`, `read-tree` sem `-u`, start-point `^{commit}`."""
+    from app.git_runtime import worktree
+
+    names = worktree.task_worktree_names("abcdef12-3456-4789-8abc-def012345678")
+    add = worktree._add_argv("/usr/bin/git", "/repo", names, "/wt/x", "a" * 40)
+    read_tree = worktree._read_tree_argv("/usr/bin/git", "/wt/x", "a" * 40)
+    for argv in (add, read_tree):
+        pares = {argv[i + 1] for i, item in enumerate(argv[:-1]) if item == "-c"}
+        assert {
+            "core.hooksPath=/dev/null",
+            "core.fsmonitor=false",
+            "submodule.recurse=false",
+            "branch.autoSetupMerge=false",
+            "worktree.useRelativePaths=false",
+            "core.sparseCheckout=false",
+            "core.sparseCheckoutCone=false",
+        } <= pares
+        assert "--no-pager" in argv and "--no-lazy-fetch" in argv
+        assert not any(item.startswith("filter.") for item in argv)
+        assert "-u" not in argv
+        assert argv[-1] == "a" * 40 + "^{commit}"
+    assert "--no-checkout" in add
+    assert add[-3:-1] == ("--", "/wt/x")
+    assert read_tree[-3:] == ("read-tree", "--no-sparse-checkout", "a" * 40 + "^{commit}")
+
+
+def test_worktree_py_so_cria_processo_pelo_supervisor() -> None:
+    """D6: os passos mutantes passam por `process_runtime.run_supervised`, nunca `subprocess`
+    direto; e `run_supervised` só é chamado dentro de `_run_git_step`."""
+    for call in _calls(_WORKTREE_MODULE):
+        dotted = _dotted(call.func)
+        assert (
+            dotted is None
+            or dotted[0] not in {"subprocess", "os"}
+            or dotted[1]
+            not in {
+                "run",
+                "Popen",
+                "call",
+                "check_call",
+                "check_output",
+                "system",
+                "popen",
+            }
+        ), f"worktree.py cria processo por {dotted}"
+    assert _enclosing_functions_calls(_WORKTREE_MODULE, "run_supervised") == ["_run_git_step"]
+
+
+def test_git_runtime_nao_escreve_arquivo_por_conta_propria() -> None:
+    """D7 + P2: toda escrita de conteúdo passa pelo `TreeWriter` do `path_runtime` (injetado).
+    O `git_runtime` só lê: nenhum `os.mkdir`/`os.write`/`open(..., "w")`/`write_bytes`."""
+    proibidas = {("os", "mkdir"), ("os", "makedirs"), ("os", "write"), ("os", "replace")}
+    for path in (APP_ROOT / "git_runtime").rglob("*.py"):
+        for call in _calls(path):
+            dotted = _dotted(call.func)
+            assert dotted not in proibidas, f"git_runtime/{path.name} chama {dotted}"
+            func = call.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            assert name not in {"write_bytes", "write_text", "mkdir"}, (
+                f"git_runtime/{path.name} escreve com `{name}`"
+            )
+            if isinstance(func, ast.Name) and func.id == "open" and len(call.args) > 1:
+                mode = call.args[1]
+                assert isinstance(mode, ast.Constant) and set(str(mode.value)) <= {"r", "b"}, (
+                    f"git_runtime/{path.name} abre arquivo para escrita"
+                )
+        source = path.read_text(encoding="utf-8")
+        for flag in ("O_CREAT", "O_WRONLY", "O_RDWR", "O_APPEND", "O_TRUNC"):
+            assert flag not in source, f"git_runtime/{path.name} usa `os.{flag}`"
+
+
+def test_tree_writer_so_existe_no_path_runtime() -> None:
+    definicoes = [
+        _module_name(path)
+        for path in ALL_FILES
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.ClassDef) and node.name == "CheckedTreeWriter"
+    ]
+    assert definicoes == ["app.path_runtime"]
+
+
+def _enclosing_functions_calls(path: Path, func_name: str) -> list[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    found: list[str] = []
+
+    def visit(node: ast.AST, owner: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            name = child.name if isinstance(child, ast.FunctionDef) else owner
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id == func_name
+            ):
+                found.append(owner)
+            visit(child, name)
+
+    visit(tree, "<module>")
+    return found
+
+
+def test_git_runtime_so_importa_safety_e_supervisor_no_modulo_de_worktree() -> None:
+    """[01] §2 + adendo E7.4: `safety` (e o próprio pacote); `process_runtime` só em
+    `worktree.py`. Nunca `db`, `orchestrator`, `agent_runtime`, `tool_executor`, `path_runtime`,
+    `context_engine`, `api`."""
+    for path in (APP_ROOT / "git_runtime").rglob("*.py"):
+        for imported in _imports(path):
+            if not imported.startswith("app."):
+                continue
+            permitido: tuple[str, ...] = ("app.safety", "app.git_runtime")
+            if path == _WORKTREE_MODULE:
+                permitido += ("app.process_runtime",)
+            assert imported.startswith(permitido), f"git_runtime/{path.name} importa `{imported}`"
+
+
+def test_worktree_root_so_e_construida_pelo_path_runtime() -> None:
+    """D7: a `WorktreeRoot` validada nasce num único ponto, depois da decisão da `safety`."""
+    construtores = []
+    for path in ALL_FILES:
+        for call in _calls(path):
+            if isinstance(call.func, ast.Name) and call.func.id == "WorktreeRoot":
+                construtores.append(_module_name(path))
+    assert construtores == ["app.path_runtime"]
 
 
 def test_safety_e_puro() -> None:
@@ -1403,17 +1633,19 @@ def test_process_runtime_e_folha_so_stdlib() -> None:
                 )
 
 
-def test_ninguem_importa_process_runtime_na_e7_3() -> None:
-    """Consumidores (TestRunner/adaptadores, composition root) chegam na E8. Até lá, nenhum
-    módulo — em especial `orchestrator`, `agent_runtime`, `tool_executor`, `safety`, `api` e
-    `db` — depende do Supervisor."""
+def test_so_o_modulo_de_worktree_importa_process_runtime() -> None:
+    """Consumidores de provider (TestRunner/adaptadores, composition root) chegam na E8. Até
+    lá, o **único** consumidor é `git_runtime/worktree.py`, para o `worktree add` mutante
+    (adendo E7.4 a [01] §2). `orchestrator`, `agent_runtime`, `tool_executor`, `safety`, `api`
+    e `db` continuam sem depender do Supervisor — nenhum provider o alcança."""
     for path in ALL_FILES:
-        if path.is_relative_to(_PROCESS_RUNTIME):
+        if path.is_relative_to(_PROCESS_RUNTIME) or path == _WORKTREE_MODULE:
             continue
         for imported in _imports(path):
             assert not imported.startswith("app.process_runtime"), (
-                f"{_module_name(path)} importa `{imported}`: ninguém usa o Supervisor na E7.3"
+                f"{_module_name(path)} importa `{imported}`: só git_runtime/worktree.py pode"
             )
+    assert any(i.startswith("app.process_runtime") for i in _imports(_WORKTREE_MODULE))
 
 
 def test_nenhuma_chamada_liga_shell() -> None:

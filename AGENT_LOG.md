@@ -7280,3 +7280,143 @@ não era afetado.
 - Gates locais (Windows): E7.3 121 passed, 3 skipped (2×); architecture 183; afetados 524
   passed, 3 skipped; ruff check/format, mypy e mypy --platform linux exit 0.
 - Pendências: CI do PR; reverificação pontual do Codex; merge não autorizado; E7.4 não iniciada.
+
+## 2026-09-30 — Claude Opus 5.5 (effort: high) — E7.4: Git Worktree Isolation
+
+Implementação da E7.4 com as decisões D1–D10 do planejamento revisadas por Pedro (D5 alterada:
+sem `BRANCH_RESUMABLE`; D6 alterada: `worktree add` sob `process_runtime`). `main` local
+avançada por fast-forward (`2247197` → `6d7d226`, `git fetch origin main:main`); branch
+`e7/04-worktree-isolation` criada exatamente de `6d7d226`. Branches anteriores preservadas.
+Sem commit, sem push, sem PR.
+
+- **Addendum autorizado por Pedro nesta sessão** (estritamente aditivo): `docs/architecture/01`
+  §2 (aresta `git_runtime → process_runtime` só para mutação de lifecycle de worktree; leituras
+  no runner atual; `git_runtime` dono semântico; provider sem acesso) e `docs/architecture/04`
+  §8 (supervisão; `reset --hard` interno do `worktree add` na worktree nova, runtime continua
+  proibido de construí-lo; hooks e filtros neutralizados na criação). Nada mais em `docs/`.
+- Arquivos: novos `api/app/git_runtime/worktree.py`, `api/app/safety/worktree_location.py`,
+  `api/tests/test_git_worktree_e7_4.py`, `api/tests/test_worktree_root_e7_4.py`; alterados
+  `git_runtime/__init__.py` (reexportação + docstring), `safety/types.py`
+  (`WorktreeRootFacts`, `WorktreeRoot`), `safety/__init__.py`, `path_runtime.py`
+  (`inspect_worktree_root`/`prepare_worktree_root`), `config.py` (`worktrees_dir`,
+  `extra_sync_roots`, `sync_roots`, `ensure_worktrees_dir`), `tests/test_architecture.py`,
+  `.github/workflows/api-ci.yml` (job `process-runtime-windows` estendido, mesmo nome).
+  Não tocados: `orchestrator/`, `agent_runtime/`, `tool_executor/`, `db/`, `src/`.
+- Decisões de implementação: start-point `<sha>^{commit}` + pós-condição `HEAD == base`
+  (ref homônima de 40 hex testada nos 5 namespaces); só `ABSENT` cria, só `REUSABLE` reusa;
+  branch `ff/task-<id8>` existente sem worktree reusável → `BRANCH_ORPHANED` (recusa);
+  limpeza estrita inclui ignorados e marcadores de operação no git dir **da worktree**;
+  `clean=` também neutralizado (para o `status` de conferência); caminho **pedido** com link
+  e reparse na cadeia canônica recusam a raiz; `WorktreeRoot` amarrada por identidade ao
+  toplevel e ao `.git` comum do repositório.
+- Evidência real: `%LOCALAPPDATA%\FreelanceFocus` canoniza para
+  `…\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\FreelanceFocus` (MSIX) e é aceito;
+  `OneDrive\Desktop` recusado (`worktree_root.sync_root`). Contrafactual descartável (fora da
+  suíte): trocando `process_runtime` por `subprocess.run(timeout)`, o `sh.exe` neto do filtro
+  sobreviveu com o `git` pai morto e o chamador travou — processos encerrados por PID.
+- Gates locais (Windows, Python 3.11.9, git 2.53.0.windows.2, pytest 8.4.2, mypy 1.20.2):
+  E7.4 137 passed, 1 skipped; git_runtime/path/safety/architecture/process_runtime 416 passed,
+  6 skipped; suíte completa 2393 passed, 10 skipped (exit 0); ruff check, ruff format --check,
+  mypy e mypy --platform linux exit 0; `git diff --check` limpo.
+- Pendências: auditoria independente do Codex; CI (Linux + Windows) só roda após push, não
+  autorizado; Execution Manager (guarda de id8 único, ligação em `start_execution`,
+  reconciliação) fica para as próximas subetapas; E7.5/E8 não iniciadas.
+
+## 2026-09-30 — Claude Opus 5.5 (effort: high) — E7.4: finding pré-auditoria (filtros por includeIf)
+
+Fecha o risco "filtros via `includeIf gitdir:`" que o relatório da E7.4 deixara como residual.
+Reproduzido **antes** de mudar código, com a implementação anterior e git real em repos
+descartáveis: driver `filter.evil.{process,smudge}` só num `includeIf
+"gitdir:<repo>/.git/worktrees/**"` + `* filter=evil` → marcador gravado pelo filho
+`git reset --hard` interno do `worktree add` (a enumeração de `filter.*` rodava da principal,
+que não vê o include). Mesma classe: `core.attributesFile` condicional, `.git/info/attributes`
+com driver condicional, `attr.tree` condicional. Achados adjacentes reproduzidos: sparse da
+principal copiado para a worktree nova (árvore parcial com `status` limpo → aceita como
+`REUSABLE`) e `assume-unchanged` escondendo modificação do `status`. O `status` da inspeção
+**não** era vulnerável (enumera no próprio contexto do alvo); agora travado por teste com
+controle vivo.
+
+- Correção (só `git_runtime/worktree.py` + `_run_git` ganhou `stdin` opcional):
+  `--attr-source=<base>^{commit}` e `-c core.attributesFile=/dev/null` no `add`; drivers =
+  os **aplicados** pelo atributo `filter` a algum arquivo do base (`ls-tree` → `check-attr
+  --stdin`, sob as mesmas fontes fixadas) ∪ os configurados; `-c core.sparseCheckout=false`
+  e `core.sparseCheckoutCone=false`; `--no-pager`; reuso exige `ls-files -v` só com `H`.
+  Git < 2.42 (sem `--attr-source`) fecha como `UNVERIFIABLE`.
+- Adendo E7.4 de `docs/architecture/04` §8, item 3, **complementado** (mesma autorização da
+  sessão, mudança semântica da estratégia): driver aplicado por atributo, fontes fixadas,
+  sparse desligado.
+- Testes novos: 15 (includeIf process/smudge, attributesFile, info/attributes, attr.tree,
+  LFS por includeIf, macro/aninhado, valor inseguro, git sem `--attr-source`, clean no
+  `status` da inspeção com dois controles, textconv/diff externo/pager/editor, sparse ×2,
+  assume-unchanged/skip-worktree). Contrafactual por mutação real de `worktree.py`
+  (restaurado por sha256): M1 5 falham, M2 2 falham, M3 2 falham.
+- Gates (Windows): E7.4 152 passed, 1 skipped; git_runtime/architecture/process_runtime/
+  path/safety 416 passed, 6 skipped; afetados 79 passed; suíte completa 2407 passed,
+  10 skipped (exit 0); ruff check/format, mypy, mypy --platform linux exit 0.
+- Pendências: revisão do Pedro antes do Codex; commit/push não autorizados.
+
+## 2026-09-30 — Claude Opus 5.5 (effort: high) — E7.4: correção estrutural dos P2-001/P2-002 (Codex BLOCKED)
+
+Auditoria Codex BLOCKED por dois P2: (001) `set`/`unset`/`unspecified` como **valor** de
+`filter=` eram descartados pelo parser do `check-attr` e o driver homônimo executava; (002)
+corrida em `.git/info/attributes` entre a enumeração e o checkout executava `filter.two`.
+Decisão de Pedro: eliminar o pipeline de checkout/conversão do Git da criação.
+
+- Reprodução antes de mudar código (git real, repos descartáveis): P2-001 executou 3/3
+  (`set`, `unset`, `unspecified`) e P2-002 executou em 2/6 rodadas (7077 alternâncias) no
+  código anterior; os mesmos reprodutores no código novo: 0 execuções (5987 alternâncias).
+- PoC: `worktree add --no-checkout` só cria `git branch` interno (nenhum `reset --hard`), alvo só
+  com `.git`, sem índice; `read-tree --no-sparse-checkout` sem `-u`: zero filhos, zero arquivos,
+  índice == árvore; `ls-files`/`cat-file --batch`: zero filhos; 162 alternâncias de
+  `info/attributes` durante tudo, nenhum marcador. Symlink (`120000`) vira arquivo comum com o
+  alvo no Windows (`core.symlinks=false`) e gitlink vira diretório vazio → recusados
+  (`UNSUPPORTED_TREE_ENTRY`). Partial clone: `GIT_NO_LAZY_FETCH=1`/`--no-lazy-fetch` → `missing`
+  sem filho; sem eles o Git abre `fetch` + transporte.
+- Novo modelo (`git_runtime/worktree.py`): snapshot `ls-tree -r -z -l` validado inteiro antes de
+  qualquer escrita (`safety.decide_tree_paths`: política de path + `.git`, caixa, arquivo ×
+  diretório, `MAX_PATH`); `cat-file --batch-check` confirma blobs locais; `add --no-checkout` e
+  `read-tree` sem `-u` sob `process_runtime`; blobs crus em lotes de ≤ 32 MiB (oid recalculado)
+  escritos pelo `CheckedTreeWriter` do `path_runtime`, **injetado** (`tree_writer=`; sem aresta
+  `git_runtime → path_runtime`); cancelamento entre arquivos. Reuso **e** pós-condição pela
+  mesma verificação raw: `ls-files --stage`/`-v` == base e filesystem == snapshot (sem seguir
+  link, oid dos bytes, bit de execução POSIX); `git status`, `check-attr`, `--attr-source` e
+  toda neutralização de filtros removidos. `_run_git` ganhou `stdin`; `GIT_NO_LAZY_FETCH=1` em
+  `_GIT_ENV_OVERRIDES` (vale para as leituras antigas também).
+- Addenda E7.4 de `docs/architecture/01` §2 e `04` §8 revisados (mesma autorização; diff contra
+  `main` continua só de adição).
+- Gates (Windows): E7.4 203 passed, 2 skipped; ruff check/format, mypy, mypy --platform linux
+  exit 0. Performance (clone deste repo, 255 arquivos): `add` com checkout 0,46 s vs.
+  `create_worktree` raw ~3–5 s (dominado pela verificação raw, linear); reuso 0,87 s.
+- Pendências: nova auditoria do Codex; CI só após push (não autorizado); conteúdo materializado é
+  o blob cru — sem conversão `autocrlf` (Windows passa a ver LF onde o checkout daria CRLF).
+
+## 2026-09-30 — Claude Opus 5.5 (effort: high) — E7.4: três P2 da reauditoria do Codex
+
+Reauditoria confirmou fechados os P2 de filtros/atributos e abriu três P2 novos. Modelo
+no-checkout + read-tree sem `-u` + blobs crus + `CheckedTreeWriter` mantido.
+
+- Arquivos alterados: `api/app/path_runtime.py` (`CheckedTreeWriter`),
+  `api/app/git_runtime/worktree.py` (`_index_diff_argv`, `_index_matches_tree`,
+  `TreeSnapshot.commit`), `api/app/git_runtime/__init__.py` (só docstring),
+  `api/app/safety/worktree_location.py` (`decide_tree_paths`), testes
+  `test_worktree_root_e7_4.py`, `test_git_worktree_e7_4.py`, `test_architecture.py`;
+  addendum [04] §8 itens 2 e 3 (correção mínima, diff contra `main` segue só de adição).
+- P2-001 (cache do writer autorizava): o registro de identidades virou só expectativa; antes de
+  cada `mkdir`, da abertura e dos bytes, `_verify_chain` revalida sem reparse do volume até a
+  raiz, identidade da raiz e de cada componente até o pai. Reprodutor exato (raiz movida +
+  junction no caminho original entre duas chamadas) aceitava a escrita antes; agora recusa.
+- P2-002 (intent-to-add invisível): `ls-files --stage/-v/-t/--format` medidos, nenhum expõe a
+  flag. Escolhido `diff-index --cached --ita-invisible-in-index --no-renames --no-ext-diff
+  --no-textconv --ignore-submodules=none --raw -z --exit-code <base>^{commit}` (árvore ×
+  índice, sem working tree; 0 filhos com drivers maliciosos ativos). `--debug` descartado.
+  Arquivo vazio do base + ita era REUSABLE antes; agora DIRTY.
+- P2-003 (caixa de prefixo): `decide_tree_paths` exige uma só grafia por prefixo em toda a
+  árvore (`Dir/a.txt` + `dir/b.txt` → `tree_path.case_collision`), em todo SO. Antes o
+  `worktree add` chegava a rodar; agora nenhuma mutação.
+- Teste novo de interrupção do `read-tree` (hook `post-index-change` infinito, timeout e
+  cancelamento): árvore morta, `CREATED_INVALID`, nada limpo, nenhuma nova tentativa, nunca
+  REUSABLE. Sem bug de produção.
+- Gates (Windows): E7.4 244 passed, 2 skipped; suíte completa 2504 passed, 11 skipped
+  (exit 0); ruff check/format, mypy, mypy --platform linux exit 0; `git diff --check` limpo.
+  Performance (clone deste repo, 255 arquivos): create 4,7–6,7 s, reuso ~1 s.
+- Pendências: reverificação do Codex; commit/push não autorizados.

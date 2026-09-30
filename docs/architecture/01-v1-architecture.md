@@ -140,6 +140,21 @@ api/
 Na ordem interna de L1, `process_runtime` é folha (nenhuma dependência de projeto). A aresta
 `agent_runtime → process_runtime` só passa a existir na E8.
 
+#### Adendo autorizado — E7.4 (2026-09-30): supervisão das operações Git mutantes de worktree
+
+> Adendo aprovado por Pedro (decisão D6 do planejamento da E7.4; **revisado** na correção dos
+> P2-001/P2-002, também autorizada por Pedro). **Estritamente aditivo**: não altera nenhuma
+> outra linha desta seção nem as regras de [04](04-safety-and-git-runtime.md) além do adendo
+> correspondente em §8.
+
+| | |
+| --- | --- |
+| **Nova aresta** | `git_runtime → process_runtime`, **somente** para operações Git **mutantes** do ciclo de vida de worktree (na E7.4: `git worktree add --no-checkout` e `git read-tree` sem `-u`). O processo Git e todos os seus descendentes rodam sob o Supervisor: árvore contida, timeout, cancelamento, encerramento da árvore e confirmação de morte, saída limitada. |
+| **Materialização** | O conteúdo da worktree é escrito a partir dos blobs crus por um `TreeWriter` do `path_runtime` (`CheckedTreeWriter`), **injetado** em `create_worktree` por quem chama — como a `WorktreeRoot`. Não há aresta `git_runtime → path_runtime`; o `git_runtime` não escreve arquivo por conta própria. |
+| **Leituras Git** | Continuam no runner próprio de `git_runtime/` (o `subprocess` de leitura do adendo E7.3, D7). Nada migra. |
+| **Dono semântico** | `git_runtime/` continua sendo o **único** dono das operações Git: é ele quem forma o `argv`, escolhe o verbo e interpreta o resultado. `process_runtime` só executa a `ProcessSpec` recebida e não conhece Git. |
+| **Provider** | A aresta **não** dá a nenhum provider acesso a `process_runtime` nem a Git. O Developer continua alcançando Git apenas por `GitStatus`/`GitDiff`/`GitShow`/`GitListTree` via `ToolExecutor` ([04] §2); `execute_commands = disabled` permanece sem exceção. |
+
 #### `context_engine/` — conhecimento do workspace
 
 | | |

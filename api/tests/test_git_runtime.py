@@ -165,6 +165,7 @@ _EXPECTED_GIT_ENV = {
     "SYSTEMROOT": r"C:\Windows",
     "GIT_OPTIONAL_LOCKS": "0",
     "GIT_TERMINAL_PROMPT": "0",
+    "GIT_NO_LAZY_FETCH": "1",
 }
 
 

@@ -20,6 +20,9 @@ denylist de caminho — ela reaproveita `is_sensitive_key` e `classify_path_secr
 A E7.1 acrescenta `capability_profile`: o contrato puro das sete capabilities e a política
 de aceitação da V1 — vocabulário e veredito, sem prova nem provider.
 
+A E7.4 acrescenta `worktree_location`: a decisão pura sobre a raiz de worktrees (fora do
+OneDrive, do repositório e do `.git`), sobre `WorktreeRootFacts` coletados por `path_runtime`.
+
 Fora da E2 (fica para o Full Safety Runtime, E7): política de comandos, enforcement de
 escrita, `ToolExecutor`, capability, processos, timeout, worktree.
 """
@@ -62,8 +65,13 @@ from app.safety.types import (
     ObjectIdentity,
     PathFacts,
     SafetyDecision,
+    TreeWriter,
+    TreeWriterFactory,
     Tri,
+    WorktreeRoot,
+    WorktreeRootFacts,
 )
+from app.safety.worktree_location import decide_tree_paths, decide_worktree_root
 
 __all__ = [
     "OBJECTIVE_MENTIONS_SECRET",
@@ -83,13 +91,19 @@ __all__ = [
     "SecretPolicy",
     "SecretVerdict",
     "SourceRefResult",
+    "TreeWriter",
+    "TreeWriterFactory",
     "Tri",
+    "WorktreeRoot",
+    "WorktreeRootFacts",
     "check_v1",
     "classify_path_form",
     "classify_path_secrecy",
     "contains_redaction_marker",
     "decide_path",
     "decide_post_open",
+    "decide_tree_paths",
+    "decide_worktree_root",
     "detect_sensitive_objective_signals",
     "fingerprint_v1_projection",
     "is_sensitive_key",
