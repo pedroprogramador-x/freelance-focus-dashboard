@@ -335,7 +335,12 @@ def test_data_dir_real_desta_maquina_e_aceito_quando_fora_do_onedrive(tmp_path: 
     ("paths", "regra"),
     [
         (("a/../b",), "tree_path.path.parent_traversal"),
-        (("/abs",), "tree_path.path.root_relative"),
+        (
+            ("/abs",),
+            "tree_path.path.root_relative"
+            if _IS_WINDOWS
+            else "tree_path.path.absolute_not_allowed",
+        ),
         (("C:/abs",), "tree_path.path.absolute_not_allowed"),
         (("a\\b",), "tree_path.backslash"),
         (("x/.git/config",), "tree_path.dot_git"),
