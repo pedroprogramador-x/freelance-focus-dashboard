@@ -7420,3 +7420,135 @@ no-checkout + read-tree sem `-u` + blobs crus + `CheckedTreeWriter` mantido.
   (exit 0); ruff check/format, mypy, mypy --platform linux exit 0; `git diff --check` limpo.
   Performance (clone deste repo, 255 arquivos): create 4,7–6,7 s, reuso ~1 s.
 - Pendências: reverificação do Codex; commit/push não autorizados.
+
+## 2026-10-03 — Claude Opus 5.5 (effort: high) — E7.5-C: ApplyPatch seguro e determinístico
+
+Branch `e7/05-tool-executor`. Sem commit, push ou PR. E7.5-A/B intocadas em comportamento; as
+quatro operações de Git seguem `ERROR operation_not_implemented` (E7.5-D não iniciada).
+
+- Arquivos: novos `api/app/tool_executor/unified_diff.py` (parser + aplicação exata, puro),
+  `api/app/tool_executor/patch_ops.py` (coordenação), `api/tests/test_unified_diff_e7_5c.py`,
+  `api/tests/test_apply_patch_e7_5c.py`. Alterados: `tool_executor/executor.py` (despacho do
+  `ApplyPatch`; mapeamento único de falhas `_failed`; nota de aplicação parcial),
+  `tool_executor/outcome.py` (`ToolError`, `OperationAborted`, `Outcome.effects_applied`),
+  `tool_executor/reasons.py` (códigos `invalid_patch`, `patch_conflict`,
+  `unsupported_patch_format`, `unsupported_text_format`, `patch_partial_apply` e
+  `PARTIAL_APPLY_NOTE`), `path_runtime.py` (aditivo: `open_existing(readable=True)` → `O_RDWR`;
+  `probe_create` somente leitura), testes A/B que contavam o `ApplyPatch` como não implementado,
+  `tests/test_architecture.py` (lista de módulos + pureza do parser + efeitos só por primitivas).
+- Decisões: subset fechado (`--- a/P`/`+++ b/P`, `/dev/null` para create/delete, hunks lidos por
+  contagem, sem fuzz); `diff --git`/`index`/modos/rename/binário/TAB/aspas → `unsupported_patch_format`;
+  caminho absoluto/`..`/`.git`/segredo decididos pela pipeline normal (DENIED + journal), não pelo
+  parser; fim de linha: LF ou CRLF uniforme preservado, misturado/CR solto → `unsupported_text_format`,
+  `\ No newline at end of file` suportado com semântica exata; preflight em fases (limites → política
+  de todos → colisões NFC+casefold/identidade/ancestral → leitura interna + aplicação em memória) e
+  efeitos em ordem canônica por bytes UTF-8; update/delete relêem pelo handle e comparam SHA-256 +
+  tamanho; teto de leitura da linha de base derivado (`resultado + patch`), não normativo novo;
+  aplicação parcial = código original (ou `patch_partial_apply` para técnico) + nota fixa genérica.
+- Gates (Windows, Python 3.11.9): novos 238 passed (3×); E7.5-A/B 664 passed, 3 skipped; path/safety/
+  security/E7.2/architecture/worktree 723 passed, 8 skipped; suíte completa 3437 passed, 14 skipped;
+  ruff check, ruff format --check, mypy e mypy --platform linux exit 0; `git diff --check` limpo.
+  12 mutantes deliberados (releitura, colisão, ordem, marcador, fuzz, nota parcial…) — todos detectados.
+- Pendências: auditoria do Codex; POSIX não executado localmente; TOCTOU residual entre a última
+  comparação e o `unlink`/`ftruncate` (sem lock); sem rollback entre arquivos (decisão aprovada).
+
+## 2026-10-03 — Claude Opus 5.5 (effort: high) — E7.5-C: correção de C-AUD-001 e C-AUD-002
+
+Auditoria Codex da E7.5-C: BLOCKED por dois P2. Sem commit, push ou PR; E7.5-D não iniciada.
+
+- C-AUD-001 (summary validado só depois dos efeitos): o summary exato de sucesso (operação +
+  caminho relativo, ordem canônica) passa a ser finalizado no preflight pela fronteira central do
+  executor (`_prepare_output`: redação uma vez → teto UTF-8), exposta ao handler por
+  `HandlerContext.prepare_output`. Não cabe → `DENIED limit.tool_result_content_bytes` + journal,
+  zero efeitos. O `PreparedToolOutput` emitido é devolvido no `Outcome` e entregue intacto (sem
+  redigir/medir de novo); `_finish` só aceita a instância emitida nesta chamada. `_boundary_content`
+  virou `_prepare_output`; `Outcome.effects_applied` (OK) foi substituído por `Outcome.prepared`.
+- C-AUD-002 (contabilidade de create baseada no preflight): `path_runtime.CreateMutationTrace`
+  (aditivo, opcional em `create_exclusive`) registra cada `mkdir` e o `O_EXCL` bem-sucedidos no
+  instante da syscall e sobrevive a exceções. `patch_ops._create` marca efeito se algum pai foi
+  criado ou se o alvo criado não foi removido com prova; `parents_existed` removido. `touched` só
+  liga, nunca desliga.
+- Arquivos: `path_runtime.py`, `tool_executor/{executor,outcome,patch_ops}.py`,
+  `tests/test_apply_patch_e7_5c.py` (teste do teto agora exige negação antes dos efeitos),
+  `tests/test_architecture.py` (só o executor constrói `PreparedToolOutput`; trace sem política),
+  novo `tests/test_e7_5c_audit.py` (33 testes: contrafactual de 50 arquivos com caminhos longos —
+  só Windows por PATH_MAX —, teto exato/+1, redação que encolhe/expande, UTF-8, journal, saída
+  reutilizada, 11 testes do trace, corrida de pai removido + cancelamento/EIO, varreduras de
+  cancelamento (com e sem corrida) e de EIO em cada syscall da fase de efeitos).
+- Mutantes: 6 (summary após efeitos, redação dupla, prepared forjado, pais ignorados, trace sem
+  mkdir, limpeza ignorada) — todos detectados; restaurados por sha256.
+- Gates (Windows): novos 33 passed (3×); E7.5-C 271 passed; E7.5-A/B 664 passed, 3 skipped;
+  path/safety/security/E7.2/architecture/worktree 725 passed, 8 skipped; suíte completa 3472
+  passed, 14 skipped; ruff check/format, mypy e mypy --platform linux exit 0; `git diff --check` limpo.
+- Pendências: reverificação dirigida do Codex; teto derivado da linha de base intocado.
+
+## 2026-10-03 — Claude Opus 5.5 (effort: high) — E7.5-D: Git mediado (GitStatus, GitDiff, GitShow, GitListTree)
+
+Branch `e7/05-tool-executor`. Sem commit, push ou PR. E7.5 inteira **não** marcada como concluída:
+aguarda auditoria dirigida do Codex da D e depois a transversal da E7.5.
+
+- Arquivos novos: `api/app/git_runtime/mediated.py` (único dono do argv/ambiente/parse das quatro
+  leituras, sob `process_runtime`), `api/app/tool_executor/git_ops.py` (coordenação),
+  `api/app/tool_executor/diff_render.py` (unified diff puro), `api/app/safety/mediated_git.py`
+  (`decide_mediated_revision`), `api/tests/test_git_mediated_e7_5d.py`,
+  `api/tests/test_diff_render_e7_5d.py`. Alterados: `path_runtime.py` (aditivo: `digest_fd`),
+  `safety/__init__.py`, `tool_executor/executor.py` (despacho), `tool_executor/reasons.py`
+  (7 códigos técnicos Git, regra `git.ref_outside_base_history` → `capability_denied`),
+  testes A/B/C que esperavam `operation_not_implemented` (agora `git_failed` fora de repo),
+  `tests/test_architecture.py` (aresta ampliada, subcomandos fixos, sem patch do Git, renderer
+  puro, sem argv de fora). Adendos E7.5-D **só de adição** (autorizados na tarefa) em
+  `docs/architecture/01` §2 e `04` §8.
+- Decisões: o Git **nunca lê a worktree** (só `rev-parse`, `merge-base --is-ancestor`,
+  `ls-tree -r -z -l --full-tree`, `ls-files --stage|--others`, `cat-file blob|commit` com oid
+  recalculado); comparação com o filesystem em Python sobre bytes crus via `path_runtime`;
+  `base_commit` é a âncora (ref resolvida uma vez + gate de ancestralidade; `GitStatus` contra
+  o base, não o HEAD); prefixo do binding conferido contra `--show-prefix`; captura interna
+  4 MiB (truncado → `git_output_unverifiable`); `ls-tree -l` com tamanho `BAD` (partial clone)
+  → `git_object_unavailable`; renames sem heurística (status: só conteúdo idêntico; diff:
+  remoção + criação); marcadores `binary`/`large`/`index` sem conteúdo; caminho do provider
+  nunca no argv.
+- Testes: 116 novos (repos reais; config adversarial com sentinel + controle vivo; partial clone
+  com controle de lazy fetch; snapshots de worktree/índice/refs; truncamento, timeout, cancelamento).
+  13 mutantes deliberados — todos detectados (o D2, prefixo truncado bem formado, só depois de um
+  teste novo).
+- Gates (Windows, Python 3.11.9, git 2.53): novos 116 passed (3×); A/B/C 935 passed, 3 skipped;
+  E7.3/E7.4/git_runtime/path/safety/security/contratos/arquitetura 897 passed, 11 skipped; suíte
+  completa 3602 passed, 14 skipped; ruff check/format, mypy, mypy --platform linux exit 0;
+  `git diff --check` limpo. Frontend não tocado.
+- Pendências: auditoria dirigida do Codex; POSIX/CI não executados localmente; custo linear
+  (inspect + leitura de cada arquivo rastreado por GitStatus/GitDiff, ~0,4–1,2 s por operação
+  num repo pequeno no Windows).
+
+## 2026-10-04 — Claude Opus 5.5 (effort: high) — E7.5-D: correção de D-AUD-001..004
+
+Auditoria Codex da E7.5-D: BLOCKED por quatro P2. Sem commit, push ou PR; E7.5 **não** marcada como
+concluída; E7.6 não iniciada. D-AUD-001, D-AUD-002, D-AUD-003 e D-AUD-004: **candidate resolved**,
+aguardando reverificação do Codex.
+
+- D-AUD-001 (intent-to-add como limpo): o índice passa a ser observado também por
+  `diff-index --cached --ita-invisible-in-index --no-renames --no-ext-diff --no-textconv
+  --ignore-submodules=none --raw -z --exit-code <commit>^{commit} --` — **o mesmo argv** da E7.4
+  (`worktree._index_diff_argv`, dono único do literal), só árvore × índice, sem disco nem patch.
+  GitStatus: caminho sinalizado só por ele vira `staged`; GitDiff: `index\t<p>`.
+- D-AUD-002 (duplicatas colapsadas): `_validate_index_entries` antes de qualquer mapa (exatamente
+  um estágio 0, ou só 1/2/3 sem repetição; duplicata idêntica também falha) →
+  `git_output_unverifiable`; `_validate_tree_entries` idem na árvore. Contrafactual com índice v2
+  real escrito pelo teste (A,B e B,A).
+- D-AUD-003 (índice escondido pelo disco): `index\t<p>` sai **sempre** que o índice diverge do
+  commit (inventário, conflito ou ITA), antes da representação do disco; redundância aceita.
+- D-AUD-004 (cancelamento na volta do Supervisor): `MediatedGit._run` consulta o token antes,
+  e **depois** de `run_supervised` antes de olhar o desfecho (vence `EXITED`); cada operação
+  consulta de novo antes de devolver `OK`. Supervisor não alterado.
+- Arquivos: `git_runtime/mediated.py`, `tool_executor/git_ops.py`, `tests/test_e7_5d_audit.py`
+  (novo, 53), `tests/test_git_mediated_e7_5d.py` (rename agora com `index\t…`; helper de
+  subcomando), `tests/test_architecture.py` (3 travas novas), `tests/test_diff_render_e7_5d.py`
+  (só a docstring: ida e volta dentro do contrato da C), adendo E7.5-D de `docs/architecture/04`
+  (item 3 e item 9; diff contra `main` segue só de adição).
+- Mutantes: 6 (sem probe ITA, last-write-wins, marcador só com disco == base, sem checagem na
+  volta, `diff-index` truncado aceito, sem checagem final no GitShow) — todos detectados.
+- Gates (Windows): auditoria 53 passed em 9 de 10 rodadas (inclusive 3 em paralelo sob carga);
+  **1 falha intermitente na 1ª rodada, não reproduzida, nome não capturado** (o script de gate só
+  guardava o resumo). D inteira 169 passed; A/B/C 935 passed, 3 skipped; E7.3/E7.4/git/path/
+  safety/security/contratos/arquitetura 900 passed, 11 skipped; suíte completa 3658 passed,
+  14 skipped; ruff check/format, mypy, mypy --platform linux exit 0; `git diff --check` limpo.
+- Pendências: reverificação dirigida do Codex; investigar a falha intermitente se reaparecer.

@@ -12,6 +12,12 @@ criaria ciclo.
 nomeia a operação e passa parâmetros tipados; o `argv` é formado pelo runtime (E7.5).
 `required_capability` amarra cada operação à capability de [04] §2; um teste trava as nove.
 
+## E7.5-A: ajustes mínimos
+
+`CancelToken` passa a ser definido aqui (e `agent_runtime.dto` o reexporta); a factory recebe o
+token e o `DecisionJournal` do run; `ToolExecutor` ganha `close()`; `ListDirectory.path` passa a
+`str | None` — `None` é a **raiz** da execution workspace (nenhuma string vira atalho de raiz).
+
 ## O que estes DTOs não decidem
 
 Se um caminho é permitido, se o conteúdo vaza segredo, se a capability está concedida: nada
@@ -115,15 +121,20 @@ class ReadFile:
 
 @dataclass(frozen=True, slots=True)
 class ListDirectory:
-    path: str
+    """`path=None` é a raiz da execution workspace; `""`, `"."`, `"/"` etc. **não** são."""
+
+    path: str | None = None
 
     def __post_init__(self) -> None:
-        _path("path", self.path)
+        if self.path is not None:
+            _path("path", self.path)
 
 
 @dataclass(frozen=True, slots=True)
 class SearchText:
-    """Busca implementada pelo runtime, não por `grep` externo ([04] §2)."""
+    """Busca implementada pelo runtime, não por `grep` externo ([04] §2).
+
+    `path=None` é a raiz da execution workspace."""
 
     query: str
     path: str | None = None
@@ -298,6 +309,68 @@ class MediatedUsage:
             raise ContractViolation("denials não pode exceder operations")
 
 
+# ------------------------------------------------------------------ cancelamento e journal
+
+
+class CancelToken(Protocol):
+    """Todo provider, auditor, runner e executor é cancelável por um token ([05] §1)."""
+
+    def is_cancelled(self) -> bool: ...
+
+
+class DecisionCategory(str, Enum):
+    """Categoria de uma negação. Valores **iguais** aos de `SafetyEventKind` ([02] §12).
+
+    Definida aqui para que `tool_executor` não importe `db`; um teste fora desta fronteira
+    trava que cada valor existe em `SafetyEventKind`.
+    """
+
+    PATH_DENIED = "path_denied"
+    SECRET_ACCESS_BLOCKED = "secret_access_blocked"  # noqa: S105 — nome de evento, não senha
+    CAPABILITY_DENIED = "capability_denied"
+    LIMIT_EXCEEDED = "limit_exceeded"
+    TOCTOU_RECHECK_FAILED = "toctou_recheck_failed"
+    OUT_OF_WORKTREE_WRITE = "out_of_worktree_write"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolDecisionRecord:
+    """Uma negação do executor, já sanitizada, para o Execution Manager virar `SafetyEvent`.
+
+    `reason` é a frase fixa do `rule_id` e `subject_redacted` já passou pelo redator: quem
+    persistir não precisa lembrar de sanitizar. Não há `workspace_id` — o executor não o
+    conhece; o Execution Manager o preenche a partir da `workspace_ref`.
+    """
+
+    sequence: int
+    operation: str
+    category: DecisionCategory
+    rule_id: str
+    subject_redacted: str
+    reason: str
+    run_scope: RunScope
+
+    def __post_init__(self) -> None:
+        require_int("sequence", self.sequence, minimum=1)
+        require_text("operation", self.operation)
+        require_instance("category", self.category, DecisionCategory)
+        require_text("rule_id", self.rule_id)
+        require_text("subject_redacted", self.subject_redacted)
+        require_text("reason", self.reason)
+        require_instance("run_scope", self.run_scope, RunScope)
+
+
+class DecisionJournal(Protocol):
+    """Canal run-scoped por onde o executor entrega negações. **Nunca persiste.**
+
+    Quem o implementa é o Execution Manager (o único que grava `SafetyEvent`). Se `append`
+    levantar, o executor entra em estado *poisoned*: devolve `ERROR` (nunca `DENIED`, que
+    exigiria uma trilha de decisão disponível) para esta chamada e todas as seguintes.
+    """
+
+    def append(self, record: ToolDecisionRecord) -> None: ...
+
+
 # --------------------------------------------------------------------------- protocolos
 
 
@@ -316,6 +389,10 @@ class ToolExecutor(Protocol):
 
     def mediated_tools(self) -> MediatedTools: ...
 
+    def close(self) -> None:
+        """Encerra o executor do run: chamadas seguintes devolvem `ERROR`. Idempotente."""
+        ...
+
 
 class ToolExecutorFactory(Protocol):
     """Vida da aplicação; injetada pelo composition root ([05] §2)."""
@@ -326,12 +403,17 @@ class ToolExecutorFactory(Protocol):
         composed_policy: SafetyPolicy,
         effective_capability_profile: ProviderCapabilityProfile,
         run_scope: RunScope,
+        cancel_token: CancelToken,
+        decision_journal: DecisionJournal,
     ) -> ToolExecutor: ...
 
 
 __all__ = [
     "TOOL_OPERATIONS",
     "ApplyPatch",
+    "CancelToken",
+    "DecisionCategory",
+    "DecisionJournal",
     "ExecutionWorkspaceRef",
     "GitDiff",
     "GitListTree",
@@ -343,6 +425,7 @@ __all__ = [
     "ReadFile",
     "RunScope",
     "SearchText",
+    "ToolDecisionRecord",
     "ToolExecutor",
     "ToolExecutorFactory",
     "ToolRequest",

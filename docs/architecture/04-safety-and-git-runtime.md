@@ -698,3 +698,64 @@ O `git_runtime` nunca escreve no banco: devolve fatos, e o Execution Manager per
    atualiza refs; o `read-tree` escreve o índice), sem alterar configuração persistente. O
    `git worktree add` ainda executa, ele próprio, um `git branch` interno; o runtime continua
    **proibido** de construir ou invocar `git reset --hard` (ou qualquer checkout) diretamente.
+
+#### Adendo autorizado — E7.5-D (2026-10-03): as quatro leituras Git do Developer
+
+> Adendo aprovado por Pedro (tarefa E7.5-D). **Estritamente aditivo**: a lista "Nunca executa",
+> a tabela de situações e o adendo E7.4 acima continuam valendo sem alteração. A aresta de
+> módulo está no adendo E7.5-D de [01](01-v1-architecture.md) §2.
+
+1. **Operações fixas.** `GitStatus`, `GitDiff`, `GitShow` e `GitListTree` exigem `git_read`
+   em `fixed_operations_only`; o gate de capability roda **antes** de qualquer processo. O
+   provider escolhe só a operação, uma ref tipada e um caminho tipado; o `argv` é formado
+   apenas por `git_runtime/mediated.py`. Caminho do provider **nunca** entra no `argv`: a árvore
+   é listada inteira e filtrada pelo runtime.
+2. **Âncora no `base_commit`.** `ref=None` é o `base_commit` do run. Uma ref nomeada é resolvida
+   **uma vez** (`rev-parse --verify --quiet --end-of-options <ref>^{commit}`) para um commit
+   completo (SHA-1 ou SHA-256, conforme o repositório), e só vale se for o `base_commit` ou
+   ancestral dele (`merge-base --is-ancestor`); fora disso, `DENIED
+   git.ref_outside_base_history`, registrado. O `HEAD` ambiente nunca é autoridade —
+   `GitStatus` também compara contra o `base_commit`.
+3. **O Git nunca lê a worktree.** Só comandos de objeto e índice: `rev-parse`, `merge-base`,
+   `ls-tree -r -z -l --full-tree`, `ls-files --stage`/`--others --exclude-standard`,
+   `cat-file blob|commit` (oid recalculado) e `diff-index --cached --ita-invisible-in-index
+   --no-renames --no-ext-diff --no-textconv --raw -z` — o mesmo argv do adendo E7.4, usado
+   **só** para observar árvore × índice (inclusive *intent-to-add*, que `ls-files --stage` não
+   expõe), sem conteúdo de diff e sem tocar o disco. Nenhum `status`, `diff`, `diff-files`,
+   `diff-index` sem `--cached`, `show`, `log` — eles podem rodar `clean`/`process` de filtros e
+   `textconv` do repositório. O conteúdo atual é lido pelo `path_runtime` (inspect → política →
+   `open_existing` → pós-abertura → leitura) e comparado em Python sobre os bytes crus (oid de
+   blob). Mesma decisão do adendo E7.4: o pipeline de conversão de working tree do Git fica fora.
+4. **Sem patch do Git.** `diff -p`, `show -p` e `diff-tree -p` não são usados. O unified diff do
+   `GitDiff` é renderizado em Python (`tool_executor/diff_render.py`, puro), a partir dos blobs
+   crus e do conteúdo atual; binário e conteúdo acima da captura interna viram marcadores sem
+   conteúdo; índice divergente de um arquivo igual ao commit não some (marcador).
+5. **Sem rede, helpers, hooks ou filtros.** Opções fixas em toda invocação: as de leitura já
+   auditadas (`core.fsmonitor=false`, `core.quotepath=false`, `diff.relative=false`,
+   `status.relativePaths=false`) mais `--no-pager`, `--no-lazy-fetch`, `--no-replace-objects`,
+   `protocol.allow=never`, `credential.helper=` (vazio), `core.hooksPath=/dev/null`,
+   `core.untrackedCache=false`, `gc.auto=0`, `maintenance.auto=false`. Ambiente mínimo com
+   `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0` e `GIT_NO_LAZY_FETCH=1`; nenhum `GIT_*`
+   herdado. Objeto ausente num partial clone é `ERROR git_object_unavailable`, nunca fetch.
+   Nenhum subcomando altera worktree, índice, refs, `HEAD` ou config.
+6. **Captura interna ≠ saída.** A saída estrutural do Git é capturada até 4 MiB
+   (`git_internal_capture_bytes`); passou disso, `ERROR git_output_unverifiable` — nunca um
+   prefixo interpretado como resposta completa. `stderr` é limitado e descartado. O
+   `ToolResult` segue a fronteira central já auditada: saída completa → redação uma vez →
+   256 KiB em bytes UTF-8 → `OK` ou `DENIED limit.tool_result_content_bytes`, sem corte.
+   `GitShow(path)` nega blob acima de 256 KiB **antes** de ler o conteúdo.
+7. **Caminhos.** Caminho explícito negado → a operação inteira é `DENIED`. Caminho descoberto
+   negado → registrado e omitido (nunca lido). Caminho de fora do workspace é descartado (nunca
+   `../`). Caminho de dentro que o `ToolExecutor` não sabe nomear (UTF-8 inválido, `\` literal)
+   no escopo pedido → `ERROR git_output_unverifiable`; symlink, gitlink ou repositório aninhado
+   no escopo → `ERROR unsupported_git_tree_entry`.
+8. **Uso medido.** `files_read` conta só o conteúdo entregue: o caminho de `GitShow(path)` e
+   cada seção textual do `GitDiff`, depois do `ToolResult OK`. Leituras internas, marcadores e
+   metadados não contam.
+9. **Correções da auditoria (D-AUD-001 a 004).** O índice é observado pelo inventário
+   **e** pela divergência árvore × índice, unidos; nenhum mapa por caminho nasce antes de
+   validar que cada caminho tem exatamente um estágio 0 **ou** só estágios de conflito sem
+   repetição (duplicata, mesmo idêntica, → `ERROR git_output_unverifiable`). No `GitDiff`, um
+   índice divergente do commit sempre sai como `index\t<p>`, diverja o disco ou não. O
+   cancelamento é consultado antes de cada processo Git, pelo Supervisor durante, **depois**
+   que ele devolve (vence até `EXITED` completo) e de novo antes de cada `OK`.

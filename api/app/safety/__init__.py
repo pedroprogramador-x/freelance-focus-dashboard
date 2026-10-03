@@ -39,6 +39,15 @@ from app.safety.capability_profile import (
     parse_capability_profile,
     require_v1,
 )
+from app.safety.mediated_git import (
+    REF_OUTSIDE_BASE_HISTORY_RULE_ID,
+    decide_mediated_revision,
+)
+from app.safety.mediated_paths import (
+    DOT_GIT_RULE_ID,
+    decide_mediated_path,
+    prevalidate_mediated_path,
+)
 from app.safety.objective_signals import (
     OBJECTIVE_MENTIONS_SECRET,
     AnalyzerSignal,
@@ -49,7 +58,9 @@ from app.safety.paths import (
     PathIntent,
     classify_path_form,
     decide_path,
+    decide_post_create,
     decide_post_open,
+    path_components,
     prevalidate_path_syntax,
 )
 from app.safety.policy import SafetyPolicy, policy_hash
@@ -61,6 +72,7 @@ from app.safety.redaction import (
 )
 from app.safety.secrets import SecretPolicy, SecretVerdict, classify_path_secrecy
 from app.safety.source_refs import SourceRefResult, validate_source_ref
+from app.safety.tool_limits import TOOL_LIMITS_V1, ToolLimits
 from app.safety.types import (
     ObjectIdentity,
     PathFacts,
@@ -74,7 +86,10 @@ from app.safety.types import (
 from app.safety.worktree_location import decide_tree_paths, decide_worktree_root
 
 __all__ = [
+    "DOT_GIT_RULE_ID",
     "OBJECTIVE_MENTIONS_SECRET",
+    "REF_OUTSIDE_BASE_HISTORY_RULE_ID",
+    "TOOL_LIMITS_V1",
     "AnalyzerSignal",
     "Capability",
     "CapabilityProfileRejected",
@@ -91,6 +106,7 @@ __all__ = [
     "SecretPolicy",
     "SecretVerdict",
     "SourceRefResult",
+    "ToolLimits",
     "TreeWriter",
     "TreeWriterFactory",
     "Tri",
@@ -100,7 +116,10 @@ __all__ = [
     "classify_path_form",
     "classify_path_secrecy",
     "contains_redaction_marker",
+    "decide_mediated_path",
+    "decide_mediated_revision",
     "decide_path",
+    "decide_post_create",
     "decide_post_open",
     "decide_tree_paths",
     "decide_worktree_root",
@@ -108,7 +127,9 @@ __all__ = [
     "fingerprint_v1_projection",
     "is_sensitive_key",
     "parse_capability_profile",
+    "path_components",
     "policy_hash",
+    "prevalidate_mediated_path",
     "prevalidate_path_syntax",
     "redact",
     "redact_document",

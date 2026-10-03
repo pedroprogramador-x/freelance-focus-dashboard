@@ -143,14 +143,26 @@ def test_git_runtime_e_somente_leitura() -> None:
         "--system",
     )
     for path in (APP_ROOT / "git_runtime").rglob("*.py"):
+        if path == _MEDIATED_MODULE:
+            continue  # estrutural, abaixo: `commit` lá é **tipo de objeto** do `cat-file`
         source = path.read_text(encoding="utf-8")
         for verb in mutating_verbs:
             assert f'"{verb}"' not in source, (
                 f"git_runtime/{path.name} usa o verbo git `{verb}`: o adaptador é só leitura"
             )
+    constantes = _str_constants_of(_MEDIATED_MODULE)
+    for verb in mutating_verbs:
+        if verb == "commit":
+            # Só como tipo de objeto, dentro de `read_commit` (`cat-file commit <oid>`).
+            assert _enclosing_functions(_MEDIATED_MODULE, "commit") == ["read_commit"]
+            continue
+        assert verb not in constantes, f"mediated.py constrói `{verb}`"
 
 
 _WORKTREE_MODULE = APP_ROOT / "git_runtime" / "worktree.py"
+#: E7.5-D: as quatro leituras Git do Developer, sob o Supervisor (adendo E7.5-D).
+_MEDIATED_MODULE = APP_ROOT / "git_runtime" / "mediated.py"
+_SUPERVISED_GIT_MODULES = (_WORKTREE_MODULE, _MEDIATED_MODULE)
 
 #: P2-001/P2-002: nada no módulo de worktree passa conteúdo pela conversão de working tree
 #: do Git nem consulta atributos. Conferido por **constante no AST** (não por texto: a
@@ -338,15 +350,15 @@ def _enclosing_functions_calls(path: Path, func_name: str) -> list[str]:
 
 
 def test_git_runtime_so_importa_safety_e_supervisor_no_modulo_de_worktree() -> None:
-    """[01] §2 + adendo E7.4: `safety` (e o próprio pacote); `process_runtime` só em
-    `worktree.py`. Nunca `db`, `orchestrator`, `agent_runtime`, `tool_executor`, `path_runtime`,
-    `context_engine`, `api`."""
+    """[01] §2 + adendos E7.4/E7.5-D: `safety` (e o próprio pacote); `process_runtime` só em
+    `worktree.py` e `mediated.py`. Nunca `db`, `orchestrator`, `agent_runtime`,
+    `tool_executor`, `path_runtime`, `context_engine`, `api`."""
     for path in (APP_ROOT / "git_runtime").rglob("*.py"):
         for imported in _imports(path):
             if not imported.startswith("app."):
                 continue
             permitido: tuple[str, ...] = ("app.safety", "app.git_runtime")
-            if path == _WORKTREE_MODULE:
+            if path in _SUPERVISED_GIT_MODULES:
                 permitido += ("app.process_runtime",)
             assert imported.startswith(permitido), f"git_runtime/{path.name} importa `{imported}`"
 
@@ -1483,16 +1495,126 @@ def _externos(pasta: str) -> dict[str, set[str]]:
     return resultado
 
 
-def test_tool_executor_so_depende_de_safety() -> None:
-    """[01] §3: `tool_executor → agent_runtime` criaria ciclo; `→ db`/`orchestrator` idem.
+#: Os módulos de `tool_executor` que são só tipos (E7.2): continuam sem IO e só com `safety`.
+_CONTRATOS_DO_TOOL_EXECUTOR = {"contracts.py", "validation.py"}
 
-    Na E7.2 o pacote só tem contratos, então nem `path_runtime`/`git_runtime` entram ainda.
+
+def test_tool_executor_so_importa_o_permitido() -> None:
+    """[01] §2: `tool_executor` pode importar `safety`, `path_runtime`, `git_runtime`, `config`
+    e stdlib. `→ agent_runtime` criaria ciclo; `→ db`/`orchestrator`/`context_engine`/`api`
+    nunca; e **não** usa `process_runtime` (o Developer não tem processo).
+
+    Os módulos de contrato (E7.2) continuam só com `safety`.
     """
     for nome, importados in _imports_do_projeto("tool_executor").items():
+        permitido: tuple[str, ...] = ("app.safety", "app.tool_executor")
+        if nome not in _CONTRATOS_DO_TOOL_EXECUTOR:
+            permitido += ("app.path_runtime", "app.git_runtime", "app.config")
         for imported in importados:
-            assert imported.startswith(("app.safety", "app.tool_executor")), (
-                f"tool_executor/{nome} importa `{imported}`: só `safety` é permitido"
+            assert imported.startswith(permitido), (
+                f"tool_executor/{nome} importa `{imported}`: fora do permitido"
             )
+
+
+_PROIBIDOS_NO_TOOL_EXECUTOR = (
+    "app.db",
+    "app.agent_runtime",
+    "app.orchestrator",
+    "app.context_engine",
+    "app.api",
+    "app.main",
+    "app.process_runtime",
+    "app.workspace",
+    "fastapi",
+    "starlette",
+    "sqlalchemy",
+    "subprocess",
+    "multiprocessing",
+)
+
+
+def test_tool_executor_nao_importa_banco_provider_nem_processo() -> None:
+    for path in (APP_ROOT / "tool_executor").rglob("*.py"):
+        for imported in _imports(path):
+            assert not imported.startswith(_PROIBIDOS_NO_TOOL_EXECUTOR), (
+                f"tool_executor/{path.name} importa `{imported}`"
+            )
+
+
+#: IO de filesystem e rede é do `path_runtime`/`git_runtime`; o executor só coordena a decisão.
+_IO_PROIBIDO_NO_EXECUTOR = {
+    "os",
+    "shutil",
+    "pathlib",
+    "tempfile",
+    "socket",
+    "io",
+    "glob",
+    "fnmatch",
+}
+
+
+def test_tool_executor_nao_faz_io_por_conta_propria() -> None:
+    for path in (APP_ROOT / "tool_executor").rglob("*.py"):
+        for imported in _imports(path):
+            assert imported.split(".")[0] not in _IO_PROIBIDO_NO_EXECUTOR, (
+                f"tool_executor/{path.name} importa `{imported}`: IO é do path_runtime"
+            )
+        for call in _calls(path):
+            func = call.func
+            assert not (isinstance(func, ast.Name) and func.id == "open"), (
+                f"tool_executor/{path.name} chama open()"
+            )
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            assert name not in {"write_bytes", "write_text", "unlink", "rmdir", "mkdir"}, (
+                f"tool_executor/{path.name} chama `{name}`"
+            )
+
+
+def test_path_runtime_nao_importa_o_executor_nem_o_cancel_token() -> None:
+    """As primitivas E7.5-A cooperam com cancelamento por `Callable[[], bool]`; não há
+    dependência reversa de `path_runtime` para `tool_executor`/`agent_runtime`."""
+    for imported in _imports(APP_ROOT / "path_runtime.py"):
+        assert not imported.startswith(("app.tool_executor", "app.agent_runtime")), imported
+    tree = ast.parse((APP_ROOT / "path_runtime.py").read_text(encoding="utf-8"))
+    nomes = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} | {
+        n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+    }
+    assert "CancelToken" not in nomes  # a docstring pode citá-lo; o código não
+
+
+def test_path_runtime_nao_decide_politica_do_developer() -> None:
+    """Capability, segredo e `.git` são decididos por `safety`; `path_runtime` só coleta e
+    revalida fatos. Nem a regra mediada nem a classificação de segredo são chamadas aqui."""
+    tree = ast.parse((APP_ROOT / "path_runtime.py").read_text(encoding="utf-8"))
+    usados = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} | {
+        n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            usados |= {alias.name for alias in node.names}
+    for nome in (
+        "decide_mediated_path",
+        "prevalidate_mediated_path",
+        "classify_path_secrecy",
+        "require_v1",
+        "Capability",
+        "DOT_GIT_RULE_ID",
+    ):
+        assert nome not in usados, f"path_runtime referencia `{nome}`: política não é dele"
+
+
+def test_agent_runtime_so_ve_os_contratos_do_tool_executor() -> None:
+    """O executor concreto (factory, executor, resolver, journal) nunca é importado por
+    `agent_runtime`: os providers recebem só as portas de `contracts`."""
+    for path in (APP_ROOT / "agent_runtime").rglob("*.py"):
+        for imported in _imports(path):
+            if imported.startswith("app.tool_executor"):
+                assert imported in {
+                    "app.tool_executor",
+                    "app.tool_executor.contracts",
+                    "app.tool_executor.validation",
+                }, f"agent_runtime/{path.name} importa `{imported}`"
 
 
 def test_agent_runtime_so_depende_de_safety_e_tool_executor() -> None:
@@ -1509,6 +1631,8 @@ def test_contratos_usam_so_stdlib_de_tipos() -> None:
     """Sem `os`, `subprocess`, `socket`, `pathlib`, SDK: os contratos não têm efeito."""
     for pasta in ("agent_runtime", "tool_executor"):
         for nome, externos in _externos(pasta).items():
+            if pasta == "tool_executor" and nome not in _CONTRATOS_DO_TOOL_EXECUTOR:
+                continue  # executor concreto (E7.5-A): coberto pelos testes de IO acima
             for imported in externos:
                 assert imported.split(".")[0] in _STDLIB_PERMITIDA_NOS_CONTRATOS, (
                     f"{pasta}/{nome} importa `{imported}`: contratos não têm IO nem SDK"
@@ -1530,14 +1654,237 @@ def test_so_agent_runtime_importa_tool_executor_e_ninguem_importa_agent_runtime(
                 )
 
 
-def test_nao_ha_adaptador_concreto_nem_executor_concreto_na_e7_2() -> None:
-    """Adaptadores (`agent_runtime/adapters/`) e o executor são E7.5+/E8+."""
+def test_nao_ha_adaptador_concreto_e_o_executor_tem_so_as_operacoes_ate_a_e7_5c() -> None:
+    """Adaptadores (`agent_runtime/adapters/`) são E8+. O executor concreto tem as operações de
+    arquivo (E7.5-B, `fs_ops`) e o `ApplyPatch` (E7.5-C, `patch_ops` + o parser puro
+    `unified_diff`); nenhum módulo de Git mediado ainda (E7.5-D)."""
     assert not (APP_ROOT / "agent_runtime" / "adapters").exists()
     assert {p.name for p in (APP_ROOT / "tool_executor").glob("*.py")} == {
         "__init__.py",
         "contracts.py",
         "validation.py",
+        "workspace.py",
+        "journal.py",
+        "facade.py",
+        "reasons.py",
+        "executor.py",
+        "factory.py",
+        "outcome.py",
+        "fs_ops.py",
+        "patch_ops.py",
+        "unified_diff.py",
+        "git_ops.py",
+        "diff_render.py",
     }
+
+
+# ------------------------------------------------------------------- E7.5-D: Git mediado
+
+#: Os **únicos** subcomandos que o Git mediado constrói: só objetos e índice.
+_SUBCOMANDOS_MEDIADOS = {"rev-parse", "merge-base", "ls-tree", "ls-files", "cat-file"}
+
+#: Nada que leia a worktree pelo Git (filtros/`textconv`), gere patch ou toque rede/config.
+_PROIBIDOS_NO_GIT_MEDIADO = (
+    "status",
+    "diff",
+    "diff-files",
+    "diff-index",
+    "diff-tree",
+    "show",
+    "log",
+    "-p",
+    "--patch",
+    "--textconv",
+    "--filters",
+    "--batch",
+    "check-attr",
+    "update-index",
+    "--refresh",
+    "checkout",
+    "fetch",
+    "config",
+    "submodule",
+)
+
+
+def _str_constants_of(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return {
+        n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    }
+
+
+def test_git_mediado_so_usa_subcomandos_de_objeto_e_indice() -> None:
+    constantes = _str_constants_of(_MEDIATED_MODULE)
+    for proibido in _PROIBIDOS_NO_GIT_MEDIADO:
+        assert proibido not in constantes, f"mediated.py constrói `{proibido}`"
+    usados = {c for c in constantes if c in _SUBCOMANDOS_MEDIADOS}
+    assert usados == _SUBCOMANDOS_MEDIADOS
+
+
+def test_diff_index_do_git_mediado_e_o_da_e7_4() -> None:
+    """D-AUD-001: o único `diff-index` do Git mediado é o argv já auditado da E7.4
+    (`worktree._index_diff_argv`: árvore × índice, `--cached --raw -z`, sem diff externo/textconv),
+    usado só em `MediatedGit.index_divergence` — nunca diff de worktree, nunca patch."""
+    from app.git_runtime import worktree
+
+    assert "app.git_runtime.worktree" in _imports(_MEDIATED_MODULE)
+    assert _enclosing_functions_calls(_MEDIATED_MODULE, "_index_diff_argv") == ["index_divergence"]
+    argv = worktree._index_diff_argv("a" * 40)
+    assert {"--cached", "--raw", "-z", "--no-ext-diff", "--no-textconv", "--no-renames"} <= set(
+        argv
+    )
+    assert not {"-p", "--patch", "--stat", "--textconv", "--ext-diff"} & set(argv)
+
+
+def _calls_in_order(path: Path, function: str) -> list[str]:
+    """Nomes chamados dentro de ``function``, na ordem do código-fonte."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == function:
+            calls = [n for n in ast.walk(node) if isinstance(n, ast.Call)]
+            calls.sort(key=lambda n: (n.lineno, n.col_offset))
+            return [
+                c.func.attr if isinstance(c.func, ast.Attribute) else getattr(c.func, "id", "")
+                for c in calls
+            ]
+    raise AssertionError(function)
+
+
+def test_indice_e_arvore_sao_validados_antes_de_virar_mapa() -> None:
+    """D-AUD-002: nenhum mapa por caminho sem antes validar unicidade/estágios."""
+    for function, validator in (
+        ("list_index", "_validate_index_entries"),
+        ("list_tree", "_validate_tree_entries"),
+    ):
+        names = _calls_in_order(_MEDIATED_MODULE, function)
+        assert validator in names and names.index(validator) < names.index("_freeze"), function
+
+
+def test_cancelamento_e_checado_na_volta_do_supervisor() -> None:
+    """D-AUD-004: em `MediatedGit._run`, o token é consultado antes **e depois** de
+    `run_supervised`, antes de qualquer interpretação do desfecho."""
+    names = _calls_in_order(_MEDIATED_MODULE, "_run")
+    run = names.index("run_supervised")
+    assert "_cancelled" in names[:run] and "_cancelled" in names[run + 1 :]
+
+
+def test_git_mediado_so_cria_processo_pelo_supervisor() -> None:
+    """Nenhum `subprocess` no Git mediado; `run_supervised` só dentro de `MediatedGit._run`."""
+    assert not any(i.split(".")[0] == "subprocess" for i in _imports(_MEDIATED_MODULE))
+    assert _enclosing_functions_calls(_MEDIATED_MODULE, "run_supervised") == ["_run"]
+
+
+def test_git_mediado_fixa_opcoes_e_ambiente() -> None:
+    from app.git_runtime import _git_env, mediated
+
+    opcoes = mediated._MEDIATED_GIT_OPTIONS
+    pares = {opcoes[i + 1] for i, item in enumerate(opcoes[:-1]) if item == "-c"}
+    assert {
+        "core.fsmonitor=false",
+        "core.quotepath=false",
+        "diff.relative=false",
+        "status.relativePaths=false",
+        "protocol.allow=never",
+        "credential.helper=",
+        "core.hooksPath=/dev/null",
+        "core.untrackedCache=false",
+    } <= pares
+    assert {"--no-pager", "--no-lazy-fetch", "--no-replace-objects"} <= set(opcoes)
+    env = _git_env({"GIT_DIR": "x", "GIT_EXTERNAL_DIFF": "x", "GIT_CONFIG": "x", "PATH": "p"})
+    assert env == {
+        "PATH": "p",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_NO_LAZY_FETCH": "1",
+    }
+
+
+def test_tool_executor_nao_forma_argv_git() -> None:
+    """`git_runtime` é o único dono do argv Git: nenhum subcomando aparece em `tool_executor`."""
+    for path in (APP_ROOT / "tool_executor").glob("*.py"):
+        constantes = _str_constants_of(path)
+        proibidos = _SUBCOMANDOS_MEDIADOS | {"diff-tree", "diff-index", "diff-files", "--patch"}
+        assert not constantes & proibidos, (path.name, constantes & proibidos)
+
+
+def test_renderizador_de_diff_e_puro() -> None:
+    path = APP_ROOT / "tool_executor" / "diff_render.py"
+    assert {i.split(".")[0] for i in _imports(path)} <= {"__future__", "difflib"}
+
+
+def test_git_mediado_nao_aceita_argv_de_fora() -> None:
+    """A API pública de `MediatedGit` não tem parâmetro de argv/flag/config/ambiente."""
+    import inspect as pyinspect
+
+    from app.git_runtime.mediated import MediatedGit
+
+    proibidos = {"argv", "args", "flags", "options", "config", "env", "command"}
+    for name, member in vars(MediatedGit).items():
+        if name.startswith("_") and name != "__init__":
+            continue
+        if callable(member):
+            parametros = set(pyinspect.signature(member).parameters)
+            assert not parametros & proibidos, (name, parametros & proibidos)
+
+
+#: O parser de unified diff (E7.5-C) é **puro**: só estas bibliotecas, nenhum módulo do projeto.
+_STDLIB_DO_PARSER_DE_PATCH = {"__future__", "collections", "dataclasses", "enum", "re"}
+
+
+def test_parser_de_patch_e_puro() -> None:
+    """`unified_diff` transforma texto em estrutura: zero IO, zero `SafetyPolicy`, zero banco,
+    zero processo, zero git, zero `path_runtime` — e nenhum outro módulo de `app`."""
+    path = APP_ROOT / "tool_executor" / "unified_diff.py"
+    for imported in _imports(path):
+        assert imported.split(".")[0] in _STDLIB_DO_PARSER_DE_PATCH, (
+            f"unified_diff importa `{imported}`: o parser não pode ter dependência"
+        )
+    for call in _calls(path):
+        if isinstance(call.func, ast.Name):  # builtins com efeito (`re.compile` é atributo)
+            assert call.func.id not in {"open", "exec", "eval", "compile", "__import__"}
+
+
+def test_patch_ops_so_produz_efeito_pelas_primitivas_do_path_runtime() -> None:
+    """`patch_ops` coordena: os efeitos são `create_exclusive`/`write_fd`/`delete_if_identity`.
+    Nenhum `os`/`shutil`/`pathlib`/`subprocess`, nenhum git e nenhuma escrita direta."""
+    path = APP_ROOT / "tool_executor" / "patch_ops.py"
+    for imported in _imports(path):
+        assert imported.split(".")[0] not in {"os", "shutil", "pathlib", "subprocess", "io"}, (
+            imported
+        )
+        assert not imported.startswith(("app.git_runtime", "app.process_runtime")), imported
+    nomes = {
+        (call.func.attr if isinstance(call.func, ast.Attribute) else getattr(call.func, "id", ""))
+        for call in _calls(path)
+    }
+    proibidos = {"open", "write_text", "write_bytes", "unlink", "remove", "rename", "replace"}
+    assert not nomes & proibidos, nomes & proibidos
+    assert {"create_exclusive", "write_fd", "delete_if_identity"} <= nomes
+
+
+def test_so_o_executor_constroi_output_preparado() -> None:
+    """C-AUD-001: `PreparedToolOutput` é a saída **já finalizada** pela fronteira central
+    (redação uma vez + teto). Só `executor.py` a constrói; nenhuma operação a fabrica."""
+    for path in (APP_ROOT / "tool_executor").glob("*.py"):
+        for call in _calls(path):
+            name = (
+                call.func.attr
+                if isinstance(call.func, ast.Attribute)
+                else getattr(call.func, "id", "")
+            )
+            if name == "PreparedToolOutput":
+                assert path.name == "executor.py", f"{path.name} constrói PreparedToolOutput"
+
+
+def test_trace_de_mutacao_nao_conhece_politica() -> None:
+    """C-AUD-002: `CreateMutationTrace` é só observabilidade do `path_runtime`."""
+    tree = ast.parse((APP_ROOT / "path_runtime.py").read_text(encoding="utf-8"))
+    (classe,) = [
+        n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "CreateMutationTrace"
+    ]
+    nomes = {n.id for n in ast.walk(classe) if isinstance(n, ast.Name)}
+    assert nomes <= {"dataclass", "int", "bool", "created_parent_count", "created_target"}, nomes
 
 
 # ------------------------------------------------------------------------------ E7.3
@@ -1635,17 +1982,19 @@ def test_process_runtime_e_folha_so_stdlib() -> None:
 
 def test_so_o_modulo_de_worktree_importa_process_runtime() -> None:
     """Consumidores de provider (TestRunner/adaptadores, composition root) chegam na E8. Até
-    lá, o **único** consumidor é `git_runtime/worktree.py`, para o `worktree add` mutante
-    (adendo E7.4 a [01] §2). `orchestrator`, `agent_runtime`, `tool_executor`, `safety`, `api`
-    e `db` continuam sem depender do Supervisor — nenhum provider o alcança."""
+    lá, os **únicos** consumidores são `git_runtime/worktree.py` (o `worktree add` mutante,
+    adendo E7.4) e `git_runtime/mediated.py` (as leituras Git do Developer, adendo E7.5-D).
+    `orchestrator`, `agent_runtime`, `tool_executor`, `safety`, `api` e `db` continuam sem
+    depender do Supervisor — nenhum provider o alcança."""
     for path in ALL_FILES:
-        if path.is_relative_to(_PROCESS_RUNTIME) or path == _WORKTREE_MODULE:
+        if path.is_relative_to(_PROCESS_RUNTIME) or path in _SUPERVISED_GIT_MODULES:
             continue
         for imported in _imports(path):
             assert not imported.startswith("app.process_runtime"), (
-                f"{_module_name(path)} importa `{imported}`: só git_runtime/worktree.py pode"
+                f"{_module_name(path)} importa `{imported}`: só worktree.py/mediated.py podem"
             )
-    assert any(i.startswith("app.process_runtime") for i in _imports(_WORKTREE_MODULE))
+    for path in _SUPERVISED_GIT_MODULES:
+        assert any(i.startswith("app.process_runtime") for i in _imports(path))
 
 
 def test_nenhuma_chamada_liga_shell() -> None:

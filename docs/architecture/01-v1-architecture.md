@@ -155,6 +155,19 @@ Na ordem interna de L1, `process_runtime` é folha (nenhuma dependência de proj
 | **Dono semântico** | `git_runtime/` continua sendo o **único** dono das operações Git: é ele quem forma o `argv`, escolhe o verbo e interpreta o resultado. `process_runtime` só executa a `ProcessSpec` recebida e não conhece Git. |
 | **Provider** | A aresta **não** dá a nenhum provider acesso a `process_runtime` nem a Git. O Developer continua alcançando Git apenas por `GitStatus`/`GitDiff`/`GitShow`/`GitListTree` via `ToolExecutor` ([04] §2); `execute_commands = disabled` permanece sem exceção. |
 
+#### Adendo autorizado — E7.5-D (2026-10-03): leituras Git mediadas do Developer sob o Supervisor
+
+> Adendo aprovado por Pedro (tarefa E7.5-D). **Estritamente aditivo**: amplia o adendo E7.4
+> acima só no que está escrito aqui; nenhuma outra linha desta seção muda. A regra de
+> segurança correspondente está no adendo E7.5-D de [04](04-safety-and-git-runtime.md) §8.
+
+| | |
+| --- | --- |
+| **Aresta ampliada** | `git_runtime → process_runtime` passa a valer também para as **quatro leituras Git do Developer** (`GitStatus`, `GitDiff`, `GitShow`, `GitListTree`), num módulo próprio (`git_runtime/mediated.py`). Árvore contida, timeout, cancelamento, confirmação de morte e captura limitada, como na E7.4. As leituras antigas de contexto/preflight (E3/E4) **não** migram: continuam no runner próprio. |
+| **Dono semântico** | `git_runtime/` continua o **único** dono do Git: resolve o executável, forma o `argv`, fixa ambiente e opções e interpreta a saída estrutural. `tool_executor/` (`git_ops.py`) só valida capability, coordena política/path, lê o conteúdo atual pelo `path_runtime`, renderiza e prepara o `ToolResult`. `process_runtime` só executa a `ProcessSpec`. |
+| **Direções** | `tool_executor → git_runtime` (já permitida); `git_runtime → process_runtime` (este adendo e o da E7.4); `git_runtime` **não** importa `tool_executor` nem `path_runtime`; `process_runtime` continua folha. Nenhum ciclo. |
+| **Provider** | Nada muda para o provider: continua sem `argv`, flag, subcomando, config ou ambiente; `ToolRequest` continua com as **nove** operações; não existe `ExecCommand`; `execute_commands = disabled` permanece sem exceção. |
+
 #### `context_engine/` — conhecimento do workspace
 
 | | |

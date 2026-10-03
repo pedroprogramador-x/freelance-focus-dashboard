@@ -116,6 +116,19 @@ def _allow(rule_id: str, reason: str, subject: str) -> SafetyDecision:
     )
 
 
+def path_components(requested: str) -> list[str]:
+    """Os componentes léxicos de um caminho pedido: a **única** gramática de separação.
+
+    Separador `/` ou `\\`, prefixo de drive removido, `""` e `.` descartados. Quem precisa
+    olhar componentes (a pré-validação, a regra mediada de `.git`) usa esta função — nenhum
+    segundo parser de path (E7.5).
+    """
+    body = requested
+    if _DRIVE_ABSOLUTE.match(body):
+        body = body[2:]
+    return [part for part in re.split(r"[\\/]+", body) if part not in ("", ".")]
+
+
 def prevalidate_path_syntax(
     requested: str,
     *,
@@ -185,11 +198,7 @@ def prevalidate_path_syntax(
     if requested.startswith("~"):
         return _deny("path.home_reference", "referência ao diretório home (`~`)", requested)
 
-    body = requested
-    if _DRIVE_ABSOLUTE.match(body):
-        body = body[2:]
-
-    components = [part for part in re.split(r"[\\/]+", body) if part not in ("", ".")]
+    components = path_components(requested)
     if not components:
         return _deny("path.no_components", "caminho sem componente utilizável", requested)
 
@@ -398,3 +407,91 @@ def decide_post_open(
             )
 
     return _allow("path.post_open_ok", "identidade estável entre inspeção e abertura", subject)
+
+
+def decide_post_create(
+    facts: PathFacts,
+    *,
+    policy: SafetyPolicy | None = None,
+) -> SafetyDecision:
+    """Decide sobre os fatos de uma **criação exclusiva** (E7.5), antes de qualquer byte.
+
+    Não há identidade prévia do alvo para comparar — ele não existia. O que prova que o
+    arquivo é o que acabamos de criar: o handle é de arquivo regular, sem link/reparse; o
+    caminho, relido por `lstat`, aponta para o **mesmo objeto** do handle; e o diretório pai
+    continua sendo o mesmo de antes (um pai trocado por junction entre a verificação e o
+    `open` faria o arquivo nascer fora da raiz).
+
+    `O_EXCL` já criou um arquivo **vazio** quando esta decisão acontece: criação não é
+    possível sem isso. Nenhum byte de conteúdo existe ainda; se a decisão negar, quem chamou
+    remove o vazio por identidade (risco residual declarado em [04] §4).
+    """
+    active = policy or SafetyPolicy()
+    subject = facts.requested_path
+
+    if facts.inspection_error is not None:
+        return _deny(
+            "path.post_create_inspection_failed",
+            f"inspeção pós-criação falhou: {facts.inspection_error}",
+            subject,
+        )
+
+    if facts.post_open_identity is None or facts.post_create_path_identity is None:
+        return _deny(
+            "path.post_create_unverified",
+            "identidade do arquivo criado indisponível; fail closed",
+            subject,
+        )
+
+    if not (
+        facts.post_open_identity.is_verifiable and facts.post_create_path_identity.is_verifiable
+    ):
+        return _deny(
+            "path.post_create_unverified",
+            "identidade do arquivo criado não é verificável (`file_id` 0); fail closed",
+            subject,
+        )
+
+    if not facts.post_create_regular.is_true:
+        return _deny("path.post_create_not_regular", "arquivo criado não é regular", subject)
+
+    if facts.post_create_reparse.is_true or (
+        facts.post_create_reparse.is_unknown and active.require_verified_link_status
+    ):
+        return _deny(
+            "path.post_create_reparse",
+            "arquivo criado é link/reparse ou o estado não foi verificado",
+            subject,
+        )
+
+    if facts.post_create_path_identity != facts.post_open_identity:
+        return _deny(
+            "path.toctou_recheck_failed",
+            "caminho aponta para outro objeto que o handle criado; trocado após a criação",
+            subject,
+        )
+
+    if facts.parent_identity is None or facts.post_create_parent_identity is None:
+        return _deny(
+            "path.post_create_no_parent_baseline",
+            "sem identidade do diretório pai para comparar; fail closed",
+            subject,
+        )
+
+    if not (
+        facts.parent_identity.is_verifiable and facts.post_create_parent_identity.is_verifiable
+    ):
+        return _deny(
+            "path.post_create_no_parent_baseline",
+            "identidade do diretório pai não é verificável; fail closed",
+            subject,
+        )
+
+    if facts.parent_identity != facts.post_create_parent_identity:
+        return _deny(
+            "path.toctou_recheck_failed",
+            "diretório pai trocado entre a verificação e a criação",
+            subject,
+        )
+
+    return _allow("path.post_create_ok", "criação exclusiva em objeto e pai estáveis", subject)
