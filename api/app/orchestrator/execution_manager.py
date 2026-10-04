@@ -87,6 +87,7 @@ from app.db.enums import (
 from app.db.models import ContextManifest, DevWorkspace, SafetyEvent, WorkspaceTask
 from app.git_runtime import preflight
 from app.orchestrator.analyzer import AnalyzerEnrichmentPort
+from app.orchestrator.developer_binding import DeveloperBindingResolver
 from app.orchestrator.errors import (
     ApprovalFingerprintMismatch,
     ConcurrentTaskUpdate,
@@ -543,8 +544,15 @@ def plan(
     candidate_paths: Sequence[str] = (),
     artifacts_dir: Path,
     enrichment_port: AnalyzerEnrichmentPort | None = None,
+    developer_binding_resolver: DeveloperBindingResolver | None = None,
 ) -> PlanResult:
     """`draft | needs_fix → planning → awaiting_approval` ([02] §4).
+
+    E8.1: ``developer_binding_resolver`` é a porta tier → binding concreto, fornecida pelo
+    chamador confiável (composition root; na E8.1, só testes). `None` mantém
+    `developer_binding: null`. Os três comandos que montam fingerprint — `plan`, `approve`
+    e `start_execution` — recebem a mesma porta e passam pelo mesmo
+    `build_fingerprint_parts`.
 
     ## `planning` é durável, e é por isso que o commit fica no meio (E6-AUD-003)
 
@@ -605,6 +613,7 @@ def plan(
             candidate_paths=list(candidate_paths),
             artifacts_dir=artifacts_dir,
             enrichment_port=enrichment_port,
+            developer_binding_resolver=developer_binding_resolver,
         )
 
         require_transition(TaskStatus.PLANNING, TaskStatus.AWAITING_APPROVAL)
@@ -714,7 +723,12 @@ def _abort_planning(session: Session, task_id: str, error: Exception) -> Orchest
     return translated
 
 
-def _recompute_fingerprint(session: Session, task: WorkspaceTask) -> tuple[str, dict[str, Any]]:
+def _recompute_fingerprint(
+    session: Session,
+    task: WorkspaceTask,
+    *,
+    developer_binding_resolver: DeveloperBindingResolver | None,
+) -> tuple[str, dict[str, Any]]:
     """Recalcula o fingerprint sobre o estado **atual** do banco ([02] §7).
 
     Usa `build_fingerprint_parts`, o mesmo código do plano — ver o docstring dela para por
@@ -738,6 +752,7 @@ def _recompute_fingerprint(session: Session, task: WorkspaceTask) -> tuple[str, 
         plan_hash=task.plan_hash,
         agents=tuple(task.agents or ()),
         decision=decision,
+        developer_binding_resolver=developer_binding_resolver,
     )
     return parts.compute(), parts.as_canonical()
 
@@ -748,6 +763,7 @@ def approve(
     task_id: str,
     *,
     execution_fingerprint: str,
+    developer_binding_resolver: DeveloperBindingResolver | None = None,
 ) -> WorkspaceTask:
     """`awaiting_approval → approved`, exigindo o `execution_fingerprint` **completo**.
 
@@ -765,7 +781,9 @@ def approve(
     origin = task.status
     require_transition(origin, TaskStatus.APPROVED)
 
-    current_fingerprint, current_parts = _recompute_fingerprint(session, task)
+    current_fingerprint, current_parts = _recompute_fingerprint(
+        session, task, developer_binding_resolver=developer_binding_resolver
+    )
 
     if execution_fingerprint != current_fingerprint:
         fields = diverged_fields(task.approved_fingerprint_parts, current_parts)
@@ -1024,6 +1042,7 @@ def start_execution(
     *,
     prover: CapabilityProver | None = None,
     expected_capability_binding: CapabilityBinding | None = None,
+    developer_binding_resolver: DeveloperBindingResolver | None = None,
 ) -> WorkspaceTask:
     """`approved → executing`. **Recusada nesta fase, por desenho.**
 
@@ -1038,6 +1057,10 @@ def start_execution(
     E8: o limite `NotImplementedError` abaixo é preservado, a task segue `approved` e nada
     é criado.
 
+    E8.1: ``developer_binding_resolver`` participa só do **recálculo** do fingerprint (a
+    mesma porta do `plan`/`approve`). Ele não prova capability nem abre a execução: sem
+    provador, a guarda continua recusando.
+
     A função existe agora, e não em E7, porque a **guarda** é o entregável: escrevê-la junto
     com a máquina de estados é o que garante que E7 acrescente o provador a um ponto de
     extensão já fechado, em vez de abrir um caminho novo ao lado dela.
@@ -1047,7 +1070,9 @@ def start_execution(
 
     workspace = get_workspace(session, task.workspace_id)
     facts_git = preflight(workspace.local_path)
-    current_fingerprint, current_parts = _recompute_fingerprint(session, task)
+    current_fingerprint, current_parts = _recompute_fingerprint(
+        session, task, developer_binding_resolver=developer_binding_resolver
+    )
     decision = decision_from_task(task)
 
     # Lidos **antes** do CAS de invalidação: ele sobrescreve os dois campos e expira o
