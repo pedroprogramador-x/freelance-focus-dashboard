@@ -61,6 +61,17 @@ class ObjectIdentity:
     volume_id: int
     file_id: int
 
+    @property
+    def is_verifiable(self) -> bool:
+        """Esta identidade **prova** algo? Não, se o `file_id` é 0.
+
+        Alguns sistemas de arquivos/volumes não expõem um índice estável e devolvem `0` para
+        qualquer arquivo; nesse caso `(volume, 0) == (volume, 0)` vale para objetos diferentes.
+        Fail closed: identidade não verificável nunca é prova de nada (E7.5). O `volume_id` não
+        é filtrado — `0` ali é legítimo em alguns dispositivos.
+        """
+        return self.file_id != 0
+
 
 @dataclass(frozen=True, slots=True)
 class PathFacts:
@@ -98,6 +109,13 @@ class PathFacts:
     post_open_target: str | None = None
     post_open_identity: ObjectIdentity | None = None
     inspection_error: str | None = None
+    #: E7.5 — fatos de **criação exclusiva** (`path_runtime.create_exclusive`). Sem identidade
+    #: prévia do alvo (ele não existia), a base de comparação é o que o próprio handle criado
+    #: e o caminho/pai observados logo depois dizem. `parent_identity` é a linha de base do pai.
+    post_create_path_identity: ObjectIdentity | None = None
+    post_create_parent_identity: ObjectIdentity | None = None
+    post_create_regular: Tri = Tri.UNKNOWN
+    post_create_reparse: Tri = Tri.UNKNOWN
 
 
 @dataclass(frozen=True, slots=True)

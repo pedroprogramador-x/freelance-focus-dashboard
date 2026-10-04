@@ -66,6 +66,8 @@ from app.tool_executor import contracts as tool_contracts
 from app.tool_executor.contracts import (
     TOOL_OPERATIONS,
     ApplyPatch,
+    CancelToken,
+    DecisionJournal,
     GitDiff,
     GitListTree,
     GitShow,
@@ -73,6 +75,7 @@ from app.tool_executor.contracts import (
     ListDirectory,
     ReadFile,
     SearchText,
+    ToolDecisionRecord,
     ToolStatus,
     WorkspaceKind,
     WriteFile,
@@ -176,6 +179,14 @@ class FakeExecutor:
     def mediated_tools(self) -> MediatedTools:
         return FakeTools()
 
+    def close(self) -> None:
+        return None
+
+
+class FakeJournal:
+    def append(self, record: ToolDecisionRecord) -> None:
+        return None
+
 
 class FakeFactory:
     def create(
@@ -184,6 +195,8 @@ class FakeFactory:
         composed_policy: SafetyPolicy,
         effective_capability_profile: ProviderCapabilityProfile,
         run_scope: RunScope,
+        cancel_token: CancelToken,
+        decision_journal: DecisionJournal,
     ) -> ToolExecutor:
         return FakeExecutor()
 
@@ -223,6 +236,8 @@ def test_fakes_satisfazem_os_protocols_por_atribuicao_tipada() -> None:
         SafetyPolicy(),
         DEVELOPER_V1_PROFILE,
         RunScope("t1", "r1", "i1"),
+        Token(),
+        FakeJournal(),
     )
     assert isinstance(developer.run(developer_request(), executor.mediated_tools()), AgentRunResult)
     assert executor.usage().operations == 0
@@ -241,6 +256,7 @@ PROTOCOL_SIGNATURES: dict[type, dict[str, tuple[str, ...]]] = {
         "execute": ("self", "request"),
         "usage": ("self",),
         "mediated_tools": ("self",),
+        "close": ("self",),
     },
     MediatedTools: {"execute": ("self", "request")},
     ToolExecutorFactory: {
@@ -250,6 +266,8 @@ PROTOCOL_SIGNATURES: dict[type, dict[str, tuple[str, ...]]] = {
             "composed_policy",
             "effective_capability_profile",
             "run_scope",
+            "cancel_token",
+            "decision_journal",
         )
     },
 }

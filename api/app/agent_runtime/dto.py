@@ -19,10 +19,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol
 
 from app.safety.capability_profile import ProviderCapabilityProfile
 from app.safety.test_policy import TestPolicy
+from app.tool_executor.contracts import CancelToken as CancelToken  # E7.5-A: definido lá
 from app.tool_executor.contracts import ExecutionWorkspaceRef
 from app.tool_executor.validation import (
     ContractViolation,
@@ -79,12 +79,6 @@ class FindingSeverity(str, Enum):
 
 
 # ------------------------------------------------------------------ limites e cancelamento
-
-
-class CancelToken(Protocol):
-    """Todo provider, auditor e runner é cancelável por um token ([05] §1)."""
-
-    def is_cancelled(self) -> bool: ...
 
 
 def _require_cancel_token(value: object) -> None:
