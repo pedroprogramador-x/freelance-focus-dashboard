@@ -558,14 +558,26 @@ def test_a_estrutura_do_fingerprint_v1_continua_fechada_e_sem_model_policy_hash(
 
 
 def test_o_orchestrator_nao_importa_o_modulo_novo() -> None:
-    """A E7.1 não religa nada: o fingerprint segue calculando o perfil requerido da
-    constante histórica, sem passar pelo contrato novo. A ligação vem na E7.6."""
+    """A E7.1 não religava nada; a E7.6 liga **só o que precisa**, e a regra ficou precisa.
+
+    Continua proibido a **todo** módulo do orchestrator importar `capability_profile` — em
+    particular `fingerprint.py`, que segue calculando o perfil requerido da constante
+    histórica, sem passar pelo contrato novo. A única exceção (E7.6) é `state_machine.py`,
+    e só para o **nome** `ProviderRole` (a guarda de entrada é a do Developer); nenhuma regra
+    de perfil (`check_v1`, `require_v1`, projeção) é reimplementada ou importada de lá — a
+    avaliação passa por `safety.capability_verification`, a autoridade única."""
     orchestrator_root = Path(fingerprint_module.__file__).parent
 
     for path in orchestrator_root.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module:
+                if (
+                    path.name == "state_machine.py"
+                    and node.module == "app.safety.capability_profile"
+                ):
+                    assert {a.name for a in node.names} == {"ProviderRole"}, path.name
+                    continue
                 assert "capability_profile" not in node.module, path.name
                 assert not any(a.name == "capability_profile" for a in node.names), path.name
             elif isinstance(node, ast.Import):

@@ -118,6 +118,7 @@ from app.orchestrator.state_machine import (
     transition_fields,
 )
 from app.safety import redact
+from app.safety.capability_verification import CapabilityBinding
 from app.workspace.service import get_workspace
 
 _MAX_TITLE_LENGTH = 255
@@ -1022,13 +1023,20 @@ def start_execution(
     task_id: str,
     *,
     prover: CapabilityProver | None = None,
+    expected_capability_binding: CapabilityBinding | None = None,
 ) -> WorkspaceTask:
     """`approved → executing`. **Recusada nesta fase, por desenho.**
 
-    Com `prover=None` — o único valor possível antes da E7/E8 — a guarda
+    Com `prover=None` — o único valor em produção até a E8 — a guarda
     `capability_profile_proven` levanta `TransitionGuardFailed` (409) com motivo explícito.
     Ver o docstring de `state_machine` para por que isso é [ADR-0004] funcionando, e não uma
     lacuna.
+
+    E7.6: ``expected_capability_binding`` é o contexto esperado, fornecido pelo chamador
+    **confiável** (nunca extraído da prova). Sem ele a guarda de capability também recusa.
+    Quando a guarda *passa*, a continuação real (Run, worktree, Developer, TestRunner…) é
+    E8: o limite `NotImplementedError` abaixo é preservado, a task segue `approved` e nada
+    é criado.
 
     A função existe agora, e não em E7, porque a **guarda** é o entregável: escrevê-la junto
     com a máquina de estados é o que garante que E7 acrescente o provador a um ponto de
@@ -1060,6 +1068,7 @@ def start_execution(
                 max_attempts=decision.max_attempts,
             ),
             prover=prover,
+            expected_binding=expected_capability_binding,
         )
     except TransitionGuardFailed as exc:
         # [02] §4: "guardas que falham geram `409` com o motivo, e `SafetyEvent` quando a
@@ -1095,8 +1104,8 @@ def start_execution(
             raise invalidation from exc
         raise
 
-    raise NotImplementedError(  # pragma: no cover — inalcançável sem um provador (E7+)
-        "a guarda de entrada passou, mas nenhuma execução existe antes da E7"
+    raise NotImplementedError(  # a continuação real é E8; só um provador injetado chega aqui
+        "a guarda de entrada passou, mas a continuação da execução é E8"
     )
 
 

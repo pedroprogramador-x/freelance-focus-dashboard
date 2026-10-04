@@ -42,6 +42,20 @@ são agora três bloqueios e um sucesso:
 | `True` | diferente | bloqueia |
 | `True` | ausente (`None`) | bloqueia |
 | `False` | qualquer | bloqueia |
+
+## E7.6: `proven + hash` deixa de bastar
+
+Mesmo a metade "hash" era autodeclarada: o hash histórico cobre só quatro das sete
+capabilities, e `proven` é um booleano que o próprio provador escolhe. A guarda agora exige,
+**além** dos dois campos acima, uma `VerifiedCapabilityObservation` (`safety`): o perfil
+**completo** observado por um mecanismo independente, vinculado (`CapabilityBinding`) ao
+contexto esperado que vem do **chamador confiável** (`expected_binding`), nunca da prova. A
+guarda reavalia tudo sozinha — não confia em `proven` — e deriva o hash histórico da
+observação, só depois de aceitar o perfil completo. Uma prova legada (`proven + hash`, sem
+observação) é recusada: `verification_missing`.
+
+Toda mensagem de recusa é montada só de texto fixo e de códigos do vocabulário fechado de
+`safety.CapabilityRefusalCode`; texto livre de adaptador/verificador nunca é interpolado.
 """
 
 from __future__ import annotations
@@ -52,6 +66,15 @@ from typing import Any, Protocol
 
 from app.db.enums import FailureReason, TaskPhase, TaskStatus
 from app.orchestrator.errors import InvalidTransition, TransitionGuardFailed
+from app.safety.capability_profile import ProviderRole
+from app.safety.capability_verification import (
+    CapabilityBinding,
+    CapabilityRefusal,
+    CapabilityRefusalCode,
+    VerifiedCapabilityObservation,
+    evaluate_observation,
+    historical_profile_hash,
+)
 
 #: Estados terminais e **imutáveis** ([ADR-0008] regra 3): "retomar trabalho significa criar
 #: uma nova tarefa". Nenhuma aresta sai daqui.
@@ -139,8 +162,12 @@ class CapabilityProof:
 
     ``proven`` `False` cobre os dois casos que [ADR-0009] trata igual: o adaptador declarou
     um perfil que não satisfaz o requerido, e o adaptador não consegue provar perfil nenhum
-    (`enforcement_method = not_enforceable`). Os dois param a execução, e ``reason`` diz
-    qual foi.
+    (`enforcement_method = not_enforceable`). Os dois param a execução. **A guarda não
+    confia em `proven = True`**: reavalia ``observation`` contra o contexto esperado.
+
+    ``observation`` (E7.6) é a verificação independente, com o perfil completo e o binding.
+    ``refusal`` é a recusa tipada quando o provador já sabe por que não provou. ``reason``
+    é texto livre legado e **nunca é exibido** — pode vir de qualquer implementação.
     """
 
     proven: bool
@@ -149,6 +176,8 @@ class CapabilityProof:
     #: vive no `execution_fingerprint` da task ([02] §7).
     effective_profile_hash: str | None = None
     reason: str = ""
+    observation: VerifiedCapabilityObservation | None = None
+    refusal: CapabilityRefusal | None = None
 
 
 class CapabilityProver(Protocol):
@@ -183,8 +212,17 @@ class EntryGuardFacts:
     max_attempts: int
 
 
-def check_entry_guard(facts: EntryGuardFacts, *, prover: CapabilityProver | None) -> None:
+def check_entry_guard(
+    facts: EntryGuardFacts,
+    *,
+    prover: CapabilityProver | None,
+    expected_binding: CapabilityBinding | None = None,
+) -> None:
     """As seis guardas de `approved → executing` ([02] §4). Levanta na primeira que falha.
+
+    ``expected_binding`` é o contexto esperado (papel, adaptador, versão, transport, model,
+    `execution_config_hash`, declaração) fornecido pelo chamador **confiável**. Sem ele, a
+    guarda de capability recusa — uma prova não escolhe contra o que será comparada.
 
     A ordem é a de [02] §4 e não é arbitrária: as baratas e determinísticas primeiro, a
     prova de capability por último. Provar capability pode custar um processo de provider;
@@ -224,17 +262,50 @@ def check_entry_guard(facts: EntryGuardFacts, *, prover: CapabilityProver | None
             guard="attempts_below_max",
         )
 
-    _check_capability(prover)
+    _check_capability(prover, expected_binding)
 
 
-def _check_capability(prover: CapabilityProver | None) -> None:
-    """A guarda de capability, *fail closed* nos **quatro** desfechos ruins.
+#: Recusas que significam "não há prova positiva" (→ `capability_profile_proven`,
+#: `SafetyEvent(capability_unenforceable)`). As demais significam "há observação, e ela não
+#: é o que foi aprovado" (→ `capability_profile_matches_approved`, `capability_denied`).
+_UNPROVEN_CODES: frozenset[CapabilityRefusalCode] = frozenset(
+    {
+        CapabilityRefusalCode.VERIFIER_ABSENT,
+        CapabilityRefusalCode.EXPECTED_CONTEXT_MISSING,
+        CapabilityRefusalCode.DECLARATION_NOT_ENFORCEABLE,
+        CapabilityRefusalCode.VERIFICATION_NEGATIVE,
+        CapabilityRefusalCode.VERIFICATION_MISSING,
+    }
+)
+
+
+def _refuse(refusal: CapabilityRefusal) -> TransitionGuardFailed:
+    """`TransitionGuardFailed` com mensagem **só** de texto fixo + código fechado."""
+    guard = (
+        "capability_profile_proven"
+        if refusal.code in _UNPROVEN_CODES
+        else "capability_profile_matches_approved"
+    )
+    return TransitionGuardFailed(
+        "o perfil de capability não foi comprovado como o requerido/aprovado "
+        f"([ADR-0009], [02] §7) — *fail closed*: {refusal.describe()}",
+        guard=guard,
+        reason_code=refusal.code.value,
+    )
+
+
+def _check_capability(
+    prover: CapabilityProver | None, expected_binding: CapabilityBinding | None
+) -> None:
+    """A guarda de capability, *fail closed*. Reavalia a prova; nunca confia em `proven`.
 
     Importada de `fingerprint` aqui dentro e não no topo do módulo: o import de topo criaria
     `state_machine → fingerprint`, e `fingerprint` não depende de estado nenhum. Manter a
     dependência local ao ponto de uso deixa a máquina de estados importável sozinha.
 
-    Ver a tabela no docstring do módulo para por que `proven` sozinho não basta.
+    Ordem: ausências baratas (sem chamar o provador) → `proven` → hash efetivo informado →
+    observação **completa** contra o contexto esperado → hash derivado da observação.
+    Ver o docstring do módulo para por que `proven` sozinho não basta.
     """
     from app.orchestrator.fingerprint import tool_profile_hash
 
@@ -245,15 +316,22 @@ def _check_capability(prover: CapabilityProver | None) -> None:
             "ausência de prova é tratada como prova negativa — *fail closed* "
             "([ADR-0009], [02] §4)",
             guard="capability_profile_proven",
+            reason_code=CapabilityRefusalCode.VERIFIER_ABSENT.value,
         )
+
+    if expected_binding is None:
+        raise _refuse(CapabilityRefusal(CapabilityRefusalCode.EXPECTED_CONTEXT_MISSING))
+
+    # `approved → executing` é a entrada do Developer; o fingerprint v1 só projeta o dele.
+    if expected_binding.role is not ProviderRole.DEVELOPER:
+        raise _refuse(CapabilityRefusal(CapabilityRefusalCode.BINDING_MISMATCH, ("role",)))
 
     required = tool_profile_hash()
     proof = prover.prove(required)
 
     if not proof.proven:
-        raise TransitionGuardFailed(
-            f"o adaptador não provou o perfil de capability requerido: {proof.reason}",
-            guard="capability_profile_proven",
+        raise _refuse(
+            proof.refusal or CapabilityRefusal(CapabilityRefusalCode.VERIFICATION_NEGATIVE)
         )
 
     # E6-AUD-012. `proven = True` afirma "consegui provar **um** perfil"; qual perfil é o
@@ -267,6 +345,7 @@ def _check_capability(prover: CapabilityProver | None) -> None:
             "`effective_profile_hash`; sem o hash efetivo não há o que comparar com o "
             "perfil aprovado — *fail closed* ([ADR-0009], [02] §7)",
             guard="capability_profile_matches_approved",
+            reason_code=CapabilityRefusalCode.EFFECTIVE_HASH_MISSING.value,
         )
 
     if proof.effective_profile_hash != required:
@@ -275,7 +354,21 @@ def _check_capability(prover: CapabilityProver | None) -> None:
             "perfil requerido/aprovado no `execution_fingerprint` ([02] §7): a execução "
             "usaria capabilities diferentes das que o humano aprovou",
             guard="capability_profile_matches_approved",
+            reason_code=CapabilityRefusalCode.EFFECTIVE_HASH_MISMATCH.value,
         )
+
+    # E7.6. As sete capabilities e o binding, contra o contexto do chamador confiável.
+    # Depois — e só depois — o hash histórico, que não enxerga git_read/git_write/
+    # external_paths, é derivado da própria observação (nunca copiado da prova).
+    refusal = evaluate_observation(expected_binding, proof.observation)
+    if refusal is not None:
+        raise _refuse(refusal)
+
+    if proof.observation is None:  # inalcançável: evaluate_observation já recusou
+        raise _refuse(CapabilityRefusal(CapabilityRefusalCode.VERIFICATION_MISSING))
+    derived = historical_profile_hash(proof.observation.profile)
+    if derived != required or derived != proof.effective_profile_hash:
+        raise _refuse(CapabilityRefusal(CapabilityRefusalCode.EFFECTIVE_HASH_MISMATCH))
 
 
 def check_approval_guard(*, stale_entry_ids: Iterable[str], risk_is_high: bool) -> None:

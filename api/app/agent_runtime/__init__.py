@@ -2,6 +2,9 @@
 
 Só interfaces e DTOs neutros: nenhuma implementação concreta, nenhum processo, nenhum SDK.
 Adaptadores (Claude Code, Codex) e o supervisor de processos são etapas posteriores.
+
+A E7.6 acrescenta `verification`: a porta `CapabilityVerifier`, distinta da declaração, que
+observa de forma independente o que foi aplicado. Nenhuma implementação existe em produção.
 Ver `docs/architecture/05-provider-contracts.md`.
 """
 
@@ -29,6 +32,15 @@ from app.agent_runtime.dto import (
     TokenSource,
 )
 from app.agent_runtime.interfaces import AuditorProvider, DeveloperProvider, TestRunner
+from app.agent_runtime.verification import (
+    CapabilityVerifier,
+    CapabilityVerifierContractViolation,
+    NotVerified,
+    VerificationResult,
+    Verified,
+    binding_of,
+    observe_declared_capabilities,
+)
 from app.tool_executor.contracts import (
     ExecutionWorkspaceRef,
     MediatedTools,
@@ -50,6 +62,8 @@ __all__ = [
     "AuditorProvider",
     "CancelToken",
     "CapabilityDeclaration",
+    "CapabilityVerifier",
+    "CapabilityVerifierContractViolation",
     "DeveloperExecutionRequest",
     "DeveloperProvider",
     "EnforcementEvidence",
@@ -59,6 +73,7 @@ __all__ = [
     "FindingSeverity",
     "MediatedTools",
     "MediatedUsage",
+    "NotVerified",
     "RunLimits",
     "RunReport",
     "RunScope",
@@ -71,4 +86,8 @@ __all__ = [
     "ToolExecutorFactory",
     "ToolRequest",
     "ToolResult",
+    "VerificationResult",
+    "Verified",
+    "binding_of",
+    "observe_declared_capabilities",
 ]

@@ -1639,15 +1639,25 @@ def test_contratos_usam_so_stdlib_de_tipos() -> None:
                 )
 
 
+#: Os módulos que podem importar `agent_runtime`: o próprio pacote e a **ponte** do composition
+#: root (E7.6), que existe justamente para que `orchestrator` e `agent_runtime` não se
+#: importem. `main.py` e a ponte são os únicos que enxergam as duas camadas.
+_COMPOSITION_ROOT_MODULES = {"app.capability_wiring"}
+
+
 def test_so_agent_runtime_importa_tool_executor_e_ninguem_importa_agent_runtime() -> None:
-    """Sem ciclo e sem atalho: camadas superiores recebem as portas por injeção."""
+    """Sem ciclo e sem atalho: camadas superiores recebem as portas por injeção.
+
+    E7.6: a única exceção a "ninguém importa `agent_runtime`" é a ponte do composition root
+    (`app.capability_wiring`). Nenhum outro módulo — nem `orchestrator`, nem `api`.
+    """
     for path in ALL_FILES:
         modulo = _module_name(path)
         for imported in _imports(path):
             if imported.startswith("app.agent_runtime"):
-                assert modulo.startswith("app.agent_runtime"), (
-                    f"{modulo} importa `{imported}`: só o composition root (E7.6+) poderá"
-                )
+                assert modulo.startswith("app.agent_runtime") or (
+                    modulo in _COMPOSITION_ROOT_MODULES
+                ), f"{modulo} importa `{imported}`: só o composition root poderá (E7.6)"
             if imported.startswith("app.tool_executor"):
                 assert modulo.startswith(("app.tool_executor", "app.agent_runtime")), (
                     f"{modulo} importa `{imported}`: fora do combinado em [01] §3"

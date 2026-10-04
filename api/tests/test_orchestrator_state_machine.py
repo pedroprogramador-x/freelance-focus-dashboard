@@ -32,6 +32,7 @@ from app.orchestrator.state_machine import (
     require_transition,
     transition_fields,
 )
+from tests.capability_helpers import FixedProver, expected_binding, full_proof
 
 #: As arestas de [02] §4, transcritas **do diagrama** e não do código. É a segunda fonte
 #: que torna o teste exaustivo abaixo uma verificação e não uma tautologia.
@@ -73,11 +74,11 @@ class _RefusingProver:
 
 
 class _AcceptingProver:
-    """Existe **só** para provar que a guarda não é um `raise` incondicional.
+    """Prova **legada** (E6): `proven = True` + hash requerido, sem observação.
 
-    Não é um adaptador: não executa processo, não fala com provider nenhum. É o
-    contrafactual que mostra que o `409` da E6 vem da **ausência da porta**, e não de a
-    guarda estar hard-coded para falhar.
+    Desde a E7.6 isto **não basta** — é o contrafactual de que a prova legada é recusada
+    (`verification_missing`). Também serve de provador "que passaria" nos testes em que uma
+    guarda *anterior* deve recusar antes de a capability ser consultada.
     """
 
     def prove(self, required_profile_hash: str) -> CapabilityProof:
@@ -219,19 +220,23 @@ def test_sem_provador_a_guarda_de_capability_recusa() -> None:
 def test_provador_que_recusa_tambem_para_a_execucao() -> None:
     """O outro desfecho de [ADR-0009]: o adaptador existe e **não** prova o perfil."""
     with pytest.raises(TransitionGuardFailed) as exc:
-        check_entry_guard(_facts(), prover=_RefusingProver())
+        check_entry_guard(_facts(), prover=_RefusingProver(), expected_binding=expected_binding())
 
     assert exc.value.guard == "capability_profile_proven"
-    assert "not_enforceable" in exc.value.message
+    assert exc.value.reason_code == "verification_negative"
+    # E7.6: o texto livre do provador nunca é interpolado no diagnóstico.
+    assert "not_enforceable" not in exc.value.message
 
 
 def test_a_guarda_nao_e_um_raise_incondicional() -> None:
-    """Contrafactual: com um provador que prova, a guarda **passa**.
+    """Contrafactual: com uma prova **completa** (E7.6), a guarda **passa**.
 
-    Sem este caso, o teste acima passaria mesmo que a guarda fosse `raise` puro — e a E7
-    descobriria só ao tentar ligá-la.
+    Sem este caso, o teste acima passaria mesmo que a guarda fosse `raise` puro. Desde a
+    E7.6 a prova legada (`proven + hash`) não basta: ver `test_capability_enforcement_e7_6`.
     """
-    check_entry_guard(_facts(), prover=_AcceptingProver())
+    check_entry_guard(
+        _facts(), prover=FixedProver(full_proof()), expected_binding=expected_binding()
+    )
 
 
 @pytest.mark.parametrize(
@@ -289,7 +294,13 @@ class _MismatchedProver:
 @pytest.mark.parametrize(
     ("rotulo", "prover_factory", "guarda_esperada"),
     [
-        ("proven=True + hash igual", lambda: _AcceptingProver(), None),
+        # E7.6: a prova legada (sem observação verificada) deixou de ser aceita.
+        (
+            "proven=True + hash igual, sem observação (legada)",
+            lambda: _AcceptingProver(),
+            "capability_profile_proven",
+        ),
+        ("proven=True + hash igual + observação completa", lambda: FixedProver(full_proof()), None),
         (
             "proven=True + hash diferente",
             lambda: _MismatchedProver("0" * 64),
@@ -316,12 +327,14 @@ def test_a_guarda_exige_prova_positiva_e_hash_efetivo_compativel(
     """
     prover = prover_factory()
 
+    binding = expected_binding()
+
     if guarda_esperada is None:
-        check_entry_guard(_facts(), prover=prover)  # type: ignore[arg-type]
+        check_entry_guard(_facts(), prover=prover, expected_binding=binding)  # type: ignore[arg-type]
         return
 
     with pytest.raises(TransitionGuardFailed) as exc:
-        check_entry_guard(_facts(), prover=prover)  # type: ignore[arg-type]
+        check_entry_guard(_facts(), prover=prover, expected_binding=binding)  # type: ignore[arg-type]
 
     assert exc.value.guard == guarda_esperada, rotulo
 
@@ -338,9 +351,9 @@ def test_o_hash_requerido_chega_ao_provador() -> None:
     class _Registrando:
         def prove(self, required_profile_hash: str) -> CapabilityProof:
             recebidos.append(required_profile_hash)
-            return CapabilityProof(proven=True, effective_profile_hash=required_profile_hash)
+            return full_proof()
 
-    check_entry_guard(_facts(), prover=_Registrando())
+    check_entry_guard(_facts(), prover=_Registrando(), expected_binding=expected_binding())
 
     assert recebidos == [tool_profile_hash()]
 

@@ -156,11 +156,15 @@ class TransitionGuardFailed(OrchestratorError):
         guard: str,
         diverged_fields: tuple[str, ...] = (),
         requires_replan: bool = False,
+        reason_code: str | None = None,
     ) -> None:
         super().__init__(message)
         self.guard = guard
         self.diverged_fields = diverged_fields
         self.requires_replan = requires_replan
+        #: Código estável (E7.6) da recusa de capability, do vocabulário fechado de
+        #: `safety.CapabilityRefusalCode`. Fora do `as_payload`: o corpo do `409` não muda.
+        self.reason_code = reason_code
 
     def as_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {"guard": self.guard}

@@ -7629,3 +7629,84 @@ reverificação do Codex.**
   20 skipped; ruff check/format, mypy, mypy --platform linux exit 0; `git diff --check` limpo.
 - Pendências: reverificação dirigida do Codex; POSIX real só no GitHub Actions; depois, commit
   de correção na mesma branch e push para o PR #6.
+
+## 2026-10-04 — Claude Sonnet 5.5 (effort: high solicitado) — E7.6 Capability Enforcement Integration — candidate
+
+Branch `e7/06-capability-enforcement`, criada de `f26fa37b572774af4d7c5cba51bc864091dea1c2`
+(merge do PR #6, E7.5). A branch local `e7/05-tool-executor` (`2dc1b25`) estava no HEAD ao
+iniciar; `main` local estava atrás de `origin/main`, e a base aprovada existia no
+repositório — nenhum merge/rebase automático. O pedido nomeava Opus 5.5; o modelo realmente
+executado nesta sessão é **Claude Sonnet 5.5** (`claude-sonnet-5-5`). CodeGraph estava
+registrado mas não foi usado: a leitura foi direta nos arquivos nomeados na tarefa.
+Sem commit, push, PR ou merge. **E8 não iniciada. E7 não está encerrada** — esta é uma
+candidata à auditoria independente.
+
+**Contrato de verificação (E7.6-A).** Declaração (`CapabilityDeclaration`, autodeclarada) e
+verificação independente passaram a ser coisas distintas:
+`safety/capability_verification.py` (puro) define `CapabilityBinding` (papel, adapter_id,
+adapter_version, transport, model, execution_config_hash, declaration_hash),
+`VerifiedCapabilityObservation` (binding + perfil **completo**), `CapabilityRefusal`/
+`CapabilityRefusalCode` (vocabulário fechado), `evaluate_observation` e
+`historical_profile_hash`. `agent_runtime/verification.py` define a porta
+`CapabilityVerifier` (`Verified | NotVerified`, resultados negativos tipados via
+`UnverifiedReason`) e `observe_declared_capabilities`. Exceções do verificador **propagam**
+(falha técnica ≠ política). Flags (`--sandbox` etc.) não são interpretadas como prova.
+
+**Validação completa (E7.6-B).** `evaluate_observation` reutiliza `check_v1` (E7.1; nenhuma
+regra concorrente): as sete capabilities por igualdade exata (mais restritivo também é
+divergência), depois o binding, e só então o hash histórico (`fingerprint_v1_projection`
+valida o perfil completo antes de projetar). `git_read`/`git_write`/`external_paths` não
+entram no hash histórico, portanto nunca é a única barreira. Fingerprint v1,
+`REQUIRED_TOOL_PROFILE` e `fingerprint.py` **intocados** (vetor literal travado em teste).
+
+**Integração (E7.6-C).** `CapabilityProof` ganhou `observation` e `refusal` (opcionais).
+`check_entry_guard(..., expected_binding=)` e `start_execution(...,
+expected_capability_binding=)` recebem o contexto esperado do **chamador confiável**; a guarda
+não confia em `proven`, reavalia a observação, deriva o hash histórico dela e o compara ao
+requerido e ao informado. Prova legada (`proven + hash`, sem observação) → recusada
+(`verification_missing`). Ordem barata→cara preservada; verificador nunca é chamado se uma
+guarda anterior, `expected_binding` ausente ou papel ≠ Developer já recusa. A ponte
+`app/capability_wiring.py` (`VerifyingCapabilityProver`) é o único módulo, além do `main.py`,
+que vê `agent_runtime` e `orchestrator`; nenhum importa o outro. `main.py` só reserva
+`app.state.capability_verifier = None`: **em produção não há verificador positivo; sem ele a
+execução é recusada** (`verifier_absent`). Doubles positivos só em `tests/`.
+
+**Recusa auditável (E7.6-D).** Mapeamento mantido: `capability_profile_proven` →
+`capability_unenforceable`; `capability_profile_matches_approved` → `capability_denied`.
+Reaproveita `TransitionGuardFailed` (agora com `reason_code`, fora do payload) e
+`_commit_audit_trail` (durável após rollback do chamador, provado por sessão nova).
+Mensagens e `SafetyEvent.detail` só têm texto fixo + códigos fechados; o texto livre
+`CapabilityProof.reason` deixou de ser interpolado. Task segue `approved`; nenhum Run,
+worktree ou tentativa consumida. Quando a guarda passa, `start_execution` continua levantando
+`NotImplementedError` (continuação real = E8; task não vai a `executing`).
+
+- Arquivos: novos `api/app/safety/capability_verification.py`,
+  `api/app/agent_runtime/verification.py`, `api/app/capability_wiring.py`,
+  `api/tests/capability_helpers.py`, `api/tests/test_capability_enforcement_e7_6.py`;
+  alterados `safety/__init__.py`, `agent_runtime/__init__.py`, `orchestrator/state_machine.py`,
+  `orchestrator/execution_manager.py`, `orchestrator/errors.py`, `main.py`; testes
+  `test_architecture.py`, `test_capability_profile_e7_1.py`, `test_orchestrator_state_machine.py`.
+  `docs/`, ADRs, `src/`, `deploy.yml`, schema, migrations e dependências **não** tocados.
+- Testes pré-existentes alterados (evolução de contrato, não silenciamento): (1) o gate
+  temporário da E7.1 "orchestrator não importa `capability_profile`" virou regra precisa —
+  só `state_machine.py`, e só o nome `ProviderRole`; (2) o gate de importadores de
+  `agent_runtime` admite a ponte `app.capability_wiring`; (3) em
+  `test_orchestrator_state_machine.py` a prova legada deixou de ser aceita (passa a exigir
+  prova completa + `expected_binding`) e o texto livre do provador não aparece mais na mensagem.
+- Gates (Windows, Python 3.11, venv oficial): E7.6 117 passed; E7.1 96; E7.2 87; state_machine
+  138; planner 45; router/fingerprint 61; architecture 252; suítes E7.5/path
+  1140 passed, 9 skipped; **backend completo 3818 passed, 20 skipped, 0 failed (19m09s)**;
+  `ruff check` e `ruff format --check` limpos; `mypy` e `mypy --platform linux` limpos
+  (170 arquivos); `git diff --check` limpo. `mypy --platform linux` **não** substitui
+  execução em Linux: CI Linux/Windows ainda não rodou para esta branch. Os 20 skips não foram
+  enumerados um a um (o run usou `-qq`); os 6 históricos são de symlink/volume no Windows.
+- Mutantes temporários, todos detectados e arquivos restaurados (md5 idêntico): M1 declaração
+  sozinha produz prova; M2 só hash histórico; M3 `git_read` ignorado; M4 binding sem
+  config/declaração; M5 objeto no `capability_verifier` do startup; M6 guarda aceita legado.
+- Limitações: nenhum adaptador/verificador real (E8+); sem proteção contra Python hostil no
+  mesmo processo; `CapabilityProof` é dado, não token anti-falsificação; sem cache global.
+- **Pendência do ciclo completo de execução / divergência documental conhecida:**
+  `docs/architecture/04` cita `failed(capability_unenforceable)`, enquanto ADR-0008 e a máquina
+  atual mantêm `approved` na recusa da guarda. Preservada a máquina (sem `approved → failed`);
+  docs não alterados. Continuam fora: provider/Developer/TestRunner reais, continuação de
+  `start_execution`, pós-verificação, model routing/`model_policy_hash`, auditor real.
