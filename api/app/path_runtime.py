@@ -59,6 +59,7 @@ from app.safety.paths import (
     classify_path_form,
     decide_path,
     decide_post_open,
+    path_components,
     prevalidate_path_syntax,
 )
 from app.safety.policy import SafetyPolicy
@@ -209,6 +210,24 @@ def _absence_is_proven(path: Path) -> bool:
     return _probe_component(path)[0] == _ABSENT
 
 
+def _lexical_parts(requested: str, form: PathForm) -> list[str]:
+    """Os componentes que o runtime **materializa** — a mesma decomposição da safety.
+
+    Para `PathForm.RELATIVE` (todo caminho de `ToolRequest`) é exatamente
+    `safety.paths.path_components`: `/` e `\\` são separadores em **todas** as plataformas,
+    `""` e `.` somem (`"."` → `[]`, a própria raiz). Sem isso o POSIX materializava
+    `sub\\a.txt` como **um** nome literal, enquanto a política tinha decidido sobre
+    `["sub", "a.txt"]` (Linux-CI-001). Consequência deliberada da gramática: um nome POSIX que
+    contém `\\` literal não é endereçável por `ToolRequest`.
+
+    As demais formas (o absoluto de `allow_absolute`, e as que a pré-validação recusa)
+    mantêm a decomposição legada, sem mudança de comportamento.
+    """
+    if form is PathForm.RELATIVE:
+        return path_components(requested)
+    return [part for part in re.split(r"[\\/]+", requested) if part not in ("", ".")]
+
+
 def _lexical_chain_facts(
     root_path: Path,
     requested: str,
@@ -244,7 +263,8 @@ def _lexical_chain_facts(
     symlink = junction = reparse = Tri.FALSE
     escapes = Tri.FALSE
 
-    parts = [part for part in re.split(r"[\\/]+", requested) if part not in ("", ".")]
+    # A mesma decomposição que `inspect` usa para materializar o alvo (Linux-CI-001).
+    parts = _lexical_parts(requested, classify_path_form(requested))
     current = root_path
     lstat_failed = False
 
@@ -358,11 +378,14 @@ def inspect(
     is_device_namespace = Tri.of(form is PathForm.DEVICE_NAMESPACE)
     is_drive_relative = Tri.of(form is PathForm.DRIVE_RELATIVE)
 
-    candidate = (
-        Path(requested)
-        if allow_absolute and form is PathForm.ABSOLUTE_QUALIFIED
-        else root_path / requested
-    )
+    # Materialização e cadeia léxica (`_lexical_chain_facts`) usam **a mesma** decomposição,
+    # `_lexical_parts`. `requested_path` segue a string original; `canonical_target` é o alvo real.
+    if allow_absolute and form is PathForm.ABSOLUTE_QUALIFIED:
+        candidate = Path(requested)
+    elif form is PathForm.RELATIVE:
+        candidate = root_path.joinpath(*_lexical_parts(requested, form))  # `"."` → a própria raiz
+    else:
+        candidate = root_path / requested
 
     try:
         canonical_target = candidate.resolve(strict=False)
@@ -1374,6 +1397,14 @@ def create_exclusive(
     ``mutation_trace`` (E7.5-C, opcional): registra cada `mkdir` e o `O_EXCL` bem-sucedidos no
     instante em que acontecem, para que quem chama saiba o que mudou mesmo quando esta função
     levanta depois. Sem ele, nada muda.
+
+    **Pai que existia e precisou ser criado** (Linux-CI-003): se a inspeção viu o pai final
+    (`facts.parent_identity` presente) e **esta** tentativa ainda assim precisou de um `mkdir`
+    bem-sucedido em algum nível da cadeia, a cadeia observada não existe mais —
+    `PARENT_IDENTITY_CHANGED` antes do `O_EXCL`, **independentemente** de `(dev, ino)`: o
+    POSIX pode reutilizar o inode de um diretório apagado e recriado, e a comparação de
+    identidade sozinha passaria. Os diretórios recriados ficam (e o `mutation_trace` os
+    conta); o alvo não é criado. Criar pais que a inspeção viu **ausentes** é o caso normal.
     """
     _check_cancel(is_cancelled)
     verify_root(root)
@@ -1383,6 +1414,7 @@ def create_exclusive(
 
     parents = parts[:-1]
     seen: dict[tuple[str, ...], ObjectIdentity] = {}
+    created_here = 0  # `mkdir` bem-sucedidos **desta** tentativa (o trace é opcional)
     for depth in range(1, len(parents) + 1):
         _check_cancel(is_cancelled)
         prefix = parents[:depth]
@@ -1400,6 +1432,7 @@ def create_exclusive(
             except OSError as error:
                 raise _classify_os_error(error) from None
             else:
+                created_here += 1
                 if mutation_trace is not None:
                     mutation_trace.created_parent_count += 1
             try:
@@ -1409,6 +1442,9 @@ def create_exclusive(
         seen[prefix] = _trusted_identity(info)
 
     _verify_dirs(root, seen)
+    if facts.parent_identity is not None and created_here:
+        # O pai final existia na inspeção; ter precisado criá-lo (ou um ancestral) prova a troca.
+        raise _violation(IntegrityFailure.PARENT_IDENTITY_CHANGED)
     parent_identity = seen[parents] if parents else root.identity
     baseline = facts.parent_identity if facts.parent_identity is not None else parent_identity
     _require_same_identity(baseline, parent_identity, IntegrityFailure.PARENT_IDENTITY_CHANGED)

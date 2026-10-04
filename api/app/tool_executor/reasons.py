@@ -55,6 +55,8 @@ ERROR_PHRASES: MappingProxyType[str, str] = MappingProxyType(
             "não foi possível inspecionar um caminho; a operação não pode afirmar que é completa"
         ),
         "cancelled": "operação cancelada",
+        # Linux-CI-AUD-001: nome descoberto que a gramática de request leria como outro caminho.
+        "path_unrepresentable": "um caminho descoberto não pode ser representado",
         # ApplyPatch (E7.5-C). Nenhuma frase cita linha do patch, conteúdo ou caminho.
         "invalid_patch": "o patch não segue o subset de unified diff aceito",
         "patch_conflict": "o patch não se aplica exatamente ao conteúdo atual",

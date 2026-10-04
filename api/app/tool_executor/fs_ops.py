@@ -49,6 +49,7 @@ from app.safety import (
     prevalidate_mediated_path,
 )
 from app.safety.paths import PathIntent
+from app.safety.source_refs import PATH_SEPARATOR_ALIASES
 from app.safety.types import PathFacts
 from app.tool_executor.contracts import (
     ListDirectory,
@@ -57,7 +58,13 @@ from app.tool_executor.contracts import (
     ToolStatus,
     WriteFile,
 )
-from app.tool_executor.outcome import HandlerContext, InspectionFailed, Outcome, OutputFragment
+from app.tool_executor.outcome import (
+    HandlerContext,
+    InspectionFailed,
+    Outcome,
+    OutputFragment,
+    ToolError,
+)
 from app.tool_executor.reasons import TECHNICAL_RULES
 
 # ------------------------------------------------------------------------------- apoio comum
@@ -153,8 +160,43 @@ def _visible_facts(context: HandlerContext, relative: str) -> PathFacts | None:
     return None
 
 
-def _join(directory: str, name: str) -> str:
-    return f"{directory}/{name}" if directory else name
+#: Caracteres que a gramática **de request** lê como separador (`path_components`): `/` e os
+#: aliases da safety. Um nome **descoberto** que contém algum deles não tem representação V1.
+_REQUEST_SEPARATORS = frozenset("/") | PATH_SEPARATOR_ALIASES
+
+
+def _discovered_relatives(directory: str, entries: Iterable[DirectoryEntryFacts]) -> list[str]:
+    """O caminho relativo **fiel** de cada entrada descoberta — ou `ERROR` para todas.
+
+    Linux-CI-AUD-001: duas gramáticas, nunca misturadas. O texto de um `ToolRequest` passa
+    por `path_components` (`/` e `\\` separam). Um `entry.name` vem do filesystem e é **um**
+    segmento literal: não passa por aquela gramática. Anexado a ``directory`` (já canônico,
+    com `/`), ele só é representável se não contiver nenhum caractere que a gramática de
+    request leria como separador — senão o texto entregue (e reusado como request) nomearia
+    **outro** objeto: no POSIX, `a\\b.txt` literal viraria `a/b.txt`.
+
+    Um nome que não é UTF-8 estrito (byte não decodificável no POSIX, via `surrogateescape`, ou
+    surrogate solto no Windows) também não cabe no texto de saída nem num request: mesma recusa.
+
+    V1 não tem escape para isso: `ToolError("path_unrepresentable")`, técnico (sem política,
+    sem journal), levantado **antes** de qualquer `_visible_facts`/`inspect`/abertura das
+    entradas deste diretório — e para o diretório **inteiro**, então o desfecho não depende da
+    ordem de enumeração.
+    """
+    relatives: list[str] = []
+    for entry in entries:
+        if _REQUEST_SEPARATORS.intersection(entry.name) or not _is_strict_utf8(entry.name):
+            raise ToolError("path_unrepresentable")
+        relatives.append(f"{directory}/{entry.name}" if directory else entry.name)
+    return relatives
+
+
+def _is_strict_utf8(name: str) -> bool:
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 # ----------------------------------------------------------------------------------- ReadFile
@@ -215,11 +257,11 @@ def list_directory_entries(context: HandlerContext, request: ListDirectory) -> O
     base = relative_target(facts, context.root)
     listing = list_directory(facts, context.root, is_cancelled=context.is_cancelled)
 
+    relatives = _discovered_relatives(base, listing.entries)  # antes de qualquer política
     shown: list[tuple[str, str]] = []
     omitted = 0
-    for entry in listing.entries:
+    for entry, relative in zip(listing.entries, relatives, strict=True):
         _cancel(context)
-        relative = _join(base, entry.name)
         if _visible_facts(context, relative) is None:
             omitted += 1
             continue
@@ -358,17 +400,21 @@ def _walk_entries(
     state: _Search, entries: Iterable[DirectoryEntryFacts], relative_dir: str
 ) -> None:
     ordered = sorted(entries, key=lambda e: _entry_order_key(e.name, e.kind))
-    for entry in ordered:
+    # Representabilidade do diretório inteiro **antes** de política, tipo ou abertura.
+    relatives = _discovered_relatives(relative_dir, ordered)
+    for entry, relative in zip(ordered, relatives, strict=True):
         if state.done:
             return
         state.budget.check()
-        if entry.kind is EntryKind.OTHER:
-            state.files_skipped += 1
-            continue
-        relative = _join(relative_dir, entry.name)
+        # Política **primeiro** (Linux-CI-002): no POSIX um symlink enumerado por `lstat` é
+        # `OTHER`; classificá-lo antes como "não pesquisável" pulava a política e o journal.
+        # Nada é seguido nem aberto aqui: `_visible_facts` só inspeciona e decide.
         facts = _visible_facts(state.context, relative)
         if facts is None:
             state.policy_skipped += 1
+            continue
+        if entry.kind is EntryKind.OTHER:  # FIFO, socket, device: permitido, não pesquisável
+            state.files_skipped += 1
             continue
         canonical = relative_target(facts, state.context.root)
         if entry.kind is EntryKind.DIRECTORY:
