@@ -249,6 +249,13 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     #: Confirmação forte da purga ([02] §11). Uma instância por app, só em memória.
     app.state.purge_token_store = PurgeTokenStore()
 
+    #: E7.6 — a porta de verificação independente de capability ([04] §1, ADR-0009). **Sem
+    #: implementação positiva em produção**: só um adaptador real (E8+) poderá preenchê-la.
+    #: `None` faz a guarda `approved → executing` recusar (*fail closed*,
+    #: `capability_profile_proven`). Nenhum fake/always-pass é instalado aqui — doubles
+    #: positivos moram em `tests/`. Ver `app.capability_wiring` para a ponte.
+    app.state.capability_verifier = None
+
     @app.middleware("http")
     async def local_guard(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]

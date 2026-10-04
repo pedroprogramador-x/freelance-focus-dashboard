@@ -20,6 +20,10 @@ denylist de caminho — ela reaproveita `is_sensitive_key` e `classify_path_secr
 A E7.1 acrescenta `capability_profile`: o contrato puro das sete capabilities e a política
 de aceitação da V1 — vocabulário e veredito, sem prova nem provider.
 
+A E7.6 acrescenta `capability_verification`: o contrato puro da verificação independente
+(binding, observação verificada, recusa tipada). Separa o que o adaptador *declara* do que
+um mecanismo independente *observou*, e avalia a observação contra um contexto esperado.
+
 A E7.4 acrescenta `worktree_location`: a decisão pura sobre a raiz de worktrees (fora do
 OneDrive, do repositório e do `.git`), sobre `WorktreeRootFacts` coletados por `path_runtime`.
 
@@ -38,6 +42,16 @@ from app.safety.capability_profile import (
     fingerprint_v1_projection,
     parse_capability_profile,
     require_v1,
+)
+from app.safety.capability_verification import (
+    CapabilityBinding,
+    CapabilityRefusal,
+    CapabilityRefusalCode,
+    InvalidCapabilityVerification,
+    UnverifiedReason,
+    VerifiedCapabilityObservation,
+    evaluate_observation,
+    historical_profile_hash,
 )
 from app.safety.mediated_git import (
     REF_OUTSIDE_BASE_HISTORY_RULE_ID,
@@ -92,9 +106,13 @@ __all__ = [
     "TOOL_LIMITS_V1",
     "AnalyzerSignal",
     "Capability",
+    "CapabilityBinding",
     "CapabilityProfileRejected",
+    "CapabilityRefusal",
+    "CapabilityRefusalCode",
     "EnforcementMode",
     "InvalidCapabilityProfile",
+    "InvalidCapabilityVerification",
     "ObjectIdentity",
     "PathFacts",
     "PathForm",
@@ -110,6 +128,8 @@ __all__ = [
     "TreeWriter",
     "TreeWriterFactory",
     "Tri",
+    "UnverifiedReason",
+    "VerifiedCapabilityObservation",
     "WorktreeRoot",
     "WorktreeRootFacts",
     "check_v1",
@@ -124,7 +144,9 @@ __all__ = [
     "decide_tree_paths",
     "decide_worktree_root",
     "detect_sensitive_objective_signals",
+    "evaluate_observation",
     "fingerprint_v1_projection",
+    "historical_profile_hash",
     "is_sensitive_key",
     "parse_capability_profile",
     "path_components",
