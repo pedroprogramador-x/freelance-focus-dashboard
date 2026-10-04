@@ -94,6 +94,10 @@ from app.git_runtime import (
     probe_head,
 )
 from app.orchestrator.analyzer import AnalyzerEnrichmentPort, TaskAnalysis, analyze
+from app.orchestrator.developer_binding import (
+    DeveloperBindingResolver,
+    select_developer_execution,
+)
 from app.orchestrator.errors import InvalidTestConfig, WorkspaceNotPlannable
 from app.orchestrator.fingerprint import (
     FingerprintParts,
@@ -131,6 +135,14 @@ PLAN_VERSION = 1
 #: adaptador, o fingerprint muda e toda aprovação vigente é invalidada, que é exatamente o
 #: comportamento que [04] §7 exige de uma mudança de binding.
 NULL_BINDING: None = None
+
+#: A chave de `execution_limits` que carrega o reasoning effort do Developer (E8.1).
+#:
+#: O effort é controle de execução, qualidade e custo — portanto um **limite** no sentido
+#: de [02] §7. Entra em `execution_limits` (e não em `developer_binding.model`, nem numa
+#: chave de topo nova) para que mudar só `medium → high` mude o fingerprint e invalide a
+#: aprovação, sem alterar a forma v1 do objeto hasheado.
+DEVELOPER_REASONING_EFFORT_KEY = "developer_reasoning_effort"
 
 
 # --------------------------------------------------------- pré-condições de planejamento
@@ -358,6 +370,7 @@ def build_fingerprint_parts(
     plan_hash: str,
     agents: tuple[str, ...],
     decision: ResourceDecision,
+    developer_binding_resolver: DeveloperBindingResolver | None,
 ) -> FingerprintParts:
     """Monta os componentes de [02] §7. **Determinística sobre o estado atual do banco.**
 
@@ -370,8 +383,19 @@ def build_fingerprint_parts(
     `test_config` do workspace, política de segurança composta, política de workflow e
     limites. O que vem congelado é o que o plano fixou: `plan_hash`, o manifest, o
     `base_commit` e `agents`.
+
+    E8.1: a decisão do Model Router sai de `task.risk`/`task.complexity` pela tabela
+    **vigente** — mesma assimetria de `decision_from_task`: mudar a política invalida a
+    aprovação. O reasoning effort entra **sempre** em `execution_limits`; o
+    `developer_binding` só deixa de ser `null` quando um resolver é injetado. Sem resolver,
+    nenhum binding concreto é inventado. ``developer_binding_resolver`` é obrigatório por
+    nome para que nenhum dos dois chamadores o esqueça em silêncio.
     """
     test_policy = _read_test_policy(workspace)
+
+    developer = select_developer_execution(
+        task.risk, task.complexity, resolver=developer_binding_resolver
+    )
 
     workflow_policy = WorkflowPolicy(
         max_fix_rounds=decision.max_fix_rounds,
@@ -383,15 +407,21 @@ def build_fingerprint_parts(
         manifest_hash=manifest.manifest_hash,
         rendered_context_hash=manifest.rendered_context_hash,
         base_commit=manifest.git_head,
-        # Ambos `null` até E8/E9 — `null` explícito, nunca chave omitida ([02] §7).
-        developer_binding=NULL_BINDING,
+        # `null` explícito, nunca chave omitida ([02] §7): o developer até um resolver ser
+        # injetado (E8); o auditor até a E9.
+        developer_binding=(
+            developer.binding.as_canonical() if developer.binding is not None else NULL_BINDING
+        ),
         auditor_binding=NULL_BINDING,
         test_binding=test_policy.as_binding() if test_policy else dict(NULL_TEST_BINDING),
         agents=agents,
         tool_profile_hash=tool_profile_hash(),
         safety_policy_hash=effective_policy_hash(workspace),
         workflow_policy_hash=workflow_policy.policy_hash(),
-        execution_limits=decision.as_execution_limits(),
+        execution_limits={
+            **decision.as_execution_limits(),
+            DEVELOPER_REASONING_EFFORT_KEY: developer.decision.effort.value,
+        },
     )
 
 
@@ -440,6 +470,7 @@ def plan_task(
     candidate_paths: list[str],
     artifacts_dir: Path,
     enrichment_port: AnalyzerEnrichmentPort | None = None,
+    developer_binding_resolver: DeveloperBindingResolver | None = None,
 ) -> PlanResult:
     """Planeja `task`. **Não escreve um único arquivo do usuário** ([07], gate da E6).
 
@@ -494,6 +525,12 @@ def plan_task(
     plan = _build_plan(task, analysis, decision, base_commit=base_commit, base_branch=base_branch)
     plan_hash = canonical_sha256(plan)
 
+    # Antes de `build_fingerprint_parts`: o Model Router lê `task.risk`/`task.complexity`,
+    # exatamente como no recálculo do `approve` e da guarda de entrada (E8.1).
+    task.risk = analysis.risk
+    task.complexity = analysis.complexity
+    task.risk_source = analysis.risk_source
+
     parts = build_fingerprint_parts(
         task,
         workspace,
@@ -501,11 +538,9 @@ def plan_task(
         plan_hash=plan_hash,
         agents=decision.agents,
         decision=decision,
+        developer_binding_resolver=developer_binding_resolver,
     )
 
-    task.risk = analysis.risk
-    task.complexity = analysis.complexity
-    task.risk_source = analysis.risk_source
     task.agents = list(decision.agents)
     task.plan = plan
     task.plan_hash = plan_hash
@@ -537,6 +572,7 @@ def plan_task(
 
 
 __all__ = [
+    "DEVELOPER_REASONING_EFFORT_KEY",
     "PLANNING_BLOCKERS",
     "PLANNING_BLOCKER_GIT_UNVERIFIABLE",
     "PLANNING_BLOCKER_INVALID_TEST_CONFIG",

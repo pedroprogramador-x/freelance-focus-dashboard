@@ -7710,3 +7710,72 @@ worktree ou tentativa consumida. Quando a guarda passa, `start_execution` contin
   atual mantêm `approved` na recusa da guarda. Preservada a máquina (sem `approved → failed`);
   docs não alterados. Continuam fora: provider/Developer/TestRunner reais, continuação de
   `start_execution`, pós-verificação, model routing/`model_policy_hash`, auditor real.
+
+## 2026-10-04 — Claude Opus 5.5 (effort: high) — E8.1 Model Router + Execution Binding — candidate
+
+Branch `e8/01-model-router-binding`, criada de `46447f89080ff99e9bfe8f91c48e8c1d9ebe8617`
+(merge do PR #7, E7.6). HEAD anterior era `e7/06-capability-enforcement` (`4082563`), working
+tree limpa. Modelo realmente executado: **Claude Opus 5.5** (`claude-opus-5-5`), effort high.
+CodeGraph estava registrado; a leitura foi majoritariamente direta nos arquivos nomeados na
+tarefa. Sem commit, push, PR ou merge. **E8.2 não iniciada.** Candidata à auditoria independente.
+
+**Model Router** (`orchestrator/model_router.py`, puro): `DeveloperModelTier`
+{`standard`, `strong`} e `DeveloperEffort` {`medium`, `high`} são enums **separados**;
+`DeveloperModelDecision(tier, effort)` é dataclass imutável validada (nunca string única).
+`route_developer_model(risk, complexity)` reusa `RiskLevel`/`ComplexityLevel` de `db/enums`,
+com tabela fechada de 12 células (`MappingProxyType`), cobertura do produto conferida na
+importação, checagem de tipo exata (rejeita `"low"`, `None`, enum trocado) e
+`ModelRoutingContractError` sem default implícito. Tabela V1:
+low → s/m, s/m, s/m, **strong/m**; medium → s/m, s/m, **s/high**, strong/m;
+high → s/high, s/high, strong/m, **strong/high** (colunas trivial, low, medium, high).
+Nenhum nome de fornecedor/modelo concreto em `orchestrator/` (gate por regex).
+
+**Binding** (`orchestrator/developer_binding.py`): `DeveloperBinding(adapter,
+adapter_version, model)` validado e imutável, `as_canonical()` com a forma histórica de
+[02] §7; porta `DeveloperBindingResolver` (`Protocol`, injetada). `resolve_developer_binding`
+recebe a decisão mas entrega ao resolver **só o tier** — ele não vê o effort e não pode
+codificá-lo no `model`. `select_developer_execution` é o único caminho decisão → binding;
+`build_fingerprint_parts` é o único chamador, usado por `plan`, `approve` e guarda de entrada
+(`_recompute_fingerprint`). `plan`/`approve`/`start_execution`/`plan_task` ganharam
+`developer_binding_resolver=None`; em `build_fingerprint_parts` o parâmetro é obrigatório por nome.
+
+**Fingerprint**: `FINGERPRINT_VERSION = 1`, chaves de topo e `fingerprint.py` intocados; sem
+`model_policy_hash`; `auditor_binding` segue `null`. `developer_binding` = binding canônico
+quando há resolver, `null` sem ele. `execution_limits` ganhou `developer_reasoning_effort`
+(**sempre**, inclusive sem resolver — o effort é decisão neutra e é aprovado). Timeouts
+(`run_timeout_s`/`task_timeout_s`) não adicionados. A tabela de modelo não foi para
+`resource_router.py` (intocado); o documento `plan`/`plan_hash` não muda. `plan_task` passou a
+gravar `task.risk/complexity/risk_source` antes de montar as partes, para que plano e
+recálculo leiam a mesma fonte.
+
+**Produção**: nenhum resolver instalado (`main.py`, API e `app.state` intocados); planejamento
+sai com `developer_binding: null`; `capability_verifier = None` e guarda fail-closed preservados;
+`NotImplementedError` de `start_execution` preservado. Consequência intencional: como o effort
+entra em todo fingerprint novo, aprovações de tasks pré-E8.1 num banco local divergem no
+recálculo (`execution_limits`) e pedem reaprovação. `execution_config_hash` da E7.6 adiado
+para a E8.2 (nenhuma forma de "prepared developer execution config" criada).
+
+- Arquivos: novos `api/app/orchestrator/model_router.py`,
+  `api/app/orchestrator/developer_binding.py`, `api/tests/test_model_router_binding_e8_1.py`;
+  alterados `api/app/orchestrator/planner.py`, `api/app/orchestrator/execution_manager.py`,
+  `AGENT_LOG.md`. `docs/`, ADRs, `src/`, schema, migrations, dependências, `main.py`, API,
+  `tool_executor`, `process_runtime`, `git_runtime`, `safety` **não** tocados. Nenhum teste
+  pré-existente alterado.
+- Testes novos: 90 (12 células literais; 4 combinações; independência; determinismo;
+  imutabilidade; fail closed; contrato de binding; fingerprint muda por model/adapter/
+  adapter_version/effort; caminho real plan → approve → `start_execution` com invalidação por
+  modelo, adaptador, versão e só-effort (política alterada via monkeypatch da célula);
+  legado sem resolver; produção sem resolver; gates AST/import).
+- Gates (Windows, Python 3.11, venv oficial): E8.1 90 passed; router/fingerprint 61; planner
+  45; state_machine 138; E7.6 117; E7.1 96; E7.2 87; architecture 256 (+4 por parametrização
+  sobre os 2 módulos novos); suítes E7.5/path 1140 passed, 9 skipped; **backend completo 3912
+  passed, 20 skipped, 0 failed (20m48s)** — os 20 skips são de plataforma (symlink, FIFO,
+  POSIX, NTFS, volumes); `ruff check`, `ruff format --check`, `mypy` e `mypy --platform linux`
+  (173 arquivos) limpos; `git diff --check` limpo. CI Linux não rodou para esta branch.
+- Mutantes temporários, todos detectados e arquivos restaurados (md5 idêntico): M1 sempre
+  standard/medium; M2 effort derivado do tier; M3 binding `null` com resolver; M4 `model`
+  removido do binding; M5 effort removido de `execution_limits`; M6 `auditor_binding`
+  preenchido; M7 nome concreto em `model_router.py`.
+- Limitações: sem resolver concreto, adaptador, verificador ou `execution_config_hash`
+  (E8.2); a correspondência entre `developer_binding` aprovado e `CapabilityBinding` esperado
+  ainda não é derivada; o resolver é confiado como determinístico (não verificável aqui).
