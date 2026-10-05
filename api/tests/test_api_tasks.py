@@ -304,8 +304,11 @@ def test_safety_event_da_guarda_de_entrada_tambem_sobrevive(
     assert aprovada.status_code == 200
 
     factory = cast("sessionmaker[Session]", session_factory)
+    # E8.2: o plano da API tem `developer_binding` concreto; a entrada de execução precisa
+    # recalcular com o MESMO resolver (o chamador real, na E8.4, o receberá do `app.state`).
+    resolver = auth_api_client.app.state.developer_binding_resolver  # type: ignore[attr-defined]
     with factory() as escrita, pytest.raises(TransitionGuardFailed):
-        start_execution(escrita, task_id)
+        start_execution(escrita, task_id, developer_binding_resolver=resolver)
 
     with factory() as leitura:
         kinds = [

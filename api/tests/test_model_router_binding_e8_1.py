@@ -702,24 +702,31 @@ def test_legado_sem_resolver_continua_igual_ao_e7(
 # ============================================================ produção sem resolver
 
 
-def test_producao_nao_instala_resolver_nem_constroi_binding() -> None:
-    """Nenhum módulo de `app/` constrói `DeveloperBinding` nem passa um resolver: o
-    composition root real é E8.2. Só testes fornecem resolvers na E8.1."""
+def test_producao_so_o_composition_root_constroi_binding_e_so_a_rota_injeta_resolver() -> None:
+    """E8.2: o resolver concreto existe em produção. Só `developer_wiring.py` constrói
+    `DeveloperBinding`; fora do Orchestrator, só a rota de tasks (porta neutra, por
+    `app.state`) e o composition root conhecem o resolver."""
+    donos_do_resolver = {"tasks.py", "developer_wiring.py", "main.py"}
     for path in APP_ROOT.rglob("*.py"):
         texto = path.read_text(encoding="utf-8")
         tree = ast.parse(texto, filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 nome = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
-                assert nome != "DeveloperBinding", f"{path} constrói DeveloperBinding"
-        if path.parent != ORCHESTRATOR:
+                if nome == "DeveloperBinding":
+                    assert path.name == "developer_wiring.py", f"{path} constrói DeveloperBinding"
+        if path.parent != ORCHESTRATOR and path.name not in donos_do_resolver:
             assert "developer_binding_resolver" not in texto, f"{path} injeta resolver"
             assert "DeveloperBindingResolver" not in texto, f"{path} conhece o resolver"
 
 
-def test_startup_nao_tem_resolver_de_developer(client: object) -> None:
+def test_startup_tem_o_resolver_de_developer_mas_nenhum_verificador_positivo(
+    client: object,
+) -> None:
+    from app.developer_wiring import AnthropicDeveloperBindingResolver
+
     state = client.app.state  # type: ignore[attr-defined]
-    assert getattr(state, "developer_binding_resolver", None) is None
+    assert isinstance(state.developer_binding_resolver, AnthropicDeveloperBindingResolver)
     assert state.capability_verifier is None
 
 

@@ -65,6 +65,7 @@ from app.orchestrator import (
     reject,
     task_purge_preview,
 )
+from app.orchestrator.developer_binding import DeveloperBindingResolver
 from app.safety import redact, redact_document
 from app.workspace import PurgeCounts, PurgeTokenStore, task_subject
 
@@ -306,9 +307,18 @@ def _artifacts_dir(request: Request) -> Any:
     return request.app.state.settings.artifacts_dir
 
 
+def _developer_binding_resolver(request: Request) -> DeveloperBindingResolver | None:
+    """O resolver tier → binding do composition root (E8.2). A rota só conhece a porta neutra."""
+    resolver: DeveloperBindingResolver | None = request.app.state.developer_binding_resolver
+    return resolver
+
+
 SessionDep = Annotated[Session, Depends(_session)]
 PurgeStoreDep = Annotated[PurgeTokenStore, Depends(_purge_store)]
 ArtifactsDirDep = Annotated[Any, Depends(_artifacts_dir)]
+BindingResolverDep = Annotated[
+    DeveloperBindingResolver | None, Depends(_developer_binding_resolver)
+]
 
 
 # ------------------------------------------------------------------ projeção
@@ -472,6 +482,7 @@ def plan_route(
     payload: PlanRequest,
     session: SessionDep,
     artifacts_dir: ArtifactsDirDep,
+    binding_resolver: BindingResolverDep,
 ) -> TaskResponse:
     # `enrichment_port` **não** é passado: nenhuma porta existe antes da E8, e o piso de
     # fallback de [03] §5 é o comportamento correto desta fase. Injetá-lo aqui exigiria que
@@ -482,6 +493,7 @@ def plan_route(
         task_id,
         candidate_paths=payload.candidate_paths,
         artifacts_dir=artifacts_dir,
+        developer_binding_resolver=binding_resolver,
     )
     return _to_response(session, result.task)
 
@@ -491,8 +503,18 @@ def plan_route(
     response_model=TaskResponse,
     summary="Aprovar; exige o execution_fingerprint completo",
 )
-def approve_route(task_id: str, payload: ApproveRequest, session: SessionDep) -> TaskResponse:
-    approved = approve(session, task_id, execution_fingerprint=payload.execution_fingerprint)
+def approve_route(
+    task_id: str,
+    payload: ApproveRequest,
+    session: SessionDep,
+    binding_resolver: BindingResolverDep,
+) -> TaskResponse:
+    approved = approve(
+        session,
+        task_id,
+        execution_fingerprint=payload.execution_fingerprint,
+        developer_binding_resolver=binding_resolver,
+    )
     return _to_response(session, approved)
 
 

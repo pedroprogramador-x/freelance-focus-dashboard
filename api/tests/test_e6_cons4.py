@@ -21,11 +21,16 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.db.enums import TaskStatus
 from app.db.models import ContextManifest, DevWorkspace, SafetyEvent, WorkspaceTask
 from app.db.session import session_scope
+from app.developer_wiring import AnthropicDeveloperBindingResolver
 from app.orchestrator import TransitionGuardFailed, start_execution
 from app.orchestrator.errors import ConcurrentTaskUpdate, InvalidTestConfig
 from tests import context_helpers
 
 # ----------------------------------------------------------------------------- montagem
+
+
+#: E8.2: o plano pela API tem binding concreto; a entrada recalcula com o MESMO resolver.
+_RESOLVER = AnthropicDeveloperBindingResolver()
 
 
 def _gone(path: Path) -> None:
@@ -85,7 +90,7 @@ def _invalidate_by_head(
     context_helpers.write(root, "novo.txt", "x\n")
     context_helpers.commit_all(root, "segundo")
     with pytest.raises(TransitionGuardFailed), session_scope(session_factory) as session:
-        start_execution(session, task_id)
+        start_execution(session, task_id, developer_binding_resolver=_RESOLVER)
     assert _detail(client, task_id)["approval_state"] == "requires_replan"
 
 

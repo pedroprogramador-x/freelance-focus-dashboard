@@ -136,6 +136,55 @@ como diagnóstico local.
 As ferramentas chegam **à parte**, como `MediatedTools` com escopo do run — não como um
 executor global embutido no request.
 
+> **Addendum E8.2 — orçamento de tokens** *(aditivo; autorizado pelo Product Owner em
+> 2026-10-05)*
+>
+> * `limits.max_tokens` (`RunLimits.max_tokens`) é o orçamento **total** de **um** provider
+>   run: a soma, em todos os turnos do run, de input total + output. Input total inclui os
+>   tokens de cache que o provider reporte à parte (na Anthropic Messages API:
+>   `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`).
+> * `max_total_tokens` ([03](03-context-architecture.md) §6) continua sendo o orçamento
+>   **por task** — não o mesmo número que `limits.max_tokens`. O Execution Manager (E8.4)
+>   calcula o restante da task e aloca um `limits.max_tokens` a cada novo provider run.
+> * O parâmetro `max_tokens` de uma request de provider (p.ex. `messages.create` da Anthropic) é
+>   só o **teto de output daquela request**; não define `limits.max_tokens`.
+> * Um adaptador pode medir o input da próxima request antes de gerar output (p.ex.
+>   `messages.count_tokens`) para saber se ela cabe no restante do run. Essa medição é
+>   **previsão**, não consumo: não é somada ao uso. A contabilidade oficial é o uso reportado
+>   pela resposta.
+> * Se a próxima request não couber no restante, o adaptador **não a envia** e devolve a
+>   condição de orçamento esgotado; quem persiste `SafetyEvent(limit_exceeded)` e o estado
+>   final é o Execution Manager.
+> * Em `AgentRunResult`, `input_tokens` é o input **total** do run (incluindo cache) e
+>   `output_tokens` o output total, de modo que a soma é comparável a `limits.max_tokens`.
+
+> **Addendum E8.2 — motivo de falha estruturado** *(aditivo; autorizado pelo Product Owner em
+> 2026-10-05)*
+>
+> * `AgentRunResult` ganha `failure_reason: RunFailureReason | None` (enum neutro de
+>   `agent_runtime`). V1 tem um único valor: `RunFailureReason.LIMIT_EXCEEDED`
+>   (`"limit_exceeded"`) — o run parou por exceder `limits.max_tokens`.
+> * Invariantes: `status = ok` ⇒ `failure_reason = None`; `limit_exceeded` ⇒ `status = blocked`.
+>   Outros status podem vir com `None`.
+> * `error_summary` é diagnóstico humano redigido e **não é control plane**: o Execution
+>   Manager (E8.4) decide `SafetyEvent(limit_exceeded)` e o estado correspondente por
+>   `failure_reason == LIMIT_EXCEEDED`, nunca interpretando texto. `failure_reason` é resultado
+>   de runtime e não entra no `execution_fingerprint`.
+
+> **Addendum E8.2 — prompt cache desligado no Developer Messages API V1** *(aditivo; autorizado
+> pelo Product Owner em 2026-10-05)*
+>
+> * O adaptador Messages API V1 usa `prompt_cache_policy = "disabled"`, que entra na
+>   configuração preparada e no `execution_config_hash`. Nenhum request enviado à API
+>   (`count_tokens` ou inferência) contém a chave `cache_control` em nível algum (system,
+>   tools, messages, blocos de conteúdo, tool results); isso é configurado, verificado antes do
+>   run e checado em cada request montada. Texto que contenha a palavra "cache_control" não é
+>   afetado — só a chave estrutural.
+> * Só sob essa política, e com o request verificado sem `cache_control`, campos de cache
+>   ausentes ou `None` no `usage` valem 0. Um valor **> 0** é violação (houve cache apesar da
+>   política): o run não continua. Qualquer outra política é não suportada pela V1 e exige nova
+>   revisão do adaptador; nela, `None` não pode ser presumido 0.
+
 ### `AgentRunResult`
 
 | Campo | Notas |
