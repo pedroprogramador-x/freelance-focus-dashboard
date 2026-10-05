@@ -57,6 +57,7 @@ from app.config import AppSettings, get_settings
 from app.context_engine import ContextError
 from app.db.conflicts import WriteConflict
 from app.db.session import create_engine, create_session_factory, session_scope
+from app.developer_wiring import AnthropicDeveloperBindingResolver
 from app.orchestrator import OrchestratorError, reconcile_on_startup
 from app.workspace import PurgeTokenStore, WorkspaceError
 
@@ -255,6 +256,14 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     #: `capability_profile_proven`). Nenhum fake/always-pass é instalado aqui — doubles
     #: positivos moram em `tests/`. Ver `app.capability_wiring` para a ponte.
     app.state.capability_verifier = None
+
+    #: E8.2 — resolver concreto tier → binding do Developer (Claude Messages API,
+    #: `transport="api"`). Só instancia um objeto sem estado: nenhum cliente HTTP, nenhuma
+    #: credencial, nenhuma rede, nenhum diretório. `plan`
+    #: e `approve` o recebem por `app.state` (a rota só conhece a porta neutra), de modo que
+    #: o `developer_binding` do fingerprint é concreto e idêntico no recálculo. Não há rota
+    #: nem laço de execução: `start_execution` segue levantando `NotImplementedError` (E8.4).
+    app.state.developer_binding_resolver = AnthropicDeveloperBindingResolver()
 
     @app.middleware("http")
     async def local_guard(

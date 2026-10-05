@@ -75,6 +75,25 @@ capability alguma é mais fácil de confiar e mais barato de operar.
 | **`fixed_operations_only`** | *(novo em 1B.3)* apenas operações nomeadas, com **argv formado pelo runtime**; o provider nomeia a operação e passa parâmetros tipados, nunca uma linha de comando |
 | `unmediated` | provider age sozinho, sem verificação — **nunca aceito na V1** |
 
+#### Adendo autorizado — E8.2 (2026-10-05): alcance de `execute_commands = disabled`
+
+> Adendo aprovado por Pedro (decisão sobre o finding E8.2-AUD-003). Esclarece o alcance da
+> decisão acima; não a reescreve nem a relaxa.
+
+`execute_commands = disabled` significa que o Developer/modelo **não recebe autoridade**
+sobre comandos ou processos cuja seleção, argv, conteúdo, dados ou disparo ele possa
+controlar ou influenciar. Subprocessos **fixos** de infraestrutura/runtime, sem influência
+do agente, não constituem capability do Developer: permanecem riscos do host, sujeitos a
+hardening.
+
+Este adendo **não** autoriza subprocesso de forma genérica: qualquer processo cujo argv,
+dados ou disparo dependa do que o modelo produz continua proibido ao Developer.
+
+**Residual registrado — AUD-003 (Windows host/runtime):** no Windows com CPython 3.11,
+`platform.uname()` executa a sonda fixa `cmd /c ver` (alcançável por dependências do
+transporte HTTP do provider). Sem influência do agente; classificado como
+**RESIDUAL ACCEPTED — HOST/RUNTIME**, com hardening em **E14**.
+
 ### O que cada adaptador declara — e prova
 
 | Campo | Significado |

@@ -31,6 +31,7 @@ from app.context_engine import select_context
 from app.db.enums import RiskLevel, TaskStatus
 from app.db.models import SafetyEvent, WorkspaceTask
 from app.db.session import session_scope
+from app.developer_wiring import AnthropicDeveloperBindingResolver
 from app.orchestrator import execution_manager as em
 from app.orchestrator.analyzer import AnalyzerEnrichment, analyze
 from app.orchestrator.errors import (
@@ -55,6 +56,10 @@ _SELECT_CONTEXT_NO_PLANNER = "app.orchestrator.planner.select_context"
 
 
 # ------------------------------------------------------------------ utilidades
+
+
+#: E8.2: o plano pela API tem binding concreto; a entrada recalcula com o MESMO resolver.
+_RESOLVER = AnthropicDeveloperBindingResolver()
 
 
 def _plan(client: TestClient, task: str, paths: tuple[str, ...] = ()) -> dict[str, Any]:
@@ -125,7 +130,7 @@ class TestAud001InvalidacaoNaEntradaTransiciona:
             pytest.raises(ApprovalFingerprintMismatch) as erro,
             session_scope(session_factory) as active,
         ):
-            em.start_execution(active, task_id)
+            em.start_execution(active, task_id, developer_binding_resolver=_RESOLVER)
 
         # O diagnóstico que faltava: **qual campo** divergiu ([06] §2).
         assert "test_binding" in erro.value.diverged_fields
@@ -171,7 +176,7 @@ class TestAud001InvalidacaoNaEntradaTransiciona:
             pytest.raises(TransitionGuardFailed) as erro,
             session_scope(session_factory) as active,
         ):
-            em.start_execution(active, task_id)
+            em.start_execution(active, task_id, developer_binding_resolver=_RESOLVER)
 
         assert erro.value.guard == "head_matches_planning_base_commit"
         assert erro.value.as_payload()["requires_replan"] is True
@@ -214,7 +219,7 @@ class TestAud001InvalidacaoNaEntradaTransiciona:
             pytest.raises(TransitionGuardFailed) as erro,
             session_scope(session_factory) as active,
         ):
-            em.start_execution(active, task_id)
+            em.start_execution(active, task_id, developer_binding_resolver=_RESOLVER)
 
         assert erro.value.guard == "capability_profile_proven"
         depois = _reload(session_factory, task_id)

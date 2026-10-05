@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.db.enums import TaskStatus
 from app.db.models import DevWorkspace, WorkspaceTask
 from app.db.session import session_scope
+from app.developer_wiring import AnthropicDeveloperBindingResolver
 from app.orchestrator import execution_manager as em
 from app.orchestrator.analyzer import analyze, evaluate_hard_rules
 from app.orchestrator.errors import ConcurrentTaskUpdate, TransitionGuardFailed
@@ -39,6 +40,10 @@ __all__ = ["repo", "task_id", "workspace_id"]
 #: Credencial **sintética**, no formato que o redator canônico reconhece. Nenhuma
 #: credencial real participa de teste nenhum deste arquivo.
 SECRET = "sk-" + ("A" * 24)
+
+
+#: E8.2: o plano pela API tem binding concreto; a entrada recalcula com o MESMO resolver.
+_RESOLVER = AnthropicDeveloperBindingResolver()
 
 
 def _plan(client: TestClient, task: str, paths: tuple[str, ...] = ()) -> dict[str, Any]:
@@ -389,7 +394,7 @@ class TestAud2004RecuperacaoDeHeadInvalido:
             pytest.raises(TransitionGuardFailed) as erro,
             session_scope(factory) as ativa,
         ):
-            em.start_execution(ativa, task)
+            em.start_execution(ativa, task, developer_binding_resolver=_RESOLVER)
         assert erro.value.as_payload()["requires_replan"] is True
         return erro.value
 
@@ -433,7 +438,7 @@ class TestAud2004RecuperacaoDeHeadInvalido:
             pytest.raises(TransitionGuardFailed),
             session_scope(session_factory) as ativa,
         ):
-            em.start_execution(ativa, task_id)
+            em.start_execution(ativa, task_id, developer_binding_resolver=_RESOLVER)
 
         detalhe = auth_api_client.get(f"/api/tasks/{task_id}").json()
         assert detalhe["status"] == "awaiting_approval"

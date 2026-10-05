@@ -669,6 +669,8 @@ def test_m5_nenhum_verificador_ou_fake_positivo_existe_no_codigo_de_producao() -
     permitidos_a_definir_tipos = {
         APP_ROOT / "agent_runtime" / "verification.py",
         APP_ROOT / "safety" / "capability_verification.py",
+        # E8.2: o verificador REAL do adaptador Messages API — observa o bundle; nunca um fake.
+        APP_ROOT / "agent_runtime" / "adapters" / "anthropic_messages" / "verifier.py",
     }
     suspeitos = ("always", "fake", "alwayspass", "stubverifier")
     for path in sorted(APP_ROOT.rglob("*.py")):

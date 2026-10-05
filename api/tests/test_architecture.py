@@ -79,12 +79,20 @@ def test_existem_modulos_para_analisar() -> None:
     assert ALL_FILES, "nenhum módulo encontrado — o teste estaria passando à toa"
 
 
+#: E8.2: o SDK da Claude Messages API (e o cliente HTTP dele) só pode ser importado pelo
+#: adaptador concreto. Nenhum outro módulo — nem o composition root — o importa direto.
+_ADAPTADOR_MESSAGES_API = APP_ROOT / "agent_runtime" / "adapters" / "anthropic_messages"
+_SDK_DO_ADAPTADOR = frozenset({"anthropic", "httpx2", "httpcore2"})
+
+
 @pytest.mark.parametrize("path", ALL_FILES, ids=_module_name)
 def test_nenhum_provider_ou_agente_e_importado(path: Path) -> None:
     for imported in _imports(path):
         root = imported.split(".")[0].lower()
-        assert root not in FORBIDDEN_EVERYWHERE, (
-            f"{_module_name(path)} importa `{imported}`: providers e agentes só a partir da E8"
+        if root in _SDK_DO_ADAPTADOR and path.is_relative_to(_ADAPTADOR_MESSAGES_API):
+            continue
+        assert root not in FORBIDDEN_EVERYWHERE and root not in _SDK_DO_ADAPTADOR, (
+            f"{_module_name(path)} importa `{imported}`: providers só no adaptador concreto"
         )
 
 
@@ -1471,6 +1479,9 @@ def test_context_engine_nao_casa_regex_sobre_conteudo_autoral() -> None:
 
 # ------------------------------------------------------------------------------ E7.2
 
+#: Adaptadores concretos (E8.2+) vivem fora do "só contratos": têm SDK, asyncio e threads.
+_ADAPTADORES = APP_ROOT / "agent_runtime" / "adapters"
+
 _STDLIB_PERMITIDA_NOS_CONTRATOS = {
     "__future__",
     "dataclasses",
@@ -1491,6 +1502,8 @@ def _imports_do_projeto(pasta: str) -> dict[str, set[str]]:
 def _externos(pasta: str) -> dict[str, set[str]]:
     resultado: dict[str, set[str]] = {}
     for path in (APP_ROOT / pasta).rglob("*.py"):
+        if path.is_relative_to(_ADAPTADORES):
+            continue  # E8.2: adaptador concreto tem SDK/asyncio; fronteira no teste E8.2 próprio
         resultado[path.name] = {i for i in _imports(path) if i.split(".")[0] != "app"}
     return resultado
 
@@ -1642,7 +1655,7 @@ def test_contratos_usam_so_stdlib_de_tipos() -> None:
 #: Os módulos que podem importar `agent_runtime`: o próprio pacote e a **ponte** do composition
 #: root (E7.6), que existe justamente para que `orchestrator` e `agent_runtime` não se
 #: importem. `main.py` e a ponte são os únicos que enxergam as duas camadas.
-_COMPOSITION_ROOT_MODULES = {"app.capability_wiring"}
+_COMPOSITION_ROOT_MODULES = {"app.capability_wiring", "app.developer_wiring"}
 
 
 def test_so_agent_runtime_importa_tool_executor_e_ninguem_importa_agent_runtime() -> None:
@@ -1668,7 +1681,10 @@ def test_nao_ha_adaptador_concreto_e_o_executor_tem_so_as_operacoes_ate_a_e7_5c(
     """Adaptadores (`agent_runtime/adapters/`) são E8+. O executor concreto tem as operações de
     arquivo (E7.5-B, `fs_ops`) e o `ApplyPatch` (E7.5-C, `patch_ops` + o parser puro
     `unified_diff`); nenhum módulo de Git mediado ainda (E7.5-D)."""
-    assert not (APP_ROOT / "agent_runtime" / "adapters").exists()
+    # E8.2: existe um único adaptador concreto, o da Claude Messages API (E9 trará o do Codex).
+    assert {p.name for p in _ADAPTADORES.iterdir() if p.is_dir() and p.name != "__pycache__"} == {
+        "anthropic_messages"
+    }
     assert {p.name for p in (APP_ROOT / "tool_executor").glob("*.py")} == {
         "__init__.py",
         "contracts.py",

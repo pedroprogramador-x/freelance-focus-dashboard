@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import re
 import typing
 from collections.abc import Callable
 from typing import Any
@@ -37,6 +38,7 @@ from app.agent_runtime import (
     FindingSeverity,
     MediatedTools,
     MediatedUsage,
+    RunFailureReason,
     RunLimits,
     RunScope,
     RunStatus,
@@ -51,6 +53,7 @@ from app.agent_runtime import (
 from app.agent_runtime import (
     TestRunner as RunnerProtocol,
 )
+from app.agent_runtime import dto as dto_module
 from app.safety import test_policy as safety_test_policy
 from app.safety.capability_profile import (
     AUDITOR_V1_PROFILE,
@@ -364,7 +367,12 @@ RUN_FIELDS = {
 
 
 def test_campos_dos_resultados_batem_com_05() -> None:
-    assert dataclass_fields(AgentRunResult) == RUN_FIELDS | {"files_read", "files_read_source"}
+    # `failure_reason`: addendum E8.2 de [05] §6 (motivo de falha estruturado).
+    assert dataclass_fields(AgentRunResult) == RUN_FIELDS | {
+        "files_read",
+        "files_read_source",
+        "failure_reason",
+    }
     assert dataclass_fields(AuditResult) == RUN_FIELDS | {"verdict", "findings"}
 
 
@@ -853,3 +861,44 @@ def test_test_request_recusa_politica_que_nao_e_test_policy() -> None:
         make_request(test_policy=None)
     with pytest.raises(ContractViolation):
         make_request(cancel_token="x")
+
+
+# ------------------------------------------------- addendum E8.2: motivo de falha estruturado
+
+
+def test_run_failure_reason_tem_so_o_motivo_necessario() -> None:
+    assert {r.value for r in RunFailureReason} == {"limit_exceeded"}
+    assert agent_result().failure_reason is None  # padrão
+
+
+def test_ok_nunca_carrega_failure_reason() -> None:
+    with pytest.raises(ContractViolation):
+        agent_result(status=RunStatus.OK, failure_reason=RunFailureReason.LIMIT_EXCEEDED)
+
+
+def test_limit_exceeded_exige_blocked() -> None:
+    assert (
+        agent_result(
+            status=RunStatus.BLOCKED, failure_reason=RunFailureReason.LIMIT_EXCEEDED
+        ).failure_reason
+        is RunFailureReason.LIMIT_EXCEEDED
+    )
+    for status in (RunStatus.ERROR, RunStatus.TIMEOUT, RunStatus.CANCELLED):
+        with pytest.raises(ContractViolation):
+            agent_result(status=status, failure_reason=RunFailureReason.LIMIT_EXCEEDED)
+
+
+@pytest.mark.parametrize("status", list(RunStatus))
+def test_todo_status_aceita_failure_reason_none(status: RunStatus) -> None:
+    assert agent_result(status=status).failure_reason is None
+
+
+def test_failure_reason_precisa_ser_o_enum() -> None:
+    with pytest.raises(ContractViolation):
+        agent_result(status=RunStatus.BLOCKED, failure_reason="limit_exceeded")
+
+
+def test_failure_reason_e_neutro_de_fornecedor() -> None:
+    texto = inspect.getsource(RunFailureReason)
+    assert not re.search(r"(?i)anthropic|claude|codex|openai|token_budget", texto)
+    assert not any(i.startswith(("anthropic", "httpx")) for i in vars(dto_module))

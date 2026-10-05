@@ -16,6 +16,10 @@ dependencies = [
     # erro e trava a coleta dos testes numa instalação limpa. Teto até o Starlette migrar;
     # o piso `>=3.6.2` já vem do próprio Starlette. (E3-AUD4-001)
     "anyio<4.15",
+    # E8.2 — SDK Python da Claude Messages API (Developer V1, `transport="api"`), versão FIXA.
+    # Trocá-la exige revisar `ADAPTER_VERSION` em
+    # `app/agent_runtime/adapters/anthropic_messages/constants.py`.
+    "anthropic==1.11.0",
 ]
 
 [project.optional-dependencies]

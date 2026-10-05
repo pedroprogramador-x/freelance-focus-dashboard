@@ -46,6 +46,19 @@ class RunStatus(str, Enum):
     BLOCKED = "blocked"
 
 
+class RunFailureReason(str, Enum):
+    """Motivo **estruturado** de um run que não terminou `ok` (addendum E8.2 de [05] §6).
+
+    É o control plane do resultado: quem decide transições (E8.4) lê este campo, **nunca**
+    `error_summary` (diagnóstico humano, redigido, não estruturado). Só o motivo necessário
+    hoje existe; outros entram quando houver necessidade real.
+    """
+
+    #: O run parou por exceder o seu orçamento (`limits.max_tokens`). E8.4 →
+    #: `SafetyEvent(limit_exceeded)`.
+    LIMIT_EXCEEDED = "limit_exceeded"
+
+
 class TokenSource(str, Enum):
     REPORTED = "reported"
     ESTIMATED = "estimated"
@@ -255,6 +268,9 @@ class AgentRunResult(RunReport):
 
     files_read: tuple[str, ...] | None
     files_read_source: FilesReadSource
+    #: Addendum E8.2: `ok` ⇒ `None`; `limit_exceeded` ⇒ `blocked` (o provider parou antes de
+    #: continuar). Demais status podem vir com `None`. Não entra no fingerprint (é runtime).
+    failure_reason: RunFailureReason | None = None
 
     def __post_init__(self) -> None:
         RunReport.__post_init__(self)
@@ -263,6 +279,15 @@ class AgentRunResult(RunReport):
             require_text_tuple("files_read", self.files_read)
         if (self.files_read is None) != (self.files_read_source is FilesReadSource.UNAVAILABLE):
             raise ContractViolation("files_read=None ⇔ files_read_source=unavailable")
+        if self.failure_reason is not None:
+            require_instance("failure_reason", self.failure_reason, RunFailureReason)
+            if self.status is RunStatus.OK:
+                raise ContractViolation("status=ok não carrega failure_reason")
+            if (
+                self.failure_reason is RunFailureReason.LIMIT_EXCEEDED
+                and self.status is not RunStatus.BLOCKED
+            ):
+                raise ContractViolation("failure_reason=limit_exceeded exige status=blocked")
 
 
 @dataclass(frozen=True, slots=True)

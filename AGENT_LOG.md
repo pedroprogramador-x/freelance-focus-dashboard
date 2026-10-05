@@ -7779,3 +7779,492 @@ para a E8.2 (nenhuma forma de "prepared developer execution config" criada).
 - Limitações: sem resolver concreto, adaptador, verificador ou `execution_config_hash`
   (E8.2); a correspondência entre `developer_binding` aprovado e `CapabilityBinding` esperado
   ainda não é derivada; o resolver é confiado como determinístico (não verificável aqui).
+
+## 2026-10-04 — Claude Sonnet 5.5 (effort: high solicitado) — E8.2 Claude Developer Adapter — candidate
+
+Branch `e8/02-claude-developer-adapter`, criada de `43101cd34f215a5701b8a7ac2ef5c6e47dccae75`
+(merge do PR #8, E8.1; `main` local atualizada por `pull --ff-only`, working tree limpa). A tarefa
+nomeava Opus 5.5; o modelo realmente executado é **Claude Sonnet 5.5** (`claude-sonnet-5-5`).
+Sem commit, push, PR ou merge. **E8.3/E8.4/E9 não iniciadas. Nenhuma chamada real ao Claude.**
+
+**SDK.** `claude-agent-sdk==0.2.159` (pin exato em `api/pyproject.toml`; wheel `win_amd64`, com o CLI
+embutido; instalada no venv oficial). O pip puxou `starlette 1.7.0` via `mcp`; restaurado
+`starlette 0.46.2` (limite do `fastapi`) e `sse-starlette 3.0.3` — `pip check` limpo e dry-run de
+`.[dev]` resolve sem alterar fastapi/starlette/pydantic. Probe sem rede: `ClaudeAgentOptions`
+tem todos os campos usados; argv do CLI (montado sem executar) traz `--tools ""`,
+`--strict-mcp-config`, `--setting-sources=`, `--permission-mode dontAsk`, `--model`, `--effort`.
+
+**Pacote** `api/app/agent_runtime/adapters/claude_sdk/` (único que importa `claude_agent_sdk`):
+`constants` (adapter `claude-agent-sdk`, transport `cli`, adapter_version `ff1-sdk0.2.159`,
+STANDARD→`claude-sonnet-5-5`, STRONG→`claude-opus-5-5`), `tool_surface` (nove tools
+`ff_read_file/list_directory/search_text/write_file/apply_patch/git_status/git_diff/git_show/
+git_list_tree`, lista canônica, `mediated_tool_schema_hash`, validação exata de entrada →
+`ToolRequest` oficial), `config` (`PreparedClaudeDeveloperConfig` imutável + `execution_config_hash`
+via `canonical_sha256`; model, **effort**, sdk_version, superfície, controles, hash do system prompt
+e perfil efetivo entram; nada transiente), `launch` (única construtora de `ClaudeAgentOptions`:
+`tools=[]`, `setting_sources=[]`, `skills=[]`, `plugins=[]`, `agents={}`, `strict_mcp_config=True`,
+`permission_mode="dontAsk"`, `verbatim_prompts=True`, system prompt próprio, model/effort
+explícitos, `allowed_tools` só autoaprova as nove MCP; ponte `ToolBridge` → `MediatedTools`),
+`verifier` (`ClaudeCapabilityVerifier`: observa o plano real contra constantes próprias; recomputa o
+hash da config **observada**; confere a declaração; binding observado ≠ cópia da declaração;
+NotVerified para controle inseguro/versão/modelo/effort/declaração divergentes; exceção para defeito
+técnico), `provider` (`ClaudeDeveloperProvider` vinculado a uma config + `…ProviderFactory` sem
+estado; transporte por porta `SessionFactory`, fake em testes; thinking descartado; timeout/cancel
+com `interrupt` e cleanup; tokens `reported` só se ambos inteiros, senão `unavailable`; `files_read`
+=`None`/`unavailable`; summary redigido). `enforcement_method=TOOL_ALLOWLIST`; supported = tudo
+`unmediated` (o que o Claude Code consegue), effective = Developer V1.
+
+**Composition.** `api/app/developer_wiring.py` (único elo Orchestrator↔adaptador):
+`ClaudeDeveloperBindingResolver` (recebe só o tier) e `prepare_developer_security_context`
+(binding+effort **aprovados** → config, declaração, `CapabilityBinding` esperado a partir do binding
+e da config — nunca de proof/observação —, verificador, `VerifyingCapabilityProver`). `main.py`
+instala `app.state.developer_binding_resolver`; `tasks.py` o injeta em `plan`/`approve` por
+dependência neutra. `plan` agora produz `developer_binding` concreto; `approve` recalcula com o
+mesmo resolver. `app.state.capability_verifier` segue `None` (verificador é por-config; ativação
+=E8.4). `start_execution` segue levantando `NotImplementedError` (E8.4); sem rota execute.
+
+**Lacuna de contrato (registrada, não bloqueante).** `DeveloperExecutionRequest` não leva
+model/effort e [05] §2 diz que o provider é vida-da-aplicação. Resolvido sem alterar DTO/docs: o
+provider é construído já vinculado à config preparada (factory sem estado); E8.4 decide a
+seleção. Efeito colateral: quem planeja com resolver precisa passar o MESMO resolver a
+`start_execution` (senão a guarda invalida a aprovação, por desenho da E8.1).
+
+- Arquivos novos: `app/agent_runtime/adapters/{__init__,claude_sdk/*}.py`, `app/developer_wiring.py`,
+  `tests/test_claude_developer_adapter_e8_2.py` (214 testes). Alterados: `pyproject.toml`,
+  `app/main.py`, `app/api/tasks.py`, `AGENT_LOG.md`.
+- Testes pré-existentes evoluídos (contrato, não silenciamento): `test_architecture.py` (adapters/
+  fora do "só contratos", `developer_wiring` é composition root, existe `adapters/claude_sdk`);
+  `test_capability_enforcement_e7_6.py` (M5 admite o verificador real); `test_model_router_binding_e8_1.py`
+  (resolver agora existe em produção; só `developer_wiring` constrói `DeveloperBinding`);
+  `test_api_tasks.py`, `test_e6_audit_round_1/2.py`, `test_e6_cons4.py` (`start_execution` após plano
+  pela API passa o resolver do app).
+- Mutantes M1–M10 (tools=None, strict False, bypassPermissions, effort fora do hash, esperado da
+  declaração, Bash na superfície, MCP externo, verbatim False, STANDARD→Opus, plan/approve toca o
+  provider): todos detectados, md5 restaurado.
+- Gates (Windows, Python 3.11, venv oficial): E8.2 214 passed; **backend completo 4144 passed, 20 skipped,
+  0 failed (21m39s)** (20 skips de plataforma); `ruff check`, `ruff format --check`, `mypy` e
+  `mypy --platform linux` (183 arquivos) limpos; `git diff --check` limpo. Uma 1ª rodada completa
+  acusou 9 falhas (E6 audit/cons4: `start_execution` sem resolver após plano pela API) — corrigidas
+  passando o resolver; reexecução completa verde.
+- Limitações: `max_tokens` não imposto (sem equivalente comprovável no SDK); `input_tokens` exclui
+  cache; servidor MCP in-process é opaco (verifica-se a lista de tools que o construiu, não os
+  handlers); sem proteção contra Python hostil no processo; nenhum processo Claude real rodou
+  (Windows: só a wheel instalada); CI Linux não rodou; `mypy --platform linux` não é runtime Linux;
+  autenticação do Claude Code é a já existente na máquina (nenhum segredo adicionado).
+
+## 2026-10-04 — Claude Opus 5.5 (effort: high) — E8.2 audit corrections — AUD-001/AUD-002/AUD-003 — BLOCKED BY PROVIDER CAPABILITY GAP
+
+Branch `e8/02-claude-developer-adapter`, HEAD `43101cd` (E8.2 segue **não commitada**). Inventário
+antes: 21 arquivos (11 modificados, 10 novos), SHA-256 capturados. **Nenhum arquivo de código ou
+teste foi alterado nesta rodada**; só esta entrada. Sem commit/push/PR/merge; nenhuma chamada real
+ao Claude; o CLI embutido não foi executado.
+
+**Resultado: E8.2 BLOCKED BY PROVIDER CAPABILITY GAP (AUD-002).** Pela regra da tarefa, a análise
+parou antes de corrigir AUD-001/AUD-003: corrigi-los não muda o fato de que nenhuma prova positiva
+de `execute_commands=disabled` é possível com Claude Code/Agent SDK 0.2.159 (CLI embutido 2.1.281,
+`claude_agent_sdk/_cli_version.py`).
+
+**AUD-002 — evidência** (documentação oficial em code.claude.com/docs/en/, lida em 2026-10-04, e
+strings do binário embutido `claude_agent_sdk/_bundled/claude.exe`):
+- `managed-settings`: "Agent SDK sessions load managed settings even when `settingSources` excludes
+  the user, project, and local files" → `setting_sources=[]` não cobre a camada gerenciada.
+- Fontes de endpoint (locais, observáveis antes do start): HKLM `SOFTWARE\Policies\ClaudeCode`
+  (`Settings`), HKCU idem, `managed-settings.json` + `managed-settings.d/*.json` + `managed-mcp.json`
+  em `C:\Program Files\ClaudeCode\` (Windows), `/etc/claude-code/` (Linux/WSL),
+  `/Library/Application Support/ClaudeCode/` (macOS); `policyHelper` (executável) só de fontes de
+  endpoint; parent tier do SDK (`managedSettings`), que o admin pode suprimir
+  (`parentSettingsBehavior`). O binário confirma os nomes `managed-settings.json`,
+  `managed-settings.d`, `managed-mcp.json`, `remote-settings.json`, `policyHelper` e a variável
+  `CLAUDE_CODE_MANAGED_SETTINGS_PATH` (não documentada; não usada como prova).
+- Fonte **remota** (server-managed settings, Teams/Enterprise): podem trazer **hooks de comando**,
+  `env` e `managedMcpServers` (http/sse). Buscadas no startup para credenciais elegíveis (OAuth
+  Team/Enterprise, `CLAUDE_CODE_OAUTH_TOKEN`, API key direta, perfil `user_oauth`); fora do primeiro
+  login/gateway/`forceRemoteSettingsRefresh`, "opens the session while the fetch continues"; polling
+  horário com aplicação na sessão em curso; cache em `~/.claude/remote-settings.json`. Em sessão
+  Agent SDK (não interativa) o que exigiria aprovação é aplicado "for that run only" — sem diálogo.
+- `disableAllHooks` de fonte não gerenciada **não** desliga hooks gerenciados; não há variável
+  documentada que desligue o fetch remoto. Os únicos "skips" documentados (provider de terceiros
+  `CLAUDE_CODE_USE_*`, `ANTHROPIC_BASE_URL` não padrão, chave via `apiKeyHelper`, WIF) mudam o
+  caminho de autenticação/roteamento — `apiKeyHelper` é ele mesmo um comando executado pelo CLI.
+- Por que não é observável antes da execução: a existência de política remota depende de estado do
+  servidor (organização/plano da credencial, configuração do admin) que pode mudar entre o preflight
+  e o start, e que chega **depois** do início da sessão (startup não bloqueante + polling). Ler o
+  cache ou a credencial não prova ausência; executar `claude doctor`/sessão para descobrir violaria
+  a regra (um hook já poderia rodar). A tarefa proíbe assumir "conta pessoal não tem".
+
+**AUD-001/AUD-003 — avaliação (não implementadas, por causa do STOP).** AUD-001 é corrigível dentro
+do SDK (bundle de runtime com handle privado da instância MCP, checagem `is` da `instance` nas
+opções reais, provider consumindo o mesmo bundle verificado, versão de contrato do bridge no config).
+AUD-003 parece corrigível com deadline absoluto + `asyncio.wait` contra cancel/deadline em todas as
+fases e cleanup limitado via `interrupt`/`disconnect` públicos; a garantia de encerramento do
+subprocesso do CLI sob prazo **não foi verificada** nesta rodada.
+
+**Menor alternativa arquitetural (decisão humana pendente):** (a) Developer via Messages API
+(laço de tool-use no nosso processo, `transport="api"`, sem runtime Claude Code — sem hooks/settings),
+o que exige aprovar a troca de transport e revisar a identidade/`adapter_version`; ou (b) manter o
+Claude Code apenas sob uma condição de skip documentada e observável no `env` do processo (ex.: rota
+de provider de terceiros) **mais** probe de todas as fontes de endpoint — muda autenticação/cobrança
+e continua sendo controle client-side. Nenhuma das duas foi implementada.
+
+- Arquivos alterados nesta rodada: `AGENT_LOG.md` (só esta entrada). Os outros 20 do inventário com
+  SHA-256 idêntico ao de antes.
+- Pendência: decisão do Pedro sobre a alternativa; até lá a E8.2 não deve ser commitada como está
+  (o `ClaudeCapabilityVerifier` atual produz `Verified` sem observar a camada gerenciada).
+
+## 2026-10-04 — Claude Opus 5.5 (effort: high) — E8.2 transport pivot — Claude Messages API — candidate
+
+Branch `e8/02-claude-developer-adapter`, HEAD `43101cd` (E8.2 inteira segue **não commitada**).
+Inventário antes da virada: 21 arquivos (11 M + 10 novos), SHA-256 capturados; desde a auditoria
+só o `AGENT_LOG.md` havia mudado. Sem commit/push/PR/merge. **Nenhuma chamada à API real, nenhuma
+API key usada ou pedida, nenhum crédito consumido.** E8.3/E8.4/E9 não iniciadas.
+
+**Decisão (Product Owner):** Developer V1 = Claude Messages API, `transport="api"`. Claude Code /
+Agent SDK **não autorizado** como Developer V1 (DEFERRED, sem código residual): o transport CLI
+carrega uma camada de managed policy (inclusive server-managed, com hooks de comando aplicados
+sem diálogo em sessão SDK) cuja ausência não é provável antes da sessão — ver a entrada
+"BLOCKED BY PROVIDER CAPABILITY GAP". Normativa: [02] já admite `transport = api`; [07]
+"Decisões adiadas" prevê "CLI vs API … quando um adaptador não conseguir provar
+`execute_commands = disabled`". Nenhum conflito com docs/ADRs; nada em `docs/` alterado.
+
+**Dependências.** Removido `claude-agent-sdk==0.2.159`; adicionado exatamente `anthropic==1.11.0`
+(Python 3.11, wheel; traz `httpx2`, `httpcore2`, `jiter`, `docstring-parser`, `sniffio`,
+`truststore`). No venv, os 20 pacotes trazidos pelo SDK antigo foram removidos (o venv voltou a
+ser idêntico ao pré-E8.2) antes de instalar o novo. `pip check` limpo; dry-run limpo de `.[dev]`:
+sem `mcp`/`sse-starlette`/`claude-agent-sdk`; `fastapi 0.115.14`, `starlette 0.46.2`,
+`pydantic 2.13.5`, `anyio 4.14.2` inalterados.
+
+**Probe offline do SDK 1.11.0:** `importlib.metadata.version("anthropic") == "1.11.0"`;
+`AsyncAnthropic(api_key=, base_url=, max_retries=, http_client=)`; com `api_key` explícita o SDK
+não consulta `ANTHROPIC_API_KEY`/perfil/federação; com `base_url` explícito não consulta
+`ANTHROPIC_BASE_URL`; **mas sempre mescla `ANTHROPIC_CUSTOM_HEADERS`** nos headers (comprovado
+offline) — a factory real recusa o cliente se houver header customizado (fail closed).
+`httpx2.AsyncClient(trust_env=False)` suportado. `ToolChoiceAutoParam.disable_parallel_tool_use`,
+`ThinkingConfigAdaptiveParam(display="omitted")` e `OutputConfigParam.effort` suportados.
+`StopReason`: end_turn, max_tokens, stop_sequence, tool_use, pause_turn, refusal,
+model_context_window_exceeded. Toda server tool da `ToolUnionParam` tem `type` próprio.
+
+**Pacote `app/agent_runtime/adapters/anthropic_messages/`** (único que importa `anthropic`/
+`httpx2`; dentro dele só `transport.py` e `provider.py` o fazem): identidade
+`anthropic-messages-api` / `ff1-sdk1.11.0` / `api`; STANDARD→`claude-sonnet-5-5`,
+STRONG→`claude-opus-5-5`; MEDIUM/HIGH→`output_config.effort` medium/high;
+`thinking={"type":"adaptive","display":"omitted"}`;
+`tool_choice={"type":"auto","disable_parallel_tool_use":true}`; endpoint explícito
+`https://api.anthropic.com`; `max_retries=0`; `trust_env=False`. Nove client tools
+`{name, description, input_schema}` (`additionalProperties:false`), zero server tools.
+`PreparedAnthropicMessagesConfig` (imutável; versão, papel, identidade, SDK, endpoint, retries,
+trust_env, model, effort, thinking, hash do system prompt, superfície/nomes/`tool_schema_hash`,
+server_tools=[], `dispatcher_contract_version=ff-client-tools-v1`, tool choice, paralelismo,
+`request_surface_version`, perfil efetivo) → `execution_config_hash` via `canonical_sha256`; nada
+transiente nem secreto. `AnthropicMessagesRequestPlan` separa o estático aprovado (JSON canônico
+numa `str`) do dinâmico (messages, max_tokens restante, timeout restante).
+`AnthropicRuntimeBundle` = config + plano + `CANONICAL_DISPATCHER`.
+
+**Declaração:** `API_TOOL_SCHEMA`; supported == effective == Developer V1 ([04] §1: pela API o
+modelo não age sozinho; o adaptador só oferece/despacha as nove operações; server tools ficam fora
+da superfície e são recusadas). **Verificador** `AnthropicMessagesCapabilityVerifier`: observa o
+bundle real contra constantes próprias (identidade, `api`, versão pela metadata no `verify`,
+endpoint, retries, trust_env, chaves exatas do request, system prompt, thinking, tool choice,
+effort, modelo, exatamente as nove client tools sem `type`/chave extra, dispatcher de tipo exato e
+instância canônica, hash do plano), recomputa o hash do observado e confere a declaração;
+negativos tipados; exceção para defeito técnico. O esperado vem do binding/effort aprovados + config
+preparada (`developer_wiring.prepare_developer_security_context`), nunca de proof/observação.
+
+**Provider** `AnthropicMessagesDeveloperProvider` (vinculado ao bundle; factory sem estado;
+transporte por porta, fake em testes; credencial por injeção em `AnthropicApiTransportFactory`,
+sem leitura de ambiente; wiring de segredo = E8.4). Loop manual: create → inspeção → um
+`tool_use` → dispatcher → `MediatedTools.execute` → `tool_result` → create. Falha de protocolo =
+`ERROR` sem executar (bloco de server tool, nome desconhecido, >1 tool_use, caller de server tool,
+end_turn com tool_use, stop_reason ≠ end_turn/tool_use). `max_tokens` = orçamento de saída do run
+(cada chamada recebe o restante; sem `usage`, desconta o máximo permitido). Tokens: soma de
+`input_tokens`/`output_tokens`; cache não somado; turno sem usage → `unavailable`. Thinking só nas
+messages efêmeras do run. `files_read=None/unavailable`.
+
+**Findings da auditoria:**
+- **AUD-001 — RESOLVED BY ARCHITECTURAL REPLACEMENT.** Sem MCP. O dispatcher local canônico é
+  vinculado no bundle e verificado por tipo exato + identidade; o provider reverifica e executa o
+  mesmo bundle. Contraprova: `SentinelDispatcher` com a mesma superfície/schemas/config hash →
+  `NotVerified`; provider com ele → `BLOCKED`, zero requests, zero despachos.
+- **AUD-002 — RESOLVED BY ARCHITECTURAL REPLACEMENT.** Sem runtime Claude Code: nada de managed
+  settings/hooks/MCP/plugins/skills/subagents/CLAUDE.md na cadeia. Gates: nenhum import de
+  `claude_agent_sdk`/`mcp`, adaptador sem `subprocess`/`os`/`process_runtime`, sem strings de
+  Claude Code; `pyproject` sem `claude-agent-sdk`. Nenhum probe de managed policy implementado.
+- **AUD-003 — RESOLVED.** Deadline absoluta nasce no início do `run` (antes do verify/transporte)
+  e governa todo o loop; cada request recebe `timeout = restante`; o `CancelToken` é observado
+  antes da 1ª chamada, durante chamadas em voo (poll de 20 ms — o protocolo só expõe
+  `is_cancelled()`), antes/depois de cada ferramenta e no follow-up; a task em voo é cancelada.
+  Event loop privado em thread própria (não daemon); `aclose` limitado por `CLEANUP_GRACE_S=2.0`
+  (só desligamento), tasks canceladas, loop fechado, `join` com prazo; fechamento não confirmado
+  nunca vira `OK`. Testes: timeout na 1ª chamada, timeout no follow-up pela deadline original,
+  resposta lenta, ferramenta lenta, cancel em voo/follow-up/ferramenta, close pendurado — nenhuma
+  thread `ff-anthropic-messages*` viva após cada teste (fixture autouse).
+
+- Arquivos removidos da candidata: `adapters/claude_sdk/{__init__,config,constants,launch,provider,
+  tool_surface,verifier}.py`, `tests/test_claude_developer_adapter_e8_2.py`. Novos:
+  `adapters/anthropic_messages/{__init__,constants,tool_surface,dispatcher,config,request_plan,
+  verifier,transport,provider}.py`, `tests/test_anthropic_messages_developer_adapter_e8_2.py`
+  (251 testes). Reescritos: `developer_wiring.py` (`AnthropicDeveloperBindingResolver`),
+  `main.py`, `pyproject.toml`. Testes pré-existentes atualizados para o novo resolver/adaptador:
+  `test_architecture.py` (anthropic/httpx2 só no adaptador), `test_capability_enforcement_e7_6.py`,
+  `test_e6_audit_round_1/2.py`, `test_e6_cons4.py`, `test_model_router_binding_e8_1.py`.
+- Mutantes N1–N12 (server web_search, dispatcher sentinela, effort fora do hash, api→cli,
+  endpoint custom, STANDARD→Opus, `open()` no handler, `claude-agent-sdk` de volta, deadline nova
+  por turno, cancel sem interromper a chamada, thinking no summary, fallback de nome
+  desconhecido): todos detectados, arquivos restaurados com SHA-256 idêntico.
+- Gates (Windows, Python 3.11): E8.2 251; E8.1 90; E7.6 117; E7.2 87; E7.1 96;
+  router/fingerprint 61; planner 45; state_machine 138; api_tasks 51; e6 r1 32, r2 24, cons4 28;
+  architecture 278 — direcionados 1298 passed; **backend completo 4185 passed, 20 skipped
+  (plataforma), 0 failed (22m51s)**; `ruff check`, `ruff format --check`, `mypy` e
+  `mypy --platform linux` (185 arquivos) limpos; `pip check` limpo; `git diff --check` limpo. CI
+  Linux não rodou.
+- Residuais: a resolução DNS do `httpx2`/`anyio` roda no executor do loop; sob cancelamento, uma
+  thread `…-io` dentro de `getaddrinfo` só termina quando a chamada do SO retorna (não faz trabalho
+  do agente; executor encerrado com `cancel_futures`) — não exercitado em teste (sem rede); a
+  checagem de headers lê o atributo privado `_custom_headers` do SDK fixado; ferramenta mediada em
+  execução não é interrompida pela deadline (limites próprios do `ToolExecutor`); sem limite
+  normativo de turnos (limitado por deadline + orçamento); `input_tokens` exclui cache;
+  `max_tokens` interpretado como orçamento de **saída** (as docs só dizem "limite do run"); o
+  provider garante a coerência interna do bundle — a E8.4 deve executar o `runtime_bundle` do
+  contexto de segurança aprovado; sem proteção contra Python hostil no processo.
+
+## 2026-10-05 — Claude Opus 5.5 (effort: high) — E8.2 corrections — AUD-003/AUD-004/AUD-005/AUD-006 — candidate
+
+Branch `e8/02-claude-developer-adapter`, HEAD `43101cd` (E8.2 segue **não commitada**). Inventário
+antes: 23 arquivos (11 M + 12 novos), SHA-256 capturados; depois: 25 (12 M + 13 novos — novos
+`adapters/anthropic_messages/sdk_logging.py`; modificado `docs/architecture/05-provider-contracts.md`
+pelo addendum autorizado). Transport, adapter (`anthropic-messages-api`/`ff1-sdk1.11.0`/`api`) e
+dependência (`anthropic==1.11.0`) inalterados; nenhuma dependência nova. AUD-001/AUD-002
+originais preservados. Sem commit/push/PR/merge; **nenhuma chamada à API real, nenhuma API key,
+nenhum crédito**. E8.3/E8.4/E9 não iniciadas.
+
+**Decisão do Product Owner (tokens) e addendum.** `docs/architecture/05` §6 ganhou o "Addendum E8.2 —
+orçamento de tokens" (aditivo, 22 linhas; nada reescrito, ADRs intocados; [03] §6 já dizia
+`max_total_tokens = por task`, sem contradição): `RunLimits.max_tokens` = total de **um** provider
+run (input total — com `cache_creation_input_tokens` e `cache_read_input_tokens` — + output);
+`max_total_tokens` = por task; E8.4 aloca o restante da task a cada run; `max_tokens` da request
+Anthropic = só teto de output daquela request; `messages.count_tokens` = preflight, não dupla
+contagem; orçamento insuficiente → não enviar e devolver condição de orçamento (persistência de
+`SafetyEvent(limit_exceeded)` = E8.4); `AgentRunResult.input_tokens` = input total do run.
+
+**AUD-004 (P1) — request executada ≠ request verificada.** Causa: o verificador olhava
+`static_params()`/`plan_hash()` e o provider usava `request_kwargs()` (método sobrescrevível); e
+`run` relia `self._bundle` depois do verify. Correção: plano, bundle, config, dispatcher e
+provider são **finais em runtime** (`__init_subclass__` recusa subclasse) e exigidos por **tipo
+exato** (`require_exact_plan`/`require_exact_bundle`, verificador `_exact_types_hold`); os
+métodos de montagem foram removidos — o request sai de **funções de módulo**
+(`build_input_params` → `build_count_tokens_kwargs`/`build_create_kwargs`, `plan_static_params`,
+`plan_hash`) sobre a `str` canônica `params_json`, sempre materializando payload novo (inclusive
+cópia profunda das messages); `count_tokens` e `create` saem da mesma função. O provider é
+imutável (`__slots__` + `__setattr__` recusado), lê `self._bundle` **uma vez** e passa a
+referência local a verify, montagem, dispatcher e loop. `AnthropicApiTransport` é ponte fina
+(`return await self._client.messages.<x>(**request)`, travado por AST).
+
+**AUD-005 (P1) — logging do SDK.** Causa: o SDK 1.11.0 loga `Request options` (com `json_data`/
+messages) em `anthropic._base_client` sob DEBUG (via `ANTHROPIC_LOG`, lido na importação, ou
+configuração externa); `httpcore2` loga trace. Correção: `sdk_logging.py` — `ANTHROPIC_LOG`
+presente e não vazio → `SdkLoggingRefused` antes de montar o cliente (única leitura de ambiente do
+adaptador); `AnthropicSdkLoggingGuard` (stdlib, lock de processo + profundidade) desliga
+`anthropic*`/`httpx2*`/`httpcore2*` (`disabled` nos existentes, nível > CRITICAL nas raízes
+para os criados durante o run) do início ao fim do run (abertura, count, create, close), confere
+o logger real `anthropic._base_client.log` (estrutura inesperada → recusa) e restaura nível e
+`disabled` na saída, inclusive em exceção. `sdk_logging_policy = "suppressed-v1"` na config.
+Prova: SDK real 1.11.0 servindo pelo transporte HTTP do `httpx2` monkeypatchado (offline), root
+e loggers do SDK em DEBUG com handler em memória: o SDK serializou prompt/thinking/assinatura
+sentinela nos corpos enviados e **nenhum** registro os contém; controle negativo sem a guarda vaza
+a sentinela (o detector é real).
+
+**AUD-003 (P2) — construção do cliente fora da supervisão.** Causa: factory síncrona no `run`
+antes do worker; o `AsyncAnthropic` base lê `<config_dir>/active_config` mesmo com `api_key`
+explícita (`_warn_env_shadow` → `_has_auto_discoverable_credentials`, só para a classe base
+exata via `_is_base_client`). Correção: o transporte é aberto por **opener assíncrono** executado
+dentro do event loop do run, sob a mesma deadline e cancelamento (gate AST: o opener só é chamado
+em `_open`); produção usa `ExplicitAsyncAnthropic` (subclasse sem corpo — o mecanismo que o próprio
+SDK usa para AWS/Google sair da cadeia de descoberta): teste prova que a construção não chama
+`_read_active_config_pointer`/`_has_auto_discoverable_credentials`/`default_credentials` (e que a
+classe base chama). `client_construction_policy = "explicit-no-discovery-v1"`. Setup de 8 s com
+`timeout_s=1` → `TIMEOUT` perto de 1 s, abertura cancelada, nenhuma thread viva.
+
+**AUD-006 (P2) — semântica de `max_tokens`.** Implementada a decisão acima: antes de cada `create`,
+`count_tokens` do input exato; `previsto ≥ restante` → não chama `create`, `BLOCKED` com
+`error_summary = BUDGET_EXHAUSTED`; senão `create(max_tokens = restante − previsto)`; contabilidade
+pelo `usage` real (input + cache creation + cache read + output); sem `usage` confiável → `ERROR`
+`unavailable`, sem continuar; consumo real > restante → `BLOCKED`, sem continuar; `stop_reason =
+max_tokens` → `BLOCKED`; falha/timeout/cancel no count → `ERROR`/`TIMEOUT`/`CANCELLED` (nunca
+limite). Exemplo 1000/600→400/750/250/240→10 executado em teste. `token_budget_policy =
+"run-total-input-output-v1"` na config. Sem limite de turnos (deadline + orçamento).
+
+- Testes: E8.2 298 (inclui AUD-004 subclasse/gêmeo/troca de bundle/mutação aninhada/bundle
+  verificado = executado/ponte fina; AUD-005 sentinelas com SDK real, ANTHROPIC_LOG
+  debug/info/warning/1, restauração normal e em exceção, concorrência, estrutura inesperada;
+  AUD-003 descoberta, setup bloqueado, cancel no setup, timeout e cancel em count/create inicial e
+  follow-up, cleanup limitado, thread morta; AUD-006 todos os itens pedidos). Mutantes C1–C12
+  (+C1b) e regressão N1–N12: 25/25 detectados, arquivos restaurados com SHA-256 idêntico.
+- Gates (Windows, Python 3.11): direcionados 1347 passed (E8.2 298, E8.1 90, E7.6 117, E7.2 87,
+  E7.1 96, router 61, planner 45, state_machine 138, api_tasks 51, e6 r1 32/r2 24/cons4 28,
+  architecture 280); **backend completo 4234 passed, 20 skipped (plataforma), 0 failed (24m45s)**;
+  `ruff check`, `ruff format --check`, `mypy`, `mypy --platform linux` (186 arquivos) limpos;
+  `pip check` limpo; dry-run de `.[dev]`: `anthropic 1.11.0`, `fastapi 0.115.14`, `starlette
+  0.46.2`, sem MCP/Agent SDK; `git diff --check` limpo. CI Linux não rodou.
+- Residuais reavaliados: (1) DNS do `httpx2`/`anyio` no executor do loop — inalterado; (2) atributos
+  privados do SDK fixado agora são três (`_custom_headers`, `_is_base_client` via subclasse,
+  `anthropic._base_client.log` conferido pela guarda) — mudança de estrutura falha fechada nos
+  dois últimos casos verificáveis; (3) ferramenta mediada síncrona não é interrompida pela deadline
+  — inalterado; (4) **novo**: na primeira abertura do cliente num processo Windows/CPython 3.11, o
+  `import truststore` chama `platform.system()` → `win32_ver()` → `cmd /c ver` (uma vez por
+  processo, em cache; sem rede/configuração) — ocorre dentro do worker supervisionado, mas é IO
+  síncrono local não preemptível; (5) `BLOCKED` por orçamento é distinguido pelo `error_summary`
+  (`BUDGET_EXHAUSTED`) — o DTO não tem código de motivo; (6) a guarda silencia todo log do
+  SDK durante o run, inclusive avisos legítimos.
+
+## 2026-10-05 — Claude Opus 5.5 (effort: high) — E8.2 corrections — AUD-003/AUD-007/AUD-008 — AUD-003 BLOCKED BY API PROVIDER LIFECYCLE GAP
+
+Branch `e8/02-claude-developer-adapter`, HEAD `43101cd` (E8.2 segue **não commitada**). Inventário
+antes: 25 arquivos (12 M + 13 novos), SHA-256 capturados; depois: 29 (15 M + 14 novos — novo
+`adapters/anthropic_messages/token_accounting.py`; modificados `agent_runtime/dto.py`,
+`agent_runtime/__init__.py`, `tests/test_agent_runtime_contracts_e7_2.py`). Transport/adapter/pin
+inalterados (`anthropic==1.11.0`, `anthropic-messages-api`, `ff1-sdk1.11.0`, `api`); nenhuma
+dependência nova. Sem commit/push/PR/merge; **nenhuma chamada à API real, nenhuma API key,
+nenhum crédito**. E8.3/E8.4/E9 não iniciadas.
+
+**Addenda aprovados pelo Product Owner** (aditivos em `docs/architecture/05` §6; nada reescrito;
+ADRs intocados): (A) motivo de falha estruturado; (B) prompt cache desligado no Developer
+Messages API V1.
+
+**AUD-007 — FECHADO.** `agent_runtime/dto.py`: `RunFailureReason` (neutro; só `LIMIT_EXCEEDED =
+"limit_exceeded"`); `AgentRunResult.failure_reason: RunFailureReason | None = None`; invariantes:
+`ok` ⇒ `None`, `limit_exceeded` ⇒ `blocked`, demais status aceitam `None`; fora do fingerprint.
+Provider: todos os caminhos de orçamento (previsto ≥ restante, uso real > restante,
+`stop_reason=max_tokens`, orçamento zerado) devolvem `BLOCKED` + `LIMIT_EXCEEDED`; o texto de
+`error_summary` virou diagnóstico privado (`_ERR_BUDGET`), a constante pública `BUDGET_EXHAUSTED`
+foi removida, e um gate AST prova que nenhuma comparação em `app/` olha `error_summary` e que o
+`failure_reason` do provider só recebe o membro literal do enum. Bloqueios de segurança seguem
+`failure_reason=None`. E8.4 deve decidir por `failure_reason`, nunca por texto.
+
+**AUD-008 — FECHADO.** `prompt_cache_policy = "disabled"` na config preparada (entra no
+`execution_config_hash`) e na evidência (`prompt_cache=disabled`). `has_cache_control_key` (puro;
+só a **chave** estrutural em dict/list/tuple — texto literal "cache_control" passa); o construtor
+canônico (`build_input_params`) recusa (`CacheControlRejected`) qualquer `count_tokens`/`create`
+com a chave em nível algum; o verificador recusa a superfície estática com a chave; blocos de
+resposta com a chave não são reenviados. `token_accounting.py`: fórmula geral pura
+(`turn_total_tokens`, `next_output_cap`) separada de `normalize_usage_for_disabled_cache`, que só
+sob a política `disabled` trata ausente/`None` como 0, aceita 0 explícito, falha
+(`PromptCacheActivity` → run `ERROR`, sem continuar) com cache > 0 e recusa qualquer outra
+política (`UnsupportedPromptCachePolicy`). Exemplo 1000/600/750/250 preservado como teste de
+fórmula pura (com cache 100/200) e como teste runtime (cache desligado).
+
+**AUD-003 — PARCIAL; BLOCKED BY API PROVIDER LIFECYCLE GAP.** Cadeia real no pin (Windows/CPython
+3.11): `platform.uname()` → `win32_ver()` → `_syscmd_ver()` → `subprocess.check_output("cmd /c
+ver")` (sem timeout; o `cmd` ainda executa `AutoRun` do registro), alcançada por três caminhos.
+Eliminados com APIs públicas: (1) `httpx2.create_ssl_context` faz `import truststore`
+incondicional → substituído por `explicit_tls_context()` (stdlib `SSLContext(PROTOCOL_TLS_CLIENT)`,
+`CERT_REQUIRED` + hostname, TLS ≥ 1.2, CAs do sistema via `ssl.enum_certificates`/caminhos
+compilados do OpenSSL, sem `SSL_CERT_FILE`/`SSL_CERT_DIR`) em `httpcore2.AsyncConnectionPool(ssl_
+context=…)` dentro de `ExplicitTlsTransport`, passado ao `httpx2.AsyncClient(transport=…)`;
+(2) o `asyncify(get_platform)` do SDK (thread) e (3) `get_architecture()`/`platform.machine()` →
+`ExplicitAsyncAnthropic` fixa `_platform` e `platform_headers()` por `sys.platform`/`sysconfig`.
+Audit hook na construção + count + create + close de produção (caminhos antigos bloqueados
+artificialmente): **0 subprocesso, 0 socket, 0 leitura de config**; 3 `open` + 1 `listdir`, todos
+`.pyc` de imports preguiçosos (anyio, queue). **Resta, sem configuração pública no pin:**
+`import httpcore2` → `httpcore2/_ssl.py: import truststore` → `truststore/_api.py:19
+platform.system()`. Num processo com `uname` frio, isso roda `cmd /c ver` na primeira abertura do
+transporte (dentro do worker supervisionado, mas não preemptível) — teste de evidência em
+subprocesso frio confirma 1 `Popen`. No processo da aplicação o `uname` já é resolvido no import de
+`app.main` (o SQLAlchemy chama `platform.machine()` em `sqlalchemy/util/compat.py`, comportamento
+pré-existente desde a E2), então ali o caminho não roda — efeito colateral de outra biblioteca, não
+garantia do adaptador. `import httpcore2` ficou preguiçoso (não foi levado ao startup).
+Menor alternativa (decisão humana): autorizar explicitamente que o adaptador garanta o
+`platform.uname()` resolvido antes do primeiro run (p.ex. pré-condição fail-closed que recusa
+abrir o transporte se o cache estiver frio, ou import do stack HTTP no import do adaptador), ou
+aceitar o residual documentado, dado que o startup já executa a mesma chamada via SQLAlchemy.
+
+- Testes: E8.2 331 (inclui F1/F2 audit hook com caminhos proibidos, TLS seguro e independente do
+  ambiente, cliente sem descoberta/plataforma, estrutura do pin, worker morto após erro de setup
+  real, evidência do residual; AUD-007 F1–F3 + gates; AUD-008 F1–F6); E7.2 97 (+10:
+  `RunFailureReason` e invariantes); architecture 282. Mutantes: F1–F8, F10, F11 detectados; **F9
+  (remover só a varredura de `cache_control` no verificador) é equivalente** — a igualdade exata das
+  tools e o hash observado/do plano continuam recusando; F9b (remove as três camadas) detectado;
+  C1–C12 + C1b e N1–N12 detectados; todos restaurados com SHA-256 idêntico.
+- Gates (Windows, Python 3.11): direcionados 1392 passed; **backend completo 4279 passed, 20
+  skipped (plataforma), 0 failed (29m33s)**; `ruff check`, `ruff format --check`, `mypy`, `mypy
+  --platform linux` (187 arquivos) limpos; `pip check` limpo; dry-run de `.[dev]` com
+  `anthropic 1.11.0`, `starlette 0.46.2`, sem MCP/Agent SDK/sse-starlette; `git diff --check`
+  limpo. CI Linux não rodou.
+- Residuais: o caminho `import httpcore2 → truststore → platform.system()` acima (bloqueio);
+  **achado fora do escopo**: o startup da aplicação (`import app.main` → SQLAlchemy) já executa
+  `cmd /c ver` no Windows/3.11 — inclusive `AutoRun` do `cmd` se configurado; DNS do `anyio` no
+  executor (inalterado); atributos privados do pin agora usados: `_custom_headers`,
+  `_is_base_client` (via subclasse), `_platform`, `anthropic._base_client.log`,
+  `AsyncHTTPTransport._pool` (estrutura travada por teste); ferramenta mediada síncrona não
+  preemptível (inalterado).
+
+## 2026-10-05 — Claude Opus 5.5 (effort: high) — E8.2 AUD-003 final transport correction — aiohttp — BLOCKED BY API PROVIDER LIFECYCLE GAP
+
+Branch `e8/02-claude-developer-adapter`, HEAD `43101cd` (E8.2 segue **não commitada**). Inventário
+antes: 29 arquivos (15 M + 14 novos), SHA-256 capturados; depois: idênticos, exceto este
+`AGENT_LOG.md`. **Nenhum código, teste, doc ou `pyproject.toml` alterado**; `adapter_version`
+permanece `ff1-sdk1.11.0` (o bump para `ff2` só faz sentido com a troca de backend, que não foi
+feita). Sem commit/push/PR/merge; nenhuma chamada à API real, nenhuma API key. E8.3/E8.4/E9 não
+iniciadas.
+
+**Decisão do Product Owner avaliada:** `anthropic==1.11.0` → `anthropic[aiohttp]==1.11.0`, com
+`DefaultAioHttpClient(transport=<transporte aiohttp seguro>)`. Inspeção do pin real (extra
+instalado temporariamente no venv, fora do repo: aiohttp 3.14.4 + aiohappyeyeballs, aiosignal,
+attrs, frozenlist, multidict, propcache, yarl):
+- `DefaultAioHttpClient` = `Httpx2AiohttpClient` vendored (httpx-aiohttp 0.2.0, BSD-3);
+  `_init_transport(transport=…)` devolve o transporte dado — o escape hatch público existe, e com
+  `trust_env=False` não há mounts de proxy.
+- O `AiohttpTransport` padrão chama `httpx2.create_ssl_context` → `import truststore` (provado em
+  processo frio) — inaceitável sozinho, como previsto.
+- **Bloqueio:** `aiohttp/helpers.py:57-58` executa `platform.system()` no nível do módulo
+  (`IS_MACOS`/`IS_WINDOWS`; idem `web_urldispatcher.py:83`). No Windows/CPython 3.11 isso é
+  `uname()` → `win32_ver()` → `_syscmd_ver()` → `cmd.exe /c "ver"` (traceback capturado por audit
+  hook). E como `anthropic/_base_client.py` faz `try: from ._vendor import httpx_aiohttp` no import,
+  **com o extra instalado o simples `import anthropic` passa a rodar `cmd /c ver`** em processo
+  frio (1 Popen) — inclusive no caminho httpx2 atual. Com transporte próprio,
+  `truststore`/`httpcore2` ficam fora de `sys.modules`, mas o Popen do import do aiohttp persiste.
+  Não há configuração pública que evite; as saídas (cache de `uname`, prewarm, aceitar residual)
+  foram vetadas pelo PO.
+- Linha de base sem o extra (estado atual): import frio de `anthropic` + adaptador = 0 Popen, sem
+  `httpcore2`/`truststore`/`aiohttp`; `import ssl, asyncio, httpx2` frio = 0 Popen.
+- O venv foi restaurado ao declarado no `pyproject.toml` (os 8 pacotes desinstalados; nenhum
+  existia antes); `pip check` limpo.
+
+Alternativas para decisão humana (nenhuma escolhida): transporte HTTP/1.1 mínimo próprio sobre
+`asyncio` streams + `ssl` da stdlib, usando `httpx2` só para o contrato
+`AsyncBaseTransport`/`Request`/`Response` (sem dependência nova; superfície security-relevant
+própria); ou runtime CPython ≥ 3.12 (`win32_ver` consulta WMI no processo antes do fallback `ver`;
+exigiria medição). Achado fora do escopo (já registrado): o startup (`import app.main` →
+SQLAlchemy) roda `cmd /c ver` no Windows/3.11 — não usado como mitigação.
+
+## 2026-10-05 — Claude Opus 5.5 (effort: high) — E8.2 final audit — GREEN
+
+Branch `e8/02-claude-developer-adapter`, base `43101cd`. As entradas anteriores desta fase —
+inclusive "E8.2 AUD-003 final transport correction — aiohttp — BLOCKED BY API PROVIDER LIFECYCLE
+GAP" — permanecem como registro histórico; esta entrada as sucede.
+
+- **Auditoria independente final: GREEN.** Zero P0, zero P1, zero P2 novos ou reabertos.
+  AUD-001 e AUD-002: resolved by architectural replacement (pivô para a Messages API).
+  AUD-004, AUD-005, AUD-006, AUD-007, AUD-008: resolved.
+- **AUD-003 reclassificado: RESIDUAL ACCEPTED — HOST/RUNTIME**, por decisão vinculante do Product
+  Owner (Pedro). `execute_commands=disabled` significa que o Developer/modelo não recebe autoridade
+  sobre comandos/processos cuja seleção, argv, conteúdo, dados ou disparo possa controlar;
+  subprocessos fixos de infraestrutura/runtime sem influência do agente (aqui, a sonda
+  `cmd /c ver` do `platform.uname()` no Windows/CPython 3.11) são risco do host, não capability do
+  Developer. Hardening destinado à **E14**. Não é autorização genérica de subprocesso.
+- Arquivos alterados nesta rodada: `docs/architecture/04-safety-and-git-runtime.md` (adendo
+  aditivo autorizado após "Modos de enforcement", §1) e este `AGENT_LOG.md`. **Zero mudança
+  funcional**; ADRs intocados.
+- Candidata final (inventário): 30 arquivos — 16 modificados (`AGENT_LOG.md`,
+  `docs/architecture/04` e `05`, `api/pyproject.toml`, `api/app/main.py`, `api/app/api/tasks.py`,
+  `api/app/agent_runtime/__init__.py` e `dto.py`, 8 testes existentes) + 14 novos (pacote
+  `api/app/agent_runtime/adapters/anthropic_messages/` com 11 módulos + `adapters/__init__.py`,
+  `api/app/developer_wiring.py`, `api/tests/test_anthropic_messages_developer_adapter_e8_2.py`).
+  `anthropic==1.11.0`, `anthropic-messages-api`, `ff1-sdk1.11.0`, transport `api`; sem extra
+  aiohttp, sem `ff2`, sem Claude Agent SDK/MCP.
+- Gates locais do Developer (reportados antes): backend completo 4279 passed / 20 skipped;
+  1392 direcionados; ruff, format, mypy, mypy --platform linux e pip check verdes. Nesta rodada:
+  917 testes direcionados (E8.2, E7.2, E8.1, E7.6, architecture) passed; ruff, format --check,
+  mypy, mypy --platform linux (187 arquivos), pip check e `git diff --check` verdes.
+- Limitações da auditoria independente: reproduziu 378 testes reais e 63 contraprovas isoladas
+  em Windows; não exercitou runtime Linux nem a API real (sem chave, sem crédito, por desenho).
+- **CI ainda requerido** (Linux real só é validado no CI). Commit/push/PR autorizados nesta
+  rodada; merge NÃO autorizado. E8.3, E8.4 e E9 não iniciadas; roadmap não marcado como merged.
