@@ -5,6 +5,10 @@ Adaptadores (Claude Code, Codex) e o supervisor de processos são etapas posteri
 
 A E7.6 acrescenta `verification`: a porta `CapabilityVerifier`, distinta da declaração, que
 observa de forma independente o que foi aplicado. Nenhuma implementação existe em produção.
+
+A E8.3 acrescenta `TestRunnerFailure`/`TestRunnerFailureCode` (falha estruturada do runner) e
+o runner concreto em `agent_runtime/runners/` — infraestrutura do sistema, **não** ferramenta
+do Developer; não é reexportado aqui, é ligado pelo composition root.
 Ver `docs/architecture/05-provider-contracts.md`.
 """
 
@@ -29,6 +33,8 @@ from app.agent_runtime.dto import (
     RunReport,
     RunStatus,
     TestRequest,
+    TestRunnerFailure,
+    TestRunnerFailureCode,
     TestSummary,
     TokenSource,
 )
@@ -82,6 +88,8 @@ __all__ = [
     "RunStatus",
     "TestRequest",
     "TestRunner",
+    "TestRunnerFailure",
+    "TestRunnerFailureCode",
     "TestSummary",
     "TokenSource",
     "ToolExecutor",

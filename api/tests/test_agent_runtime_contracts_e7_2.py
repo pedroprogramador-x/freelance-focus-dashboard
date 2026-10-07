@@ -329,7 +329,13 @@ def test_campos_de_audit_e_test_batem_com_05() -> None:
         "limits",
         "cancel_token",
     }
-    assert dataclass_fields(TestRequest) == {"workspace_ref", "test_policy", "cancel_token"}
+    # Addendum E8.3 de [05] §6: `run_scope` liga o request ao binding físico **deste** run.
+    assert dataclass_fields(TestRequest) == {
+        "workspace_ref",
+        "run_scope",
+        "test_policy",
+        "cancel_token",
+    }
     assert dataclass_fields(TestSummary) == {
         "framework",
         "exit_code",
@@ -475,6 +481,19 @@ def test_test_summary_recusa_contadores_invalidos() -> None:
         TestSummary("pytest", 0, -1, 0, 0, 1, None)
     with pytest.raises(ContractViolation):
         TestSummary("pytest", True, 1, 0, 0, 1, None)
+    # Addendum E8.3: contadores são todos `int >= 0` **ou** todos `None` — nunca mistura.
+    with pytest.raises(ContractViolation):
+        TestSummary("pytest", 0, None, 0, 0, 1, None)
+    with pytest.raises(ContractViolation):
+        TestSummary("pytest", 0, 1, None, None, 1, None)
+    with pytest.raises(ContractViolation):
+        TestSummary("pytest", 0, True, False, False, 1, None)
+
+
+def test_test_summary_aceita_contadores_todos_int_ou_todos_none() -> None:
+    assert TestSummary("pytest", 0, 3, 0, 1, 1, None).passed == 3
+    unknown = TestSummary("generic-subprocess-v1", 7, None, None, None, 1, None)
+    assert (unknown.passed, unknown.failed, unknown.skipped) == (None, None, None)
 
 
 def test_tokens_e_origem_precisam_concordar() -> None:
@@ -838,6 +857,7 @@ def make_request(**changes: Any) -> TestRequest:
     )
     fields: dict[str, Any] = {
         "workspace_ref": workspace(),
+        "run_scope": RunScope("t1", "r1", "i1"),
         "test_policy": policy,
         "cancel_token": Token(),
     }
@@ -861,6 +881,16 @@ def test_test_request_recusa_politica_que_nao_e_test_policy() -> None:
         make_request(test_policy=None)
     with pytest.raises(ContractViolation):
         make_request(cancel_token="x")
+
+
+def test_test_request_exige_run_scope() -> None:
+    """Addendum E8.3: sem `RunScope` não há binding — nem `None`, nem um id solto."""
+    with pytest.raises(ContractViolation):
+        make_request(run_scope=None)
+    with pytest.raises(ContractViolation):
+        make_request(run_scope="r1")
+    with pytest.raises(TypeError):
+        TestRequest(workspace(), make_request().test_policy, Token())  # type: ignore[call-arg, arg-type]
 
 
 # ------------------------------------------------- addendum E8.2: motivo de falha estruturado

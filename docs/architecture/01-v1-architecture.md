@@ -168,6 +168,19 @@ Na ordem interna de L1, `process_runtime` é folha (nenhuma dependência de proj
 | **Direções** | `tool_executor → git_runtime` (já permitida); `git_runtime → process_runtime` (este adendo e o da E7.4); `git_runtime` **não** importa `tool_executor` nem `path_runtime`; `process_runtime` continua folha. Nenhum ciclo. |
 | **Provider** | Nada muda para o provider: continua sem `argv`, flag, subcomando, config ou ambiente; `ToolRequest` continua com as **nove** operações; não existe `ExecCommand`; `execute_commands = disabled` permanece sem exceção. |
 
+#### Adendo autorizado — E8.3 (2026-10-06): Test Runner e verificação pós-execução
+
+> Adendo aprovado por Pedro (decisões D1 e D10 da E8.3). **Estritamente aditivo**: nenhuma outra
+> linha desta seção muda. As regras de segurança correspondentes estão no adendo E8.3 de
+> [04](04-safety-and-git-runtime.md) §7.
+
+| | |
+| --- | --- |
+| **Aresta prevista, agora criada** | `agent_runtime → process_runtime`, **somente** no Test Runner concreto (`agent_runtime/runners/local_subprocess.py`). Nenhum adaptador de provider importa `process_runtime`. O runner também confere o binding do run por `tool_executor.workspace.bind_workspace` — a **mesma** função que a `ToolExecutorFactory` usa (extraída dela, sem mudar ordem nem códigos); nenhum adaptador de provider vê o `ResolvedWorkspace`. |
+| **Nova camada neutra** | `execution_verification.py` — verificação pós-execução. **Pode importar**: `git_runtime`, `path_runtime`, `safety`, stdlib. **Não pode importar**: `db`, `api`, `orchestrator`, `agent_runtime`, `tool_executor`, `process_runtime`, FastAPI, SQLAlchemy, SDK de provider. Devolve um fato estruturado; não grava `SafetyEvent` nem muda estado. O Execution Manager o consumirá por injeção (E8.4). |
+| **Git** | As leituras novas (`main_tree_state`, `worktree_changes`) e o orçamento (`VerificationBudget`) vivem em `git_runtime/post_execution.py`: `rev-parse` no runner de leitura do próprio `git_runtime` (com o *timeout* encurtado ao prazo restante), árvore/índice da worktree pelo Git mediado (`mediated.py`, sob o Supervisor) e o filesystem lido no Python — só leitura, `argv` fixo, sem `subprocess` novo fora de `git_runtime`/`process_runtime`. |
+| **Direções** | Sem ciclo: `execution_verification → {git_runtime, path_runtime, safety}`; `agent_runtime/runners → {process_runtime, tool_executor, safety}`; `process_runtime` continua folha. |
+
 #### `context_engine/` — conhecimento do workspace
 
 | | |

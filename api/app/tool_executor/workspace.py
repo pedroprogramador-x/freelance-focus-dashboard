@@ -14,6 +14,14 @@ voltou é exatamente deste run (defesa contra um resolvedor errado).
 Nesta etapa só existe o resolvedor em memória (`InMemoryWorkspaceResolver`), com binding
 **explícito**, instanciado por quem o usa. A ligação concreta a partir do `WorktreeOutcome` da
 E7.4 é integração da E8.
+
+## Uma só conferência do binding (E8.3)
+
+`bind_workspace` é a conferência que a factory fazia inline — kind, resolução pela chave
+`(workspace_ref, run_scope)`, tipo do que voltou, `base_commit`, workspace/task/run e a raiz
+vinculada (`bind_root` com a identidade registrada). Ela foi extraída **sem mudar a ordem nem
+os códigos** para que o `TestRunner` (E8.3), que também precisa achar a worktree **deste** run,
+use exatamente a mesma regra em vez de uma segunda implementação que pudesse divergir.
 """
 
 from __future__ import annotations
@@ -23,9 +31,11 @@ import threading
 from dataclasses import dataclass
 from typing import Protocol
 
+from app.path_runtime import BoundRoot, PathIntegrityViolation, PathOperationFailed, bind_root
 from app.safety.paths import PathForm, classify_path_form
 from app.safety.types import ObjectIdentity
-from app.tool_executor.contracts import ExecutionWorkspaceRef, RunScope
+from app.tool_executor.contracts import ExecutionWorkspaceRef, RunScope, WorkspaceKind
+from app.tool_executor.reasons import rule_for_integrity
 from app.tool_executor.validation import (
     ContractViolation,
     require_instance,
@@ -145,11 +155,67 @@ class InMemoryWorkspaceResolver:
             return self._bindings.get(key)
 
 
+@dataclass(frozen=True, slots=True)
+class BoundWorkspace:
+    """O binding conferido de **um** run e a raiz já vinculada. Interno, como o resolvido."""
+
+    resolved: ResolvedWorkspace
+    root: BoundRoot
+
+    def __repr__(self) -> str:  # nunca vazar o caminho em log/traceback
+        return "BoundWorkspace(<binding>)"
+
+
+def bind_workspace(
+    resolver: WorkspaceResolver, workspace_ref: ExecutionWorkspaceRef, run_scope: RunScope
+) -> BoundWorkspace:
+    """`(workspace_ref, run_scope)` → binding conferido e raiz vinculada, ou levanta. Fail closed.
+
+    1. `kind`: `REMOTE` é recusado na V1 (`UnsupportedWorkspace`) **antes** do resolvedor;
+    2. `resolver.resolve(workspace_ref, run_scope)` — a chave inclui o run, nunca só a ref;
+    3. o binding devolvido é conferido contra a ref **e** o run (tipo, `base_commit`,
+       workspace, task, run) — defesa contra um resolvedor errado;
+    4. `bind_root` — a raiz existe, é diretório, sem reparse e com a identidade registrada.
+
+    Os códigos são os mesmos que a factory sempre usou. Nada aqui consulta banco nem registry.
+    """
+    require_instance("workspace_ref", workspace_ref, ExecutionWorkspaceRef)
+    require_instance("run_scope", run_scope, RunScope)
+    if workspace_ref.kind is not WorkspaceKind.LOCAL_WORKTREE:
+        raise UnsupportedWorkspace("workspace_kind_unsupported")
+
+    resolved = resolver.resolve(workspace_ref, run_scope)
+    if resolved is None:
+        raise WorkspaceUnavailable("workspace_unbound")
+    if not isinstance(resolved, ResolvedWorkspace):
+        raise WorkspaceUnavailable("resolver_invalid")
+    if resolved.base_commit != workspace_ref.base_commit:
+        raise WorkspaceUnavailable("base_commit_mismatch")
+    if (
+        resolved.workspace_id != workspace_ref.id
+        or resolved.task_id != run_scope.task_id
+        or resolved.run_id != run_scope.run_id
+    ):
+        raise WorkspaceUnavailable("binding_mismatch")
+
+    try:
+        root = bind_root(resolved.workspace_path, expected_identity=resolved.root_identity)
+    except PathIntegrityViolation as violation:
+        raise WorkspaceUnavailable(
+            "root_unavailable", rule_id=rule_for_integrity(violation.category)
+        ) from None
+    except PathOperationFailed:
+        raise WorkspaceUnavailable("root_unavailable") from None
+    return BoundWorkspace(resolved=resolved, root=root)
+
+
 __all__ = [
+    "BoundWorkspace",
     "InMemoryWorkspaceResolver",
     "ResolvedWorkspace",
     "ToolExecutorError",
     "UnsupportedWorkspace",
     "WorkspaceResolver",
     "WorkspaceUnavailable",
+    "bind_workspace",
 ]

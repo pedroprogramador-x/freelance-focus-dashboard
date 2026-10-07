@@ -243,6 +243,38 @@ O Test Runner é **infraestrutura do sistema, não ferramenta do Developer**
 ([04](04-safety-and-git-runtime.md) §6). Executar testes executa código do projeto: sem
 isolamento de SO, isso permanece risco residual e **não** é confinamento.
 
+> **Addendum E8.3 — Test Runner V1** *(aditivo; autorizado pelo Product Owner em 2026-10-06)*
+>
+> * `TestRequest` ganha `run_scope: RunScope` (obrigatório): `workspace_ref`, `run_scope`,
+>   `test_policy`, `cancel_token`. `ExecutionWorkspaceRef` continua **sem** caminho de
+>   filesystem; o runner acha a worktree **deste** run pelo binding explícito
+>   `(workspace_ref, run_scope)`, nunca só pelo `workspace_ref.id`.
+> * `TestSummary.passed`/`failed`/`skipped` são `int | None`: os três `int >= 0` **ou** os três
+>   `None` (métricas desconhecidas). Mistura parcial é recusada.
+> * O runner da V1 é `generic-subprocess-v1` (o `framework` do `TestSummary`). Ele **não
+>   interpreta** a saída do processo: os três contadores saem `None`, e `exit_code` é a fonte
+>   autoritativa de sucesso/falha do comando. `runner_id` diferente é recusado; não há registry
+>   nem dispatch de runner.
+> * Processo que terminou com `exit_code != 0` é um `TestSummary` **legítimo** (teste/gate
+>   falhando, que a E8.4 levará a `needs_fix`), não falha técnica. Não há retry automático.
+> * Falha técnica ou de pré-condição levanta `TestRunnerFailure` com código estável
+>   (`TestRunnerFailureCode`: `unsupported_runner`, `invalid_policy`, `workspace_unavailable`,
+>   `executable_unavailable`, `invalid_environment`, `timeout`, `cancelled`,
+>   `supervision_failed`) e `tree_confirmed_dead`. A mensagem é só o código: sem `stdout`/
+>   `stderr`, caminho absoluto, valor de ambiente nem texto livre. Timeout e cancelamento são
+>   fatos distintos; quem mapeia para `Run.status`/estado da task/`SafetyEvent` é a E8.4.
+> * `output_ref = None` na V1: a saída não é persistida.
+> * O ambiente do processo de teste **não admite** credencial nem **localizador de credencial**
+>   (`DOCKER_CONFIG`, `KUBECONFIG`, `NETRC`, `GOOGLE_APPLICATION_CREDENTIALS`,
+>   `AWS_SHARED_CREDENTIALS_FILE`, `SSH_AUTH_SOCK`, `SSH_ASKPASS`, `GIT_ASKPASS`…) nem
+>   *connection string* com credencial (`DATABASE_URL` e afins), mesmo explicitamente
+>   allowlisted: o runner recusa (`invalid_environment`) antes de o processo nascer. É
+>   *enforcement* do runner; o `test_binding`/`policy_hash` e o `execution_fingerprint` V1 não
+>   mudam.
+> * A verificação pós-execução tem trabalho **limitado**: por operação (`capture`, `verify`),
+>   100 000 entradas, 1 GiB de bytes efetivamente lidos, 60 s e o cancelamento do run; orçamento
+>   esgotado nunca vira `VERIFIED` ([04](04-safety-and-git-runtime.md) §7, adendo E8.3).
+
 ## 7. Papéis
 
 | Papel | Agente | Faz | Não faz |

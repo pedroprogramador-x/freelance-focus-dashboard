@@ -37,6 +37,11 @@ class AuditorProvider(Protocol):
 
 
 class TestRunner(Protocol):
-    """Infraestrutura do sistema, **não** ferramenta do Developer ([04] §6)."""
+    """Infraestrutura do sistema, **não** ferramenta do Developer ([04] §6).
+
+    Addendum E8.3: processo que terminou normalmente devolve `TestSummary` — inclusive com
+    `exit_code != 0`. Falha técnica ou de pré-condição levanta `TestRunnerFailure` (código
+    estruturado, sem texto livre). Nenhum `TestSummary` é inventado para um timeout.
+    """
 
     def run(self, request: TestRequest) -> TestSummary: ...
