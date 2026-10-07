@@ -199,10 +199,28 @@ def no_leak(*texts: object) -> None:
         assert SENTINEL not in str(text) and SENTINEL not in repr(text)
 
 
+#: O filho registra DUAS coisas distintas: `env` é o `os.environ` do interpretador **já
+#: inicializado** (o runtime pode ter acrescentado variáveis suas — no POSIX, a coerção de locale
+#: do CPython põe `LC_CTYPE=C.UTF-8` quando o ambiente não define locale); `initial_env` é o
+#: ambiente que o `exec` entregou, lido cru de `/proc/self/environ` (`None` onde não existe).
 REPORT = """\
 import json, os, sys
+initial = None
+try:
+    with open("/proc/self/environ", "rb") as raw_handle:
+        raw = raw_handle.read()
+    initial = {}
+    for item in raw.split(b"\\0"):
+        if item:
+            key, _, value = item.partition(b"=")
+            initial[os.fsdecode(key)] = os.fsdecode(value)
+except OSError:
+    initial = None
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
-    json.dump({"cwd": os.getcwd(), "argv": sys.argv[1:], "env": dict(os.environ)}, handle)
+    json.dump(
+        {"cwd": os.getcwd(), "argv": sys.argv[1:], "env": dict(os.environ), "initial_env": initial},
+        handle,
+    )
 sys.stdout.write(sys.argv[-1] if len(sys.argv) > 2 else "")
 """
 
@@ -210,6 +228,31 @@ sys.stdout.write(sys.argv[-1] if len(sys.argv) > 2 else "")
 def read_report(path: Path) -> dict[str, Any]:
     data: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     return data
+
+
+def assert_child_environment(
+    report: dict[str, Any], delivered: dict[str, str], host: dict[str, str]
+) -> None:
+    """O que o filho REAL recebeu, separando o `exec` do que o runtime fez depois.
+
+    * `initial_env` (Linux, `/proc/self/environ`): é o ambiente do `exec` e tem de ser EXATAMENTE
+      ``delivered`` — qualquer outra variável ali seria herança do host (ou da nossa boundary).
+    * `env` (`os.environ` já inicializado): sempre contém ``delivered`` e NUNCA um nome ou valor
+      do host que não foi entregue. Não há tolerância genérica a `LC_*`/`LANG`/`PYTHON*`: uma
+      variável a mais em `env` só é explicada por `initial_env == delivered` (ela não estava no
+      `exec`, logo foi o interpretador). Sem o ambiente cru, nada além da não-fuga é afirmado.
+    """
+    runtime, initial = report["env"], report["initial_env"]
+    for name, value in delivered.items():
+        assert runtime.get(name) == value
+    withheld = {name: value for name, value in host.items() if name not in delivered}
+    assert not set(withheld) & set(runtime), "variável do host chegou ao filho"
+    assert not {value for value in withheld.values() if value} & set(runtime.values())
+    if initial is None:
+        # Sem `/proc/self/environ` não há como distinguir o runtime do `exec`: só a prova de
+        # não vazamento acima (e a `ProcessSpec` exata, no chamador) vale.
+        return
+    assert initial == delivered  # o `exec` recebeu exatamente isto; o resto é do runtime
 
 
 # ===================================================================== TR1, TR2, TR20
@@ -419,8 +462,8 @@ def test_tr8_allowlist_vazia_filho_recebe_ambiente_vazio(rig: Rig, spy: Spy) -> 
     out = rig.reports / "env.json"
     host = {"PATH": PY_DIR, "HOME": "/home/x", "ANTHROPIC_API_KEY": SENTINEL}
     rig.runner(host).run(rig.request(policy([rig.script("r.py", REPORT), str(out)])))
-    assert dict(spy.specs[0].env) == {}
-    assert read_report(out)["env"] == {}
+    assert dict(spy.specs[0].env) == {}  # a boundary entrega EXATAMENTE vazio ao Supervisor
+    assert_child_environment(read_report(out), {}, host)
 
 
 def test_tr9_filho_recebe_so_o_allowlisted(rig: Rig, spy: Spy) -> None:
@@ -438,7 +481,48 @@ def test_tr9_filho_recebe_so_o_allowlisted(rig: Rig, spy: Spy) -> None:
         )
     )
     assert dict(spy.specs[0].env) == {"FF_TEST_ALLOWED": "C"}
-    assert read_report(out)["env"] == {"FF_TEST_ALLOWED": "C"}
+    assert_child_environment(read_report(out), {"FF_TEST_ALLOWED": "C"}, host)
+
+
+def test_assert_child_environment_distingue_exec_de_runtime() -> None:
+    """A asserção nova não é um 'ignore amplo': só o runtime EXPLICADO pelo ambiente cru passa."""
+    host = {"PATH": "/bin", "HOME": "/home/x", "ANTHROPIC_API_KEY": SENTINEL}
+    ok = {"env": {"LC_CTYPE": "C.UTF-8"}, "initial_env": {}}  # runtime acrescentou; exec vazio
+    assert_child_environment(ok, {}, host)
+    assert_child_environment({"env": {"FF": "C"}, "initial_env": None}, {"FF": "C"}, host)
+    bad: list[tuple[dict[str, Any], dict[str, str]]] = [
+        # a variável extra estava no EXEC (herança da nossa boundary ou do host): bloqueia
+        ({"env": {"LC_CTYPE": "C.UTF-8"}, "initial_env": {"LC_CTYPE": "C.UTF-8"}}, {}),
+        ({"env": {"HOME": "/home/x"}, "initial_env": {"HOME": "/home/x"}}, {}),
+        # nome do host no runtime, mesmo com exec vazio: bloqueia
+        ({"env": {"HOME": "/home/x"}, "initial_env": {}}, {}),
+        # valor do host sob outro nome: bloqueia
+        ({"env": {"K": SENTINEL}, "initial_env": None}, {}),
+        # sem o ambiente cru, o que foi entregue continua sendo exigido
+        ({"env": {}, "initial_env": None}, {"FF": "C"}),
+    ]
+    for report, delivered in bad:
+        with pytest.raises(AssertionError):
+            assert_child_environment(report, delivered, host)
+
+
+@pytest.mark.skipif(not os.path.exists("/proc/self/environ"), reason="exige /proc/self/environ")
+def test_python_runtime_may_add_locale_without_exec_env_leak(rig: Rig, spy: Spy) -> None:
+    """Documenta a diferença que quebrou TR8/TR9 no Linux: com `env={}` o CPython pode acrescentar
+    `LC_CTYPE=C.UTF-8` ao `os.environ` (coerção de locale, PEP 538) — mas o ambiente CRU do
+    `exec` (`/proc/self/environ`) segue vazio. Variável do runtime ≠ variável herdada do host.
+
+    Não depende de `LC_CTYPE` existir: o ponto é que, se algo foi acrescentado, não veio do host.
+    """
+    out = rig.reports / "env.json"
+    host = {"PATH": PY_DIR, "HOME": "/home/x", "LANG": "pt_BR.UTF-8", "ANTHROPIC_API_KEY": SENTINEL}
+    rig.runner(host).run(rig.request(policy([rig.script("r.py", REPORT), str(out)])))
+    assert dict(spy.specs[0].env) == {}
+    report = read_report(out)
+    assert report["initial_env"] == {}  # o exec não entregou nada, nem LANG/HOME/PATH do host
+    added = set(report["env"]) - set(report["initial_env"])
+    assert not added & set(host)  # o que o runtime acrescentou nunca é nome do host
+    assert SENTINEL not in json.dumps(report["env"])
 
 
 def test_tr9_nome_ausente_no_host_simplesmente_nao_aparece(rig: Rig, spy: Spy) -> None:

@@ -8469,3 +8469,24 @@ Esta rodada é só de entrega: nenhuma mudança funcional. E8.3 pronta para PR/C
 testes condicionais de symlink, FIFO/socket, `chmod` de modo, nomes não decodificáveis; e no
 Windows junction/reparse). E8.4 e E9 **não iniciadas**; `start_execution` segue no
 `NotImplementedError`.
+
+## 2026-10-07 — Claude Sonnet 5.5 (effort: high) — E8.3 PR #10 Linux locale test portability
+
+O job `quality` (Linux) do PR #10 falhou só em `test_tr8_…` e `test_tr9_…`: o `os.environ` do
+Python filho trazia `LC_CTYPE=C.UTF-8`. A `ProcessSpec.env` já era a esperada (a asserção dela
+passou no CI; falhou a leitura dentro do filho). Diagnóstico: coerção de locale do CPython no
+POSIX (PEP 538), que muda o `os.environ` **depois** do `exec` — não é herança nem entrega da
+nossa boundary. **Sem reprodução local** (máquina sem Linux/WSL/Docker): a confirmação é o novo
+teste lendo `/proc/self/environ` no CI; se o ambiente cru trouxer qualquer variável a mais, o
+teste falha e o diagnóstico muda.
+
+- Mudança: só `api/tests/test_test_runner_e8_3.py`. O filho passa a registrar também o ambiente
+  inicial cru (`/proc/self/environ`); `assert_child_environment` exige o ambiente do `exec`
+  EXATAMENTE igual ao entregue, e não-fuga de nomes/valores do host no `os.environ`, sem
+  tolerância genérica a `LC_*`/`LANG`/`PYTHON*`. A asserção exata da `ProcessSpec.env` em TR8/TR9
+  foi mantida. Teste novo POSIX/`/proc` do fenômeno e teste unitário da própria asserção
+  (relatórios sintéticos, inclusive `LC_CTYPE` no ambiente cru → falha).
+- Nenhuma mudança funcional ou de contrato de segurança: runner, Supervisor, política e
+  classificador de ambiente intocados; `LC_CTYPE`/`LANG`/`PYTHON*` não foram adicionados.
+- Gates locais (Windows): backend 4630 passed, 33 skipped, 0 failed; ruff, format, mypy, mypy
+  Linux, pip check e diff check limpos. Aguardando o CI do PR #10.
