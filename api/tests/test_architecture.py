@@ -1482,6 +1482,26 @@ def test_context_engine_nao_casa_regex_sobre_conteudo_autoral() -> None:
 #: Adaptadores concretos (E8.2+) vivem fora do "só contratos": têm SDK, asyncio e threads.
 _ADAPTADORES = APP_ROOT / "agent_runtime" / "adapters"
 
+#: E8.3: o Test Runner concreto (`generic-subprocess-v1`). Infraestrutura do sistema, não
+#: provider: é o **único** módulo de `agent_runtime` que pode alcançar o Supervisor
+#: (`process_runtime`, a aresta `agent_runtime → process_runtime` prevista em [01] §2 para a E8)
+#: e o binding interno (`tool_executor.workspace.bind_workspace`, o mesmo da factory).
+_RUNNERS = APP_ROOT / "agent_runtime" / "runners"
+_TEST_RUNNER_MODULE = _RUNNERS / "local_subprocess.py"
+
+#: Stdlib que o runner concreto pode usar: resolução de executável por `stat`/`os.path` e o
+#: ambiente imutável. **Sem** `subprocess`, `shutil` (o `which` consulta o `cwd` no Windows),
+#: `asyncio`, `socket`, `logging`.
+_STDLIB_DO_TEST_RUNNER = {
+    "__future__",
+    "collections",
+    "os",
+    "re",
+    "stat",
+    "sys",
+    "types",
+}
+
 _STDLIB_PERMITIDA_NOS_CONTRATOS = {
     "__future__",
     "dataclasses",
@@ -1504,6 +1524,8 @@ def _externos(pasta: str) -> dict[str, set[str]]:
     for path in (APP_ROOT / pasta).rglob("*.py"):
         if path.is_relative_to(_ADAPTADORES):
             continue  # E8.2: adaptador concreto tem SDK/asyncio; fronteira no teste E8.2 próprio
+        if path.is_relative_to(_RUNNERS):
+            continue  # E8.3: runner concreto; fronteira em `test_test_runner_*` abaixo
         resultado[path.name] = {i for i in _imports(path) if i.split(".")[0] != "app"}
     return resultado
 
@@ -1621,22 +1643,32 @@ def test_agent_runtime_so_ve_os_contratos_do_tool_executor() -> None:
     """O executor concreto (factory, executor, resolver, journal) nunca é importado por
     `agent_runtime`: os providers recebem só as portas de `contracts`."""
     for path in (APP_ROOT / "agent_runtime").rglob("*.py"):
+        permitidos = {
+            "app.tool_executor",
+            "app.tool_executor.contracts",
+            "app.tool_executor.validation",
+        }
+        if path == _TEST_RUNNER_MODULE:
+            # E8.3: só o runner — que não é provider — confere o binding do run pela mesma
+            # função da factory. Nenhum adaptador de provider vê o `ResolvedWorkspace`.
+            permitidos |= {"app.tool_executor.workspace"}
         for imported in _imports(path):
             if imported.startswith("app.tool_executor"):
-                assert imported in {
-                    "app.tool_executor",
-                    "app.tool_executor.contracts",
-                    "app.tool_executor.validation",
-                }, f"agent_runtime/{path.name} importa `{imported}`"
+                assert imported in permitidos, f"agent_runtime/{path.name} importa `{imported}`"
 
 
 def test_agent_runtime_so_depende_de_safety_e_tool_executor() -> None:
     """[01] §2: `agent_runtime` pode importar `safety` e `tool_executor`; **não** `db`,
     `orchestrator`, `context_engine`, `api`."""
-    for nome, importados in _imports_do_projeto("agent_runtime").items():
-        for imported in importados:
-            assert imported.startswith(("app.safety", "app.tool_executor", "app.agent_runtime")), (
-                f"agent_runtime/{nome} importa `{imported}`: [01] §2 proíbe"
+    for path in (APP_ROOT / "agent_runtime").rglob("*.py"):
+        permitido: tuple[str, ...] = ("app.safety", "app.tool_executor", "app.agent_runtime")
+        if path == _TEST_RUNNER_MODULE:
+            permitido += ("app.process_runtime",)  # E8.3: a aresta prevista em [01] §2
+        for imported in _imports(path):
+            if imported.split(".")[0] != "app":
+                continue
+            assert imported.startswith(permitido), (
+                f"agent_runtime/{path.name} importa `{imported}`: [01] §2 proíbe"
             )
 
 
@@ -2015,11 +2047,14 @@ def test_so_o_modulo_de_worktree_importa_process_runtime() -> None:
     for path in ALL_FILES:
         if path.is_relative_to(_PROCESS_RUNTIME) or path in _SUPERVISED_GIT_MODULES:
             continue
+        if path == _TEST_RUNNER_MODULE:
+            continue  # E8.3: o Test Runner concreto (aresta prevista em [01] §2 para a E8)
         for imported in _imports(path):
             assert not imported.startswith("app.process_runtime"), (
-                f"{_module_name(path)} importa `{imported}`: só worktree.py/mediated.py podem"
+                f"{_module_name(path)} importa `{imported}`: só worktree.py/mediated.py e o "
+                "Test Runner podem"
             )
-    for path in _SUPERVISED_GIT_MODULES:
+    for path in (*_SUPERVISED_GIT_MODULES, _TEST_RUNNER_MODULE):
         assert any(i.startswith("app.process_runtime") for i in _imports(path))
 
 
@@ -2077,3 +2112,163 @@ def test_backend_windows_so_liga_apis_documentadas_de_kernel32() -> None:
     tree = ast.parse(windows.read_text(encoding="utf-8"))
     attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
     assert not attributes & {"windll", "oledll", "NtResumeProcess", "NtSuspendProcess"}
+
+
+# ------------------------------------------- E8.3: Test Runner e verificação pós-execução
+
+_EXECUTION_VERIFICATION = APP_ROOT / "execution_verification.py"
+_POST_EXECUTION_GIT = APP_ROOT / "git_runtime" / "post_execution.py"
+
+
+def test_test_runner_so_usa_a_stdlib_permitida() -> None:
+    """O runner resolve o executável por `os`/`stat` — nunca `shutil.which` (no Windows/3.11 ele
+    consulta o `cwd` antes do `PATH`), nunca `subprocess`, `asyncio`, `socket` ou `logging`."""
+    externos = {i for i in _imports(_TEST_RUNNER_MODULE) if i.split(".")[0] != "app"}
+    assert {i.split(".")[0] for i in externos} <= _STDLIB_DO_TEST_RUNNER, externos
+    for path in _RUNNERS.rglob("*.py"):
+        if path != _TEST_RUNNER_MODULE:
+            assert all(i.startswith(("app.agent_runtime",)) for i in _imports(path)), path.name
+
+
+def test_test_runner_so_cria_processo_pelo_supervisor() -> None:
+    """O processo de teste nasce **só** por `run_supervised`, uma vez, dentro de `run`."""
+    proibidas = {
+        ("os", "system"),
+        ("os", "popen"),
+        ("os", "startfile"),
+        ("os", "posix_spawn"),
+        ("os", "posix_spawnp"),
+    }
+    for call in _calls(_TEST_RUNNER_MODULE):
+        dotted = _dotted(call.func)
+        assert dotted not in proibidas, f"runner cria processo por {dotted}"
+        assert not (dotted and dotted[0] == "os" and dotted[1].startswith(("spawn", "exec"))), (
+            dotted
+        )
+        func = call.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        assert name not in {"which", "create_subprocess_exec", "create_subprocess_shell"}, name
+    assert _enclosing_functions_calls(_TEST_RUNNER_MODULE, "run_supervised") == ["run"]
+
+
+def test_test_runner_nao_le_o_ambiente_do_processo() -> None:
+    """Nada de `os.environ`/`os.getenv`: o ambiente do filho é construído do zero a partir do
+    ambiente confiável **injetado**, e o `PATH` da resolução vem do mesmo lugar (M4)."""
+    tree = ast.parse(_TEST_RUNNER_MODULE.read_text(encoding="utf-8"))
+    atributos = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    assert not atributos & {"environ", "environb", "getenv", "putenv", "getcwd", "chdir"}
+
+
+def test_execution_verification_so_importa_o_permitido() -> None:
+    """A camada neutra da E8.3 compõe `git_runtime`, `path_runtime` e `safety` — e nada de
+    banco, HTTP, orchestrator, `agent_runtime`, `tool_executor`, processo ou SDK."""
+    for imported in _imports(_EXECUTION_VERIFICATION):
+        root = imported.split(".")[0]
+        if root == "app":
+            assert imported.startswith(("app.git_runtime", "app.path_runtime", "app.safety")), (
+                imported
+            )
+        else:
+            assert root in {"__future__", "collections", "dataclasses", "enum", "time"}, imported
+
+
+def test_execution_verification_nao_escreve_nem_grava_evento() -> None:
+    """Só leitura: nenhuma escrita de arquivo, nenhum `SafetyEvent`, nenhum processo."""
+    tree = ast.parse(_EXECUTION_VERIFICATION.read_text(encoding="utf-8"))
+    nomes = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} | {
+        n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+    }
+    # A docstring cita `SafetyEvent` para dizer quem o grava (E8.4); o código não o referencia.
+    assert not nomes & {"record_safety_event", "SafetyEvent", "Session", "session_scope"}
+    for call in _calls(_EXECUTION_VERIFICATION):
+        func = call.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        assert name not in {
+            "open",
+            "write",
+            "write_text",
+            "write_bytes",
+            "unlink",
+            "mkdir",
+            "rename",
+            "replace",
+            "rmdir",
+            "create_exclusive",
+            "delete_if_identity",
+            "write_fd",
+        }, name
+
+
+#: Subcomandos e opções do Git que leem o working tree pelo pipeline de conversão (filtros
+#: `clean`/`smudge`/`process`, `textconv`, diff externo, `fsmonitor`) ou que escrevem.
+_GIT_QUE_LE_O_WORKTREE = (
+    "status",
+    "diff",
+    "diff-files",
+    "add",
+    "checkout",
+    "restore",
+    "hash-object",
+    "update-index",
+    "show",
+    "log",
+    "ls-files",
+    "--textconv",
+    "--filters",
+    "--refresh",
+)
+
+
+def test_verificacao_e_filter_free() -> None:
+    """E8.3-AUD-002/003 (A3): o estado da árvore principal não passa por `git status` nem por
+    nada que rode helper do projeto. O único verbo Git **construído** em `post_execution.py` é
+    `rev-parse`; índice, árvore e diff-index da worktree vêm do Git mediado já auditado (E7.5-D),
+    que nunca lê o working tree."""
+    constantes = _str_constants_of(_POST_EXECUTION_GIT)
+    for literal in _GIT_QUE_LE_O_WORKTREE:
+        assert literal not in constantes, f"post_execution.py constrói `{literal}`"
+    for path in (_POST_EXECUTION_GIT, _EXECUTION_VERIFICATION):
+        fonte = path.read_text(encoding="utf-8")
+        assert "git status" not in fonte.split('"""', 2)[-1], path.name  # fora da docstring
+    assert "rev-parse" in constantes
+    for call in _calls(_POST_EXECUTION_GIT):
+        assert _dotted(call.func) not in {("subprocess", "run"), ("subprocess", "Popen")}
+
+
+def test_verificacao_nao_tem_sha1_escondido() -> None:
+    """A9: o oid de blob da worktree sai do formato do repositório (`MediatedGit.blob_hasher`);
+    o resumo local do estado é SHA-256. Nenhum `hashlib.sha1` nos módulos da E8.3."""
+    for path in (_POST_EXECUTION_GIT, _EXECUTION_VERIFICATION, _TEST_RUNNER_MODULE):
+        for call in _calls(path):
+            assert _dotted(call.func) != ("hashlib", "sha1"), path.name
+
+
+def test_verificacao_nunca_materializa_um_iterador_de_diretorio() -> None:
+    """A10: nada de `list(os.scandir(...))`/`list(iterator)` — o orçamento é cobrado **durante**
+    a enumeração (`_children`)."""
+    for path in (_POST_EXECUTION_GIT, _EXECUTION_VERIFICATION):
+        for call in _calls(path):
+            if isinstance(call.func, ast.Name) and call.func.id in {"list", "tuple", "sorted"}:
+                fonte = ast.unparse(call)
+                assert "scandir" not in fonte and "iterator" not in fonte, fonte
+        assert "listdir" not in path.read_text(encoding="utf-8")
+
+
+def test_start_execution_continua_no_limite_da_e8_4() -> None:
+    """E8.3 não liga o Test Runner nem a verificação ao `start_execution`: a função ainda para no
+    `NotImplementedError` depois da guarda, e nenhuma rota de execução existe."""
+    texto = (APP_ROOT / "orchestrator" / "execution_manager.py").read_text(encoding="utf-8")
+    assert "NotImplementedError" in texto
+    for nome in (
+        "LocalSubprocessTestRunner",
+        "PostExecutionVerifier",
+        "execution_verification",
+        "run_supervised",
+        "create_worktree",
+        "bind_workspace",
+    ):
+        assert nome not in texto, nome
+    for path in (APP_ROOT / "api").rglob("*.py"):
+        for imported in _imports(path):
+            assert not imported.startswith(("app.execution_verification", "app.process_runtime"))
+        assert "/execute" not in path.read_text(encoding="utf-8")

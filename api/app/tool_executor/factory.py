@@ -10,12 +10,14 @@
 5. o binding devolvido é conferido contra a ref **e** o run (base_commit, workspace, task, run);
 6. `bind_root` — a raiz existe, é diretório, sem reparse e com a identidade registrada.
 
+Os passos 3–6 são `workspace.bind_workspace` (extraída na E8.3, mesma ordem e mesmos códigos),
+compartilhada com o `TestRunner`.
+
 Nada aqui consulta banco, provider ou registry global; nenhuma operação é executada.
 """
 
 from __future__ import annotations
 
-from app.path_runtime import PathIntegrityViolation, PathOperationFailed, bind_root
 from app.safety.capability_profile import (
     ProviderCapabilityProfile,
     ProviderRole,
@@ -29,17 +31,10 @@ from app.tool_executor.contracts import (
     ExecutionWorkspaceRef,
     RunScope,
     ToolExecutor,
-    WorkspaceKind,
 )
 from app.tool_executor.executor import LocalWorktreeToolExecutor
-from app.tool_executor.reasons import rule_for_integrity
 from app.tool_executor.validation import ContractViolation, require_instance
-from app.tool_executor.workspace import (
-    ResolvedWorkspace,
-    UnsupportedWorkspace,
-    WorkspaceResolver,
-    WorkspaceUnavailable,
-)
+from app.tool_executor.workspace import WorkspaceResolver, bind_workspace
 
 
 def _require_callable(name: str, value: object, attribute: str) -> None:
@@ -78,35 +73,12 @@ class LocalWorktreeToolExecutorFactory:
 
         profile = require_v1(effective_capability_profile, ProviderRole.DEVELOPER)
 
-        if workspace_ref.kind is not WorkspaceKind.LOCAL_WORKTREE:
-            raise UnsupportedWorkspace("workspace_kind_unsupported")
-
-        resolved = self._resolver.resolve(workspace_ref, run_scope)
-        if resolved is None:
-            raise WorkspaceUnavailable("workspace_unbound")
-        if not isinstance(resolved, ResolvedWorkspace):
-            raise WorkspaceUnavailable("resolver_invalid")
-        if resolved.base_commit != workspace_ref.base_commit:
-            raise WorkspaceUnavailable("base_commit_mismatch")
-        if (
-            resolved.workspace_id != workspace_ref.id
-            or resolved.task_id != run_scope.task_id
-            or resolved.run_id != run_scope.run_id
-        ):
-            raise WorkspaceUnavailable("binding_mismatch")
-
-        try:
-            root = bind_root(resolved.workspace_path, expected_identity=resolved.root_identity)
-        except PathIntegrityViolation as violation:
-            raise WorkspaceUnavailable(
-                "root_unavailable", rule_id=rule_for_integrity(violation.category)
-            ) from None
-        except PathOperationFailed:
-            raise WorkspaceUnavailable("root_unavailable") from None
+        # Passos 3–6: a conferência única do binding (E8.3), a mesma do `TestRunner`.
+        bound = bind_workspace(self._resolver, workspace_ref, run_scope)
 
         return LocalWorktreeToolExecutor(
-            workspace=resolved,
-            root=root,
+            workspace=bound.resolved,
+            root=bound.root,
             policy=composed_policy,
             profile=profile,
             run_scope=run_scope,

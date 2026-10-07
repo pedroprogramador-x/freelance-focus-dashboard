@@ -82,11 +82,12 @@ executar, que é exatamente o contrário do que ele existe para garantir.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from app.safety.canonical import canonical_sha256
-from app.safety.redaction import REDACTED, redact_document
+from app.safety.redaction import REDACTED, is_sensitive_key, redact_document
 
 
 class InvalidTestPolicy(ValueError):
@@ -311,6 +312,193 @@ def _require_int(document: dict[str, Any], key: str, *, minimum: int, maximum: i
     return value
 
 
+#: E8.3 — primeiro componente de nome que identifica variável **de provider ou de credencial de
+#: nuvem/forja**. Nenhuma delas chega ao processo de teste, nem se a `env_allowlist` pedir:
+#: [04] §6, "ambiente: allowlist, sem chaves de provider". Prefixo, não nome exato:
+#: `ANTHROPIC_BASE_URL` também é configuração de provider e não tem o que fazer num teste. As
+#: credenciais do próprio backend vivem em `FF_SECRET_*` (`config.SecretSettings`) e já são
+#: sensíveis pelo componente `secret`.
+_FORBIDDEN_TEST_ENV_PREFIXES = frozenset(
+    {
+        "anthropic",
+        "claude",
+        "openai",
+        "codex",
+        "gemini",
+        "google",
+        "gcloud",
+        "gcp",
+        "vertex",
+        "aws",
+        "azure",
+        "github",
+        "gh",
+        "gitlab",
+        "bitbucket",
+        "hf",
+        "huggingface",
+        "mistral",
+        "cohere",
+        "groq",
+        "xai",
+        "deepseek",
+        "openrouter",
+        "replicate",
+        "perplexity",
+        "together",
+    }
+)
+
+#: E8.3 — componentes que, **em qualquer posição** do nome, indicam credencial além do que
+#: `is_sensitive_key` já reconhece (`api_key`, `secret`, `token`, `password`, `passwd`,
+#: `authorization`). Comparação por componente inteiro, como `is_sensitive_key`: `AUTHOR` não
+#: é `AUTH`, `KEYBOARD` não é `KEY`.
+_FORBIDDEN_TEST_ENV_COMPONENTS = frozenset(
+    {
+        "auth",
+        "oauth",
+        "credential",
+        "credentials",
+        "cred",
+        "creds",
+        "key",
+        "accesskey",
+        "privatekey",
+        "pass",
+        "passphrase",
+        "askpass",
+        "pat",
+        "jwt",
+        "bearer",
+        "cookie",
+        "netrc",
+        "kubeconfig",
+        "dsn",
+        "gnupghome",
+        "pgpassfile",
+        "pypirc",
+        "npmrc",
+    }
+)
+
+#: E8.3-AUD-001 — sufixos de **componente** que carregam credencial colada a outra palavra
+#: (`PGPASSWORD`, `MYSQLPWD`… são um componente só, que `is_sensitive_key` não decompõe). Sufixo,
+#: não substring: `TOKENIZERS` não termina em `token`.
+_FORBIDDEN_TEST_ENV_COMPONENT_SUFFIXES = ("password", "passwd", "secret", "token", "apikey")
+
+#: E8.3-AUD-001 — **localizadores de credencial**: o valor não é o segredo, mas aponta para onde
+#: ele está (arquivo de config com token, socket de agente, programa que devolve senha, daemon
+#: com privilégio). Nome exato, normalizado (`casefold`, componentes unidos por `_`).
+_CREDENTIAL_LOCATOR_NAMES = frozenset(
+    {
+        "docker_config",
+        "docker_auth_config",
+        "docker_host",
+        "docker_cert_path",
+        "aws_config_file",
+        "aws_shared_credentials_file",
+        "cloudsdk_config",
+        "boto_config",
+        "azure_config_dir",
+        "git_config",
+        "git_config_global",
+        "git_config_system",
+        "gpg_agent_info",
+        "pgservicefile",
+        "npm_config_userconfig",
+        "sudo_askpass",
+        "ssh_auth_sock",
+        "ssh_askpass",
+        "git_askpass",
+        "vault_addr",
+    }
+)
+
+#: E8.3-AUD-001 — *connection string* com credencial embutida (`DATABASE_URL`,
+#: `REDIS_URL`, `MONGODB_URI`…): um componente de **armazenamento de dados** junto de um de
+#: **localização**. Os dois precisam estar presentes: `BASE_URL`/`API_URL` continuam permitidos.
+_DATASTORE_COMPONENTS = frozenset(
+    {
+        "database",
+        "db",
+        "postgres",
+        "postgresql",
+        "pg",
+        "psql",
+        "mysql",
+        "mariadb",
+        "mssql",
+        "sqlserver",
+        "oracle",
+        "sqlalchemy",
+        "mongo",
+        "mongodb",
+        "redis",
+        "rediss",
+        "valkey",
+        "memcached",
+        "amqp",
+        "rabbitmq",
+        "kafka",
+        "broker",
+        "celery",
+        "elasticsearch",
+        "opensearch",
+        "cassandra",
+        "couchdb",
+        "supabase",
+        "jdbc",
+        "odbc",
+    }
+)
+_LOCATOR_COMPONENTS = frozenset(
+    {"url", "uri", "dsn", "conn", "connection", "connstr", "connectionstring", "string"}
+)
+
+
+def is_forbidden_test_env_name(name: str) -> bool:
+    """Esta variável é **proibida** no processo de teste, mesmo se allowlisted? (E8.3)
+
+    Decisão conservadora por **nome**, nunca por valor: o valor não é lido para decidir.
+    Proibida quando:
+
+    * o nome é sensível pelo redator canônico (`is_sensitive_key`);
+    * o primeiro componente é de provider/nuvem/forja;
+    * algum componente é de credencial, ou termina num nome de credencial (`PGPASSWORD`);
+    * o nome é um **localizador** de credencial (`DOCKER_CONFIG`, `SSH_AUTH_SOCK`,
+      `GIT_ASKPASS`…) — E8.3-AUD-001;
+    * o nome é uma *connection string* de armazenamento de dados (`DATABASE_URL`) —
+      E8.3-AUD-001.
+
+    Nome que não se decompõe em componente nenhum (vazio, só separadores) também é proibido:
+    não conseguir classificar não é classificar como seguro.
+
+    É uma **denylist sobre a allowlist**: a proteção principal continua sendo a própria
+    `env_allowlist` — nada fora dela chega ao filho.
+    """
+    if is_sensitive_key(name):
+        return True
+    components = tuple(part for part in _ENV_NAME_SEPARATORS.split(name.casefold()) if part)
+    if not components:
+        return True
+    if components[0] in _FORBIDDEN_TEST_ENV_PREFIXES:
+        return True
+    if "_".join(components) in _CREDENTIAL_LOCATOR_NAMES:
+        return True
+    if _DATASTORE_COMPONENTS.intersection(components) and _LOCATOR_COMPONENTS.intersection(
+        components
+    ):
+        return True
+    return any(
+        component in _FORBIDDEN_TEST_ENV_COMPONENTS
+        or component.endswith(_FORBIDDEN_TEST_ENV_COMPONENT_SUFFIXES)
+        for component in components
+    )
+
+
+_ENV_NAME_SEPARATORS = re.compile(r"[^0-9a-z]+")
+
+
 def parse_test_policy(document: Any) -> TestPolicy | None:
     """Valida o documento de `DevWorkspace.test_config`. `None` entra e `None` sai.
 
@@ -400,6 +588,7 @@ __all__ = [
     "TEST_POLICY_VERSION",
     "InvalidTestPolicy",
     "TestPolicy",
+    "is_forbidden_test_env_name",
     "parse_test_policy",
     "redacted_document",
 ]

@@ -23,7 +23,7 @@ from enum import Enum
 from app.safety.capability_profile import ProviderCapabilityProfile
 from app.safety.test_policy import TestPolicy
 from app.tool_executor.contracts import CancelToken as CancelToken  # E7.5-A: definido lá
-from app.tool_executor.contracts import ExecutionWorkspaceRef
+from app.tool_executor.contracts import ExecutionWorkspaceRef, RunScope
 from app.tool_executor.validation import (
     ContractViolation,
     require_instance,
@@ -152,15 +152,21 @@ class DeveloperExecutionRequest:
 
 @dataclass(frozen=True, slots=True)
 class TestSummary:
-    """[05] §6. O `TestRunner` a produz; o auditor a recebe no `AuditRequest`."""
+    """[05] §6. O `TestRunner` a produz; o auditor a recebe no `AuditRequest`.
+
+    Addendum E8.3: `passed`/`failed`/`skipped` são **todos** `int >= 0` ou **todos** `None`
+    (métricas desconhecidas). Mistura parcial é recusada. Um runner genérico, que não
+    interpreta a saída do processo, devolve os três `None`; `exit_code` continua sendo a
+    fonte autoritativa de sucesso/falha do comando.
+    """
 
     __test__ = False  # nome `Test*`: pytest não deve tentar coletar
 
     framework: str
     exit_code: int
-    passed: int
-    failed: int
-    skipped: int
+    passed: int | None
+    failed: int | None
+    skipped: int | None
     duration_ms: int
     output_ref: str | None
 
@@ -168,9 +174,14 @@ class TestSummary:
         require_text("framework", self.framework)
         if isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int):
             raise ContractViolation("exit_code precisa ser int")
-        require_int("passed", self.passed)
-        require_int("failed", self.failed)
-        require_int("skipped", self.skipped)
+        counters = (self.passed, self.failed, self.skipped)
+        if any(value is None for value in counters):
+            if not all(value is None for value in counters):
+                raise ContractViolation("passed/failed/skipped: todos int ou todos None")
+        else:
+            require_int("passed", self.passed)
+            require_int("failed", self.failed)
+            require_int("skipped", self.skipped)
         require_int("duration_ms", self.duration_ms)
         require_optional_text("output_ref", self.output_ref)
 
@@ -210,18 +221,77 @@ class AuditRequest:
 @dataclass(frozen=True, slots=True)
 class TestRequest:
     """[05] §6. Reutiliza `safety.TestPolicy`; `command_hash`/`policy_hash` são métodos
-    dela e **não** são recalculados aqui (o cálculo do runner pertence à E8)."""
+    dela e **não** são recalculados aqui (o cálculo do runner pertence à E8).
+
+    Addendum E8.3: `run_scope` é obrigatório. `ExecutionWorkspaceRef` não tem caminho de
+    filesystem, e um runner de vida de aplicação só acha a worktree **deste** run pelo
+    binding explícito `(workspace_ref, run_scope)` — nunca só pelo `workspace_ref.id`.
+    """
 
     __test__ = False
 
     workspace_ref: ExecutionWorkspaceRef
+    run_scope: RunScope
     test_policy: TestPolicy
     cancel_token: CancelToken
 
     def __post_init__(self) -> None:
         require_instance("workspace_ref", self.workspace_ref, ExecutionWorkspaceRef)
+        require_instance("run_scope", self.run_scope, RunScope)
         require_instance("test_policy", self.test_policy, TestPolicy)
         _require_cancel_token(self.cancel_token)
+
+
+class TestRunnerFailureCode(str, Enum):
+    """Por que o `TestRunner` não produziu um `TestSummary` (addendum E8.3 de [05] §6).
+
+    Só falhas **técnicas** ou de pré-condição. Um processo que terminou normalmente com
+    `exit_code != 0` **não** é falha do runner: é um `TestSummary` legítimo. Quem mapeia
+    estes códigos para `Run.status`/estado da task/`SafetyEvent` é o Execution Manager (E8.4).
+    """
+
+    __test__ = False
+
+    #: `test_policy.runner_id` não é o runner implementado.
+    UNSUPPORTED_RUNNER = "unsupported_runner"
+    #: A `TestPolicy` recebida não tem a forma que a V1 aceita (ou não vira `ProcessSpec`).
+    INVALID_POLICY = "invalid_policy"
+    #: O binding `(workspace_ref, run_scope)` não existe, diverge ou não é verificável.
+    WORKSPACE_UNAVAILABLE = "workspace_unavailable"
+    #: O executável lógico não resolve para um executável confiável e absoluto.
+    EXECUTABLE_UNAVAILABLE = "executable_unavailable"
+    #: A allowlist de ambiente pede variável proibida, ou o ambiente confiável é ambíguo.
+    INVALID_ENVIRONMENT = "invalid_environment"
+    #: O processo excedeu `timeout_seconds`; a árvore foi encerrada.
+    TIMEOUT = "timeout"
+    #: O `cancel_token` pediu o cancelamento; a árvore foi encerrada (ou nem nasceu).
+    CANCELLED = "cancelled"
+    #: O Supervisor não conseguiu conter, observar ou confirmar a árvore morta. Fail closed.
+    SUPERVISION_FAILED = "supervision_failed"
+
+
+class TestRunnerFailure(Exception):
+    """Falha estruturada do `TestRunner`. A mensagem é **só** o código.
+
+    Nunca carrega `stdout`/`stderr`, caminho absoluto, valor de ambiente nem texto livre de
+    exceção. ``tree_confirmed_dead`` repete o fato do Supervisor quando houve processo
+    (`None` quando nenhum processo chegou a ser iniciado pelo runner).
+    """
+
+    __test__ = False
+
+    def __init__(
+        self, code: TestRunnerFailureCode, *, tree_confirmed_dead: bool | None = None
+    ) -> None:
+        require_instance("code", code, TestRunnerFailureCode)
+        if tree_confirmed_dead is not None and not isinstance(tree_confirmed_dead, bool):
+            raise ContractViolation("tree_confirmed_dead precisa ser bool ou None")
+        super().__init__(code.value)
+        self.code = code
+        self.tree_confirmed_dead = tree_confirmed_dead
+
+    def __repr__(self) -> str:
+        return f"TestRunnerFailure({self.code.value})"
 
 
 # ---------------------------------------------------------------------------- resultados

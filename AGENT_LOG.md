@@ -8268,3 +8268,225 @@ GAP" — permanecem como registro histórico; esta entrada as sucede.
   em Windows; não exercitou runtime Linux nem a API real (sem chave, sem crédito, por desenho).
 - **CI ainda requerido** (Linux real só é validado no CI). Commit/push/PR autorizados nesta
   rodada; merge NÃO autorizado. E8.3, E8.4 e E9 não iniciadas; roadmap não marcado como merged.
+
+## 2026-10-06 — Claude Opus 5.5 (effort: high) — E8.3 Test Runner + Post-Execution Verification — candidate
+
+Branch `e8/03-test-runner-verification`, base `37dfea8` (main pós-E8.2). **Não commitada**, sem
+push/PR/merge — aguardando auditoria independente (Codex). E8.4 e E9 não iniciadas;
+`start_execution` continua parando no `NotImplementedError` depois da guarda.
+
+- Arquivos alterados: `api/app/agent_runtime/{__init__,dto,interfaces}.py`,
+  `api/app/git_runtime/__init__.py`, `api/app/safety/test_policy.py`,
+  `api/app/tool_executor/{factory,workspace}.py`, `api/tests/test_agent_runtime_contracts_e7_2.py`,
+  `api/tests/test_architecture.py`, `docs/architecture/01`, `04` e `05` (adendos E8.3 aditivos,
+  autorizados). Novos: `api/app/agent_runtime/runners/{__init__,local_subprocess}.py`,
+  `api/app/git_runtime/post_execution.py`, `api/app/execution_verification.py`,
+  `api/tests/test_test_runner_e8_3.py`, `api/tests/test_post_execution_verification_e8_3.py`.
+  ADRs intocados; nenhuma dependência nova.
+- Decisões tomadas:
+  - `TestRequest` ganha `run_scope: RunScope` (obrigatório); binding `(workspace_ref, run_scope)`
+    pela **mesma** `tool_executor.workspace.bind_workspace`, extraída da factory sem mudar ordem
+    nem códigos.
+  - `TestSummary.passed/failed/skipped`: todos `int >= 0` ou todos `None`. Runner
+    `generic-subprocess-v1` não interpreta saída (três `None`); `exit_code != 0` é `TestSummary`.
+  - Falhas estruturadas `TestRunnerFailure(TestRunnerFailureCode)`: `unsupported_runner`,
+    `invalid_policy`, `workspace_unavailable`, `executable_unavailable`, `invalid_environment`,
+    `timeout`, `cancelled`, `supervision_failed`; mensagem = só o código.
+  - Executável: só entradas **absolutas** do `PATH` confiável injetado (nunca `cwd`, nunca
+    `shutil.which`); Windows só `.exe`/`.com` (sem `PATHEXT`); `.bat`/`.cmd` e intérpretes de
+    shell (`cmd`, `powershell`, `bash`, `sh`, `env`…) recusados pelo nome e pelo destino real;
+    nada dentro da worktree.
+  - Ambiente do filho construído do zero (allowlist ∩ ambiente confiável);
+    `safety.test_policy.is_forbidden_test_env_name` (reusa `is_sensitive_key` + prefixos de
+    provider/nuvem/forja + componentes de credencial) recusa antes do processo nascer.
+  - `stdout`/`stderr` drenados e descartados; `output_ref = None`.
+  - Snapshot da árvore principal no **repositório inteiro** (raiz pelo Git): porcelain v2 cru,
+    ordenado por bytes, `--no-renames --untracked-files=all --ignore-submodules=none`, mais
+    impressão (oid de blob dos bytes crus) dos caminhos já sujos no lado working tree.
+  - Worktree: Git só sobre objetos/índice (sem `status`/`diff` lá), disco percorrido no Python
+    com ignorados; identidade da worktree conferida (prefixo, `.git` comum, link do admin dir,
+    `HEAD == base`, sem operação em andamento); fora do prefixo → `outside_workspace_change`;
+    dentro → pipeline de escrita mediada (`decide_path(WRITE)`).
+  - `execution_verification.py` neutro (só `git_runtime`/`path_runtime`/`safety`); não grava
+    `SafetyEvent`.
+- Testes/gates (Windows, Python 3.11): E8.3 runner 144 + post-execution 67; arquitetura 297
+  (+7); E7.2 99 (+2). Mutantes M1–M16 mortos (M2 isolado barrado pela segunda camada do
+  binding; M15b redundante com outras duas camadas), arquivos restaurados com SHA-256
+  idêntico. **Backend completo: 4500 passed, 27 skipped (plataforma), 0 failed**; `ruff check`,
+  `ruff format --check`, `mypy`, `mypy --platform linux` e `git diff --check` limpos. CI Linux
+  não rodou.
+- Pendências / riscos residuais: Test Runner não é sandbox (até E14); snapshot principal não
+  cobre ignorados, conteúdo de repo aninhado nem metadados `.git` (refs/config/exclude);
+  análise da worktree inclui ignorados — caches de teste fora do `workspace_prefix` (ex.:
+  `.pytest_cache` na raiz de um monorepo) bloqueiam o run; escrita concorrente do usuário na
+  árvore principal é falso positivo (fail closed). Auditoria Codex pendente.
+
+## 2026-10-07 — Claude Opus 5.5 (effort: high) — E8.3 independent audit corrections — AUD-001..AUD-005 — candidate
+
+Auditoria independente anterior: **E8.3 BLOCKED** (1 P1 + 4 P2). Correção restrita aos cinco
+findings, mesma branch `e8/03-test-runner-verification`, HEAD `37dfea8`. **Não commitada**, sem
+push/PR/merge. E8.4 e E9 não iniciadas; `start_execution` segue no `NotImplementedError`.
+
+- Arquivos alterados (só correção): `api/app/safety/test_policy.py`, `api/app/git_runtime/__init__.py`,
+  `api/app/git_runtime/post_execution.py` (reescrito), `api/app/execution_verification.py`
+  (reescrito), `api/tests/test_post_execution_verification_e8_3.py`, `api/tests/test_test_runner_e8_3.py`,
+  `api/tests/test_architecture.py`, adendos E8.3 em `docs/architecture/01`, `04`, `05`. Nenhum
+  arquivo novo, nenhuma dependência nova, ADRs e fingerprint V1 intocados, resolvedor de
+  executável intocado.
+- Decisões tomadas:
+  - AUD-001 (P1): `is_forbidden_test_env_name` recusa localizadores de credencial (nomes exatos
+    `DOCKER_CONFIG`, `AWS_SHARED_CREDENTIALS_FILE`, `GIT_ASKPASS`, `SSH_AUTH_SOCK`…), pares
+    datastore+localizador (`DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`…, sem regra ingênua de
+    substring `url`), componentes `dsn`/`pgpassfile`/`pypirc`/`npmrc`/`gnupghome` e sufixos
+    `password/passwd/secret/token/apikey`. As 30 variáveis da auditoria recusadas antes do processo,
+    inclusive com allowlist adulterada; `BASE_URL`, `API_URL`, `DATABASE_NAME` continuam permitidas.
+  - AUD-002/003 (P2): snapshot da árvore principal **read-only e filter-free** — bytes crus do
+    índice efetivo + travessia Python do filesystem da raiz (rastreados, não rastreados,
+    ignorados, repos aninhados), sem `git status/diff/add/checkout/hash-object`. Links,
+    junctions, reparse points e especiais registrados por `lstat`/`readlink`, nunca seguidos nem
+    abertos; admin `.git` não percorrido (exceção: índice). before ≠ after →
+    `OUT_OF_WORKTREE_WRITE`; anti-replay pela raiz real. Gate de arquitetura filter-free.
+  - AUD-004 (P2): formato de objeto (`sha1`/`sha256`) lido por plumbing read-only e cruzado com a
+    `MediatedGit`; oid de blob = hash(`blob <size>\0` + conteúdo) do algoritmo do formato, em
+    streaming; regex de oid 40/64 por formato.
+  - AUD-005 (P2): `VerificationBudget` por operação (capture OU verify): `MAX_ENTRIES=100_000`,
+    `MAX_BYTES_READ=1_073_741_824`, `DEADLINE=60 s` (`time.monotonic`), cancelamento via callback
+    neutro (sem dependência `execution_verification → agent_runtime`); entradas cobradas durante a
+    iteração, bytes pelos blocos lidos; timeout do Git = min(5 s, restante). Falhas estruturadas
+    `LIMIT_EXCEEDED`/`DEADLINE_EXCEEDED`/`CANCELLED`; nunca VERIFIED parcial.
+- Testes/gates (Windows, Python 3.11, Git 2.53): post-execution 104 coletados (95 passed / 9
+  skipped POSIX), runner 199 passed / 2 skipped, arquitetura 299. SHA-256 real exercitado.
+  Mutantes A1–A16 mortos numa cópia (fonte real com hash idêntico). **Backend completo: 4592
+  passed, 31 skipped (plataforma), 0 failed, exit 0**; `ruff check`, `ruff format --check`, `mypy`,
+  `mypy --platform linux`, `pip check` e `git diff --check` limpos. CI Linux não rodou.
+- Pendências / riscos residuais: no OneDrive + Defender a captura a frio deste próprio repo pode
+  passar de 60 s (fail closed `DEADLINE_EXCEEDED`, números do PO mantidos — decisão operacional do
+  PO); escrita concorrente do usuário na principal é falso positivo; metadados `.git` além do
+  índice e NTFS ADS fora do escopo; localizadores genéricos tipo `HOME` passam se allowlistados;
+  criação de worktree (E7.4) segue só SHA-1; testes POSIX não validados em Linux. Re-auditoria
+  independente pendente.
+
+## 2026-10-07 — Claude Opus 5.5 (effort: high) — E8.3 final audit corrections — FINAL-001/FINAL-002 — candidate
+
+Reauditoria final da E8.3: **BLOCKED** por dois P2 (FINAL-001 reabriu a AUD-005; FINAL-002 novo).
+AUD-001..004 seguem resolvidos; E83-CORR-006 segue RESIDUAL ACCEPTED — ENVIRONMENT/DEPLOYMENT
+(sem mudança de orçamento nem de cobertura). Mesma branch `e8/03-test-runner-verification`, HEAD
+`37dfea8`; **não commitada**, sem push/PR/merge; E8.4/E9 não iniciadas.
+
+- Arquivos alterados: `api/app/execution_verification.py`, `api/app/git_runtime/post_execution.py`,
+  `api/app/git_runtime/mediated.py` (+22/−1), `api/tests/test_post_execution_verification_e8_3.py`,
+  adendo E8.3 de `docs/architecture/04` (frases que afirmavam garantia absoluta). ADRs intocados;
+  nenhuma dependência nova; fingerprint V1, Test Runner e limites 100 000 / 1 GiB / 60 s intocados.
+- Decisões tomadas:
+  - FINAL-001: `VERIFIED` sai de um único ponto (`_verified`), que revalida o orçamento antes de
+    liberar; checagem também depois de `bind_root` e de cada `inspect`. Prazo/cancelamento que
+    cruzam a última operação viram `UNVERIFIABLE` com `deadline_exceeded`/`cancelled`.
+  - FINAL-001 (Git): `MediatedGit` ganha `remaining_s` opcional, consultado **por processo**
+    (`min(timeout da sessão, restante)`, nunca aumenta; restante ≤ 0, NaN ou consulta que falha →
+    o processo não nasce). Sem o parâmetro, o comportamento histórico da E7.5 é idêntico. `_git`
+    (`rev-parse`) também não inicia sem prazo restante.
+  - FINAL-002: as duas travessias (principal e worktree) guardam a identidade de cada diretório
+    na pilha e o revalidam (tipo, link/reparse, identidade, com orçamento antes e depois)
+    imediatamente antes do `scandir` e de novo depois. Troca por junction/symlink →
+    `link_or_reparse`; por arquivo/outro diretório/sumiço → `changed_during_read`. Raiz ancorada
+    na identidade tomada no início. Troca-e-restauração invisível entre as duas observações fica
+    como TOCTOU residual declarado (E14).
+- Testes/gates (Windows, Python 3.11, Git 2.53): 21 testes novos (F001_1..8, gate final único,
+  timeout por chamada, F002_1 worktree e principal com junction real, F002_2 troca durante a
+  enumeração, F002_3 identidade, F002_4 dir→arquivo, F002_5 dir→symlink — pulado aqui sem
+  privilégio, roda no CI POSIX —, revalidação com orçamento, raiz trocada). Os F001_1/2 e F002
+  falham no código pré-correção (reproduzem a contraprova do Codex); F001_3/4 já passavam (o
+  `_mediated` já checava depois da chamada). Mutantes MFINAL1–8 (+4b) mortos numa cópia, fonte
+  real intocado. Direcionados 3132 passed / 26 skipped. **Backend completo: 4612 passed, 32
+  skipped (plataforma), 0 failed**; `ruff check`, `ruff format --check`, `mypy`,
+  `mypy --platform linux`, `pip check`, `git diff --check` limpos. CI Linux não rodou.
+- Pendências / riscos residuais: TOCTOU de troca-e-restauração concorrente; identidade com
+  `file_id == 0` (filesystem sem id) só é protegida pela checagem de tipo/reparse; CORR-006
+  (cache frio do Defender) segue aceito como decisão de deployment. Reauditoria final pendente.
+
+## 2026-10-07 — Claude Opus 5.5 (effort: high) — E8.3 directory identity unverifiable closure — candidate
+
+Fecha a lacuna registrada como residual na entrada FINAL-001/FINAL-002 ("`file_id == 0` só
+protegido por tipo/reparse") — **não é mais residual**. Mesma branch, HEAD `37dfea8`; **não
+commitada**, sem push/PR/merge; E8.4/E9 não iniciadas; orçamentos e CORR-006 intocados.
+
+- Arquivos alterados: `api/app/git_runtime/post_execution.py`, `api/app/execution_verification.py`,
+  `api/tests/test_post_execution_verification_e8_3.py`. Docs/ADRs intocados (o adendo do doc 04 não
+  aceitava identidade não verificável).
+- Decisões tomadas: toda identidade usada como **prova de continuidade** na E8.3 passa por
+  `_proven_identity` (regra da foundation, `ObjectIdentity.is_verifiable`, mesmo significado do
+  `path_runtime._trusted_identity`): raiz e `.git` comum (anti-replay), git dir administrativo,
+  raiz da worktree, cada diretório da pilha, revalidação antes/depois da descida e a leitura
+  estável de arquivo regular (`lstat` × `fstat` × `lstat`). `file_id == 0` → nova falha
+  estruturada `integrity_unverifiable` (worktree: `INTEGRITY_VIOLATION`; principal:
+  `UNVERIFIABLE` com a causa). Raiz do workspace: regra já coberta pelo `bind_root` (testada).
+- Testes/gates: 9 testes novos (F002_ZERO_1 worktree e principal, F002_ZERO_2 troca A→B sem
+  identidade — B nunca enumerado —, F002_ZERO_3 pós-descida, esperada não verificável, raízes da
+  principal/worktree/workspace, arquivo regular). Mutante MFINAL9 morto pelos 8 testes afetados
+  (cópia; fonte real intocado). Direcionados 3155 passed / 29 skipped. **Backend completo: 4621
+  passed, 32 skipped, 0 failed**; ruff, format, mypy, mypy Linux, pip check, diff check limpos.
+- Pendências: reauditoria final independente.
+
+## 2026-10-07 — Claude Opus 5.5 (effort: high) — E8.3 root reparse closure — FOCAL-001 — candidate
+
+Auditoria focal encontrou um P2 (FOCAL-001, reabrindo só a FINAL-002): a revalidação da **raiz**
+(`root=True`) usava `stat` — que segue junction — e pulava a checagem de reparse; uma junction
+persistente no lugar da raiz da worktree, apontando para o mesmo diretório movido (identidade
+igual), terminava `VERIFIED`. Mesma branch, HEAD `37dfea8`; **não commitada**, sem push/PR/merge;
+E8.4/E9 não iniciadas; orçamentos e CORR-006 intocados.
+
+- Arquivos alterados: `api/app/git_runtime/post_execution.py`,
+  `api/tests/test_post_execution_verification_e8_3.py`. Docs/ADRs intocados (o doc 04 já dizia
+  "tipo, link/reparse, identidade" para todo diretório — agora verdade também para a raiz).
+- Decisões tomadas: o parâmetro `root` (que só servia para a exceção) foi removido; não há mais
+  `stat` que segue link na E8.3. Toda observação de diretório que prova algo — raiz da principal,
+  `.git` comum, raiz da worktree, filhos, antes e depois da enumeração — passa por
+  `_directory_proof` (`lstat` + recusa de link/reparse + orçamento antes/depois) e
+  `_proven_identity`. `main_tree_state` também prova o caminho pedido antes de o Git resolvê-lo e
+  o revalida depois (o Git resolveria uma junction para o alvo e a raiz "pareceria" ordinária).
+- Testes/gates: 8 testes novos (FOCAL_1 raiz da worktree com junction real persistente — alvo
+  nunca enumerado —, FOCAL_2 raiz da principal nas duas janelas + junction já presente, FOCAL_3
+  troca durante a enumeração, FOCAL_4 outro diretório ordinário, FOCAL_6 caminho feliz, âncora
+  unitária); FOCAL_5 (`file_id == 0` na raiz) reescrito para o `lstat`. FOCAL_1 e a junction
+  pré-existente falham no código anterior (reproduzem a contraprova). MFINAL10 morto por FOCAL_1,
+  FOCAL_2[toplevel] e FOCAL_3; MFINAL11 morto pelo teste unitário da âncora (nas integrações a
+  revalidação seguinte ainda pega — defesa em profundidade). Direcionados 3163 passed / 29
+  skipped. **Backend completo: 4629 passed, 32 skipped, 0 failed**; ruff, format, mypy, mypy
+  Linux, pip check, diff check limpos. CI Linux não rodou (FOCAL usa symlink no POSIX).
+- Pendências: reauditoria final independente.
+
+## 2026-10-07 — Claude Sonnet 5.5 (effort: medium) — E8.3 final independent audit — GREEN
+
+Auditoria independente final da E8.3: **GREEN** — P0/P1/P2/P3 = 0. Resolvidos: AUD-001..005,
+FINAL-001/002, fechamento de identidade não verificável (`file_id == 0`) e FOCAL-001 (reparse na
+raiz). **E83-CORR-006** aceito pelo Product Owner como residual de V1 —
+RESIDUAL ACCEPTED — ENVIRONMENT/DEPLOYMENT: com cache frio (Windows + OneDrive + Defender) a
+verificação pode passar dos 60 s e falha fechado (`deadline_exceeded`); contrato mantido em
+100 000 entradas / 1 GiB / 60 s / cancelamento, sem excluir `node_modules`, sem reduzir cobertura
+de ignorados; melhorias futuras guiadas por uso real (hardening/E14).
+
+Esta rodada é só de entrega: nenhuma mudança funcional. E8.3 pronta para PR/CI (validar Linux:
+testes condicionais de symlink, FIFO/socket, `chmod` de modo, nomes não decodificáveis; e no
+Windows junction/reparse). E8.4 e E9 **não iniciadas**; `start_execution` segue no
+`NotImplementedError`.
+
+## 2026-10-07 — Claude Sonnet 5.5 (effort: high) — E8.3 PR #10 Linux locale test portability
+
+O job `quality` (Linux) do PR #10 falhou só em `test_tr8_…` e `test_tr9_…`: o `os.environ` do
+Python filho trazia `LC_CTYPE=C.UTF-8`. A `ProcessSpec.env` já era a esperada (a asserção dela
+passou no CI; falhou a leitura dentro do filho). Diagnóstico: coerção de locale do CPython no
+POSIX (PEP 538), que muda o `os.environ` **depois** do `exec` — não é herança nem entrega da
+nossa boundary. **Sem reprodução local** (máquina sem Linux/WSL/Docker): a confirmação é o novo
+teste lendo `/proc/self/environ` no CI; se o ambiente cru trouxer qualquer variável a mais, o
+teste falha e o diagnóstico muda.
+
+- Mudança: só `api/tests/test_test_runner_e8_3.py`. O filho passa a registrar também o ambiente
+  inicial cru (`/proc/self/environ`); `assert_child_environment` exige o ambiente do `exec`
+  EXATAMENTE igual ao entregue, e não-fuga de nomes/valores do host no `os.environ`, sem
+  tolerância genérica a `LC_*`/`LANG`/`PYTHON*`. A asserção exata da `ProcessSpec.env` em TR8/TR9
+  foi mantida. Teste novo POSIX/`/proc` do fenômeno e teste unitário da própria asserção
+  (relatórios sintéticos, inclusive `LC_CTYPE` no ambiente cru → falha).
+- Nenhuma mudança funcional ou de contrato de segurança: runner, Supervisor, política e
+  classificador de ambiente intocados; `LC_CTYPE`/`LANG`/`PYTHON*` não foram adicionados.
+- Gates locais (Windows): backend 4630 passed, 33 skipped, 0 failed; ruff, format, mypy, mypy
+  Linux, pip check e diff check limpos. Aguardando o CI do PR #10.

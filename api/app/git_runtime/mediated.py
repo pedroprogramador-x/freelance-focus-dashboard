@@ -219,12 +219,15 @@ class MediatedGit:
         is_cancelled: Callable[[], bool],
         capture_bytes: int,
         timeout_s: float | None = None,
+        remaining_s: Callable[[], float] | None = None,
     ) -> None:
         self._cwd = workspace_path
         self._expected_prefix = expected_prefix
         self._is_cancelled = is_cancelled
         self._capture = capture_bytes
         self._timeout = TIMEOUT_S if timeout_s is None else timeout_s
+        #: Prazo **global** de quem chama (E8.3), consultado a cada processo; `None` = só o fixo.
+        self._remaining = remaining_s
         self._git: str | None = None
         self._format: str | None = None
         self._prefix: bytes | None = None
@@ -242,14 +245,32 @@ class MediatedGit:
             self._git = found
         return self._git
 
+    def _step_timeout(self) -> float:
+        """O prazo **deste** processo, calculado agora, imediatamente antes de iniciá-lo.
+
+        Sem ``remaining_s``, o fixo da sessão (comportamento histórico). Com ele, o fixo
+        encurtado — nunca aumentado — pelo que resta do prazo global; sem prazo restante (ou
+        consulta que falha), o processo **não nasce** (`TIMEOUT`).
+        """
+        if self._remaining is None:
+            return self._timeout
+        try:
+            remaining = float(self._remaining())
+        except Exception:
+            raise _fail(GitFailure.TIMEOUT) from None
+        if not remaining > 0.0:  # inclui NaN
+            raise _fail(GitFailure.TIMEOUT)
+        return min(self._timeout, remaining)
+
     def _run(self, *args: str, max_stdout: int | None = None) -> ProcessResult:
         """O **único** ponto que roda Git mediado. Devolve só `EXITED` com saída completa."""
+        timeout = self._step_timeout()
         try:
             spec = ProcessSpec(
                 argv=(self._executable(), *_MEDIATED_GIT_OPTIONS, "-C", self._cwd, *args),
                 cwd=self._cwd,
                 env=_git_env(),
-                timeout_s=self._timeout,
+                timeout_s=timeout,
                 max_stdout_bytes=max(1, self._capture if max_stdout is None else max_stdout),
                 max_stderr_bytes=_STDERR_BYTES,
             )

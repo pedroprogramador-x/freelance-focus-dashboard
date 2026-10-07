@@ -97,7 +97,8 @@ leitura fica confinado a este arquivo — o único ponto de chamada é `_run_git
 A superfície de worktree (`task_worktree_names`, `repository_layout`, `list_worktrees`,
 `inspect_task_worktree`, `classify_task_worktree`, `create_worktree`) é reexportada no fim
 deste arquivo: `worktree.py` usa os auxiliares de leitura daqui, então a importação dele
-vem depois de todos estarem definidos.
+vem depois de todos estarem definidos. O mesmo vale para as duas leituras da verificação
+pós-execução da E8.3 (`main_tree_status`, `worktree_changes`, em `post_execution.py`).
 """
 
 from __future__ import annotations
@@ -162,7 +163,7 @@ _SHA1_RE = re.compile(r"[0-9a-fA-F]{40}")
 #: a **única** transformação aplicada depois. Uma base, uma transformação, em todo lugar —
 #: era a assimetria (o `ls-tree` relativo ao cwd, o resto relativo à raiz) que produzia os
 #: casos novos a cada rodada.
-_READONLY_GIT_OPTIONS = (
+_READONLY_GIT_OPTIONS: tuple[str, ...] = (
     "-c",
     "core.fsmonitor=false",
     "-c",
@@ -248,7 +249,11 @@ def _git_env(source: Mapping[str, str] | None = None) -> dict[str, str]:
 
 
 def _run_git(
-    git: str, local_path: str, *args: str, stdin: bytes | None = None
+    git: str,
+    local_path: str,
+    *args: str,
+    stdin: bytes | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[bytes] | None:
     """Executa `git -c core.fsmonitor=false -C <local_path> <args>` sem shell, ambiente mínimo.
 
@@ -257,14 +262,17 @@ def _run_git(
     `subprocess` arrisca tradução de quebra de linha e decodificação numa thread que este
     `except` não alcança. A conversão para texto é sempre um passo explícito de quem chama,
     via `_decode_text`. ``stdin`` (bytes, E7.4) alimenta leituras em lote como o
-    `cat-file --batch` — lista de objetos sem limite de linha de comando.
+    `cat-file --batch` — lista de objetos sem limite de linha de comando. ``timeout`` (E8.3)
+    só **encurta** o prazo fixo: quem tem um prazo global (a verificação pós-execução) passa
+    o que resta dele; nunca passa de `_TIMEOUT_SECONDS`, e o padrão de toda outra chamada não muda.
     """
+    limit = _TIMEOUT_SECONDS if timeout is None else max(0.0, min(_TIMEOUT_SECONDS, timeout))
     try:
         return subprocess.run(  # noqa: S603 — sem shell; argv literal; git resolvido por shutil.which
             [git, *_READONLY_GIT_OPTIONS, "-C", local_path, *args],
             capture_output=True,
             input=stdin,
-            timeout=_TIMEOUT_SECONDS,
+            timeout=limit,
             check=False,
             env=_git_env(),
         )
@@ -1459,7 +1467,18 @@ def _ordinary_kind(xy: str) -> WorkingTreeChange:
 # ------------------------------------------------ E7.4: worktree de task (reexportação)
 #
 # No fim de propósito: `worktree.py` importa `_run_git`, `_git_env`, `_decode_text`,
-# `_has_git_marker` e `_workspace_prefix` deste módulo, que já existem neste ponto.
+# `_has_git_marker` e `_workspace_prefix` deste módulo, que já existem neste ponto. O mesmo
+# para `post_execution.py` (E8.3), que compõe os auxiliares de `worktree.py`.
+from app.git_runtime.post_execution import (  # noqa: E402
+    MainTreeState,
+    VerificationBudget,
+    VerificationFailure,
+    WorktreeChange,
+    WorktreeChangeKind,
+    WorktreeChanges,
+    main_tree_state,
+    worktree_changes,
+)
 from app.git_runtime.worktree import (  # noqa: E402
     InvalidWorktreeRequest,
     RepositoryLayout,
@@ -1485,14 +1504,20 @@ __all__ = [
     "GitPreflight",
     "HeadProbe",
     "InvalidWorktreeRequest",
+    "MainTreeState",
     "RepositoryLayout",
     "TaskWorktreeFacts",
     "TaskWorktreeNames",
     "TreeListing",
     "UnrepresentablePath",
+    "VerificationBudget",
+    "VerificationFailure",
     "WorkingTreeChange",
     "WorkingTreeEntry",
     "WorkingTreeListing",
+    "WorktreeChange",
+    "WorktreeChangeKind",
+    "WorktreeChanges",
     "WorktreeInventory",
     "WorktreeOutcome",
     "WorktreeRecord",
@@ -1502,10 +1527,12 @@ __all__ = [
     "inspect_task_worktree",
     "list_tree",
     "list_worktrees",
+    "main_tree_state",
     "preflight",
     "probe_head",
     "repository_layout",
     "task_worktree_names",
     "working_tree_diff_against",
     "working_tree_status",
+    "worktree_changes",
 ]

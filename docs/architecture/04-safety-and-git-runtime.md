@@ -606,6 +606,108 @@ mudou.
 **Alcance real:** detecta escrita na árvore principal. **Não** detecta escrita em outros
 lugares do disco. É detecção pontual, não contenção.
 
+#### Adendo autorizado — E8.3 (2026-10-06): Test Runner e verificação pós-execução
+
+> Adendo aprovado por Pedro (decisões D1–D10 da E8.3 e C1–C15 da correção da auditoria
+> independente). §6 e os itens 2 e 3 acima continuam valendo sem alteração. O **objetivo** do
+> item 1 (detectar escrita na árvore principal) também; o **mecanismo** citado nele — `git
+> status` antes × depois — é substituído, por decisão C1 do Product Owner, pelo estado
+> *read-only* e *filter-free* descrito abaixo, que detecta estritamente mais e não executa
+> nenhum helper do projeto.
+> Módulos: `agent_runtime/runners/local_subprocess.py`, `git_runtime/post_execution.py`,
+> `execution_verification.py` (arestas no adendo E8.3 de [01](01-v1-architecture.md) §2).
+
+**Test Runner (`generic-subprocess-v1`).** Executa só a `TestPolicy`, sob `process_runtime`:
+
+1. `cwd` = o workspace **dentro** da worktree do run, achado pelo binding explícito
+   `(workspace_ref, run_scope)` — a mesma conferência da `ToolExecutorFactory`.
+2. Executável lógico → caminho **absoluto** confiável, resolvido só nas entradas **absolutas**
+   do `PATH` do ambiente confiável do host — nunca pelo `cwd`, nunca por entrada vazia ou
+   relativa, nunca dentro da worktree (pelo caminho e pelo destino real). Caminho absoluto
+   configurado é aceito com as mesmas regras. No Windows, só `.exe`/`.com` são lançáveis (o
+   `PATHEXT` não participa); `.bat`/`.cmd` são recusados em qualquer SO — um projeto Node usa
+   `node.exe` + o *entrypoint* JS, nunca `npm.cmd`. Intérpretes de linha de comando (`cmd`,
+   `powershell`/`pwsh`, `bash`, `sh` e afins, hosts de script do Windows, `env`) são recusados
+   como executável, pelo nome e pelo destino real: nenhum shell interpreta o comando.
+3. Ambiente do filho **construído do zero**: allowlist ∩ ambiente confiável. Nome ausente não
+   aparece; `PATH`/`SYSTEMROOT` só entram se allowlisted. Variável de provider, token,
+   credencial ou chave — e também **localizador de credencial** (`DOCKER_CONFIG`, `KUBECONFIG`,
+   `NETRC`, `GOOGLE_APPLICATION_CREDENTIALS`, `AWS_SHARED_CREDENTIALS_FILE`, `SSH_AUTH_SOCK`,
+   `SSH_ASKPASS`, `GIT_ASKPASS`…) e *connection string* com credencial (`DATABASE_URL` e afins)
+   — é **recusada antes do processo nascer**, mesmo se allowlisted
+   (`safety.test_policy.is_forbidden_test_env_name`, consultada pelo runner a cada execução,
+   inclusive para uma `TestPolicy` montada à mão).
+4. Processo que terminou (`EXITED`) é `TestSummary`, inclusive com `exit_code != 0`: falha de
+   teste não é falha técnica. Timeout, cancelamento e falha de supervisão são falhas
+   estruturadas (`TestRunnerFailure`), com a árvore encerrada; nenhum `TestSummary` é inventado.
+5. `stdout`/`stderr` são drenados e limitados pelo Supervisor e **descartados**: não vão a
+   `TestSummary`, exceção, log, banco nem `SafetyEvent`. `output_ref = None` na V1.
+
+**O Test Runner não é sandbox** — §6 vale integralmente: o código do projeto ainda pode ler
+`~/.ssh`, abrir rede, escrever fora da worktree e usar APIs do SO. Risco residual aceito até a E14.
+
+**Verificação pós-execução, item 1 — árvore principal.** O estado é do **repositório
+principal inteiro** — a raiz vem do Git (`rev-parse --show-toplevel`), não do `local_path` do
+workspace, que pode ser subdiretório de um monorepo — e é **read-only e filter-free**: nenhum
+`git status`/`diff`/`add`/`checkout`/`hash-object`, nenhum filtro (`clean`/`smudge`/`process`),
+`fsmonitor`, `textconv`, diff externo, hook, shell ou helper do projeto. O único Git é
+`rev-parse` (raiz, git dir, `.git` comum, caminho do índice efetivo). O estado combina:
+
+* **identidade da raiz** — toplevel e `.git` comum, por caminho e identidade de objeto (um "antes"
+  de um repositório não vale para a worktree de outro);
+* **índice efetivo** — os bytes crus do arquivo que o próprio Git aponta, resumidos por SHA-256
+  em leitura estável (*staged*, `assume-unchanged`, `skip-worktree` e qualquer outra mudança no
+  índice aparecem);
+* **filesystem da raiz** — todo *directory entry* ordinário, rastreado, não rastreado e
+  **ignorado**, inclusive os arquivos de repositórios aninhados como filesystem comum: caminho em
+  bytes, tipo, bits de modo, tamanho e SHA-256 do **conteúdo** (arquivo regular); o alvo do link
+  (symlink/junction), que **nunca é seguido**; o tipo de FIFO/socket/device, que **nunca é
+  aberto**. Reparse point de outro tipo, ou leitura que não fecha, é não verificável. O git dir
+  administrativo da raiz não é percorrido — o índice é a exceção explícita. Cada diretório entra
+  na travessia com a identidade observada e é revalidado (tipo, link/reparse, identidade)
+  imediatamente **antes** do `scandir` e de novo **depois**: entrada trocada por junction,
+  symlink, arquivo ou outro diretório enquanto esperava falha fechado (E8.3-FINAL-002). Não é
+  proteção absoluta: troca **e restauração** concorrentes entre as duas observações, sem rastro
+  de identidade, são TOCTOU residual declarado (a sandbox é a E14).
+
+Antes × depois diferente → `out_of_worktree_write` — inclusive rastreado limpo ou já sujo,
+`assume-unchanged`, `skip-worktree`, não rastreado ou ignorado novo ou com conteúdo trocado,
+mudança no índice, remoção, rename, modo e conteúdo em repositório aninhado. Estado ilegível
+antes **ou** depois → não verificável (fail closed), nunca "igual". **Fora do contrato,
+declarado:** os demais metadados do `.git` (`HEAD`, refs, objetos, config, hooks, `info/exclude`,
+reflogs) e *alternate data streams* do NTFS.
+
+**Orçamento.** `capture` e `verify` têm, **cada um**, um orçamento único que cobre todos os seus
+subpassos (no `verify`: o estado "depois", a identidade da worktree, os registros do Git, o
+filesystem da worktree e o hash): **100 000 entradas** observadas (cobradas durante a enumeração,
+nunca depois de materializar o iterador), **1 GiB de bytes efetivamente lidos** (cobrados por
+bloco lido, nunca pelo `stat`; arquivo que cresce durante a leitura é recusado), **60 s** de
+relógio monotônico e o **cancelamento** do run (porta neutra `is_cancelled`). Prazo e
+cancelamento são consultados antes **e depois** de cada passo potencialmente longo (leitura Git,
+diretório, bloco, inspeção de caminho); o *timeout* de cada processo Git — inclusive o mediado —
+é o que resta do prazo, calculado imediatamente antes de iniciá-lo (sem prazo restante, o
+processo não nasce). `VERIFIED` sai de um único ponto, que revalida o orçamento antes de liberar
+(E8.3-FINAL-001). Orçamento esgotado é não verificável com causa estruturada
+(`limit_exceeded`, `deadline_exceeded`, `cancelled`) — **nunca** `VERIFIED` parcial.
+
+**Item 2 — worktree do run.** O Git Runtime é a única fonte das mudanças: a worktree **inteira**
+contra o `base_commit`, com a identidade conferida antes (prefixo confirmado pelo Git, `.git`
+comum do repositório principal, `.git` da worktree apontando para o admin dir que a registra,
+`HEAD == base_commit`, nenhuma operação em andamento). Como na E7.4/E7.5-D, o Git **não lê** a
+worktree: árvore do base, índice e `diff-index --cached` vêm do Git mediado (sob o Supervisor e o
+orçamento), **cientes do formato de objeto** do repositório (`sha1` ou `sha256`, lido por
+`rev-parse --show-object-format`; outro valor é não verificável); o disco é percorrido no Python,
+sem seguir link (com a mesma revalidação de diretório antes e depois da descida, e o mesmo TOCTOU
+residual), **ignorados incluídos**, com o oid de blob calculado no formato do repositório
+(`b"blob <tamanho>\0" + bytes`, SHA-1 ou SHA-256) em streaming.
+Para workspace em subdiretório, **qualquer mudança fora do
+`workspace_prefix` é recusada** (`outside_workspace_change`); dentro dele, cada caminho mudado
+passa pela pipeline de uma **escrita** mediada (`prevalidate_mediated_path` → `inspect` →
+`decide_path(WRITE)`), e caminho apagado é validado pelo próprio caminho, sem recriá-lo. Link,
+junction, reparse point, entrada que não é arquivo nem diretório, nome sem representação ou
+leitura incompleta falham fechado. Tudo é **só leitura** e devolve um fato estruturado; quem
+grava `SafetyEvent`, bloqueia o run e para a task é o Execution Manager (E8.4).
+
 ### OneDrive — mitigação parcial
 
 Worktrees fora do OneDrive **reduzem**, mas **não eliminam** o risco: os metadados da
