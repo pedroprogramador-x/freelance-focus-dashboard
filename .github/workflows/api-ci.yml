@@ -94,6 +94,9 @@ jobs:
   # E7.4 (D10): o mesmo job cobre a worktree de task no Windows real — junctions, caixa de
   # caminho, `.git` oculto, `git-lfs` na config de sistema do runner e o `worktree add` sob Job
   # Object (timeout/cancelamento com a árvore inteira morta). Job mantido com o mesmo nome.
+  #
+  # E8.4.2: o mesmo job cobre a preparação da execution workspace (worktree real, junction/rename
+  # da raiz, binding por Run e publicação entre processos). Os cenários POSIX rodam no job Linux.
   process-runtime-windows:
     runs-on: windows-latest
     timeout-minutes: 15
@@ -117,5 +120,6 @@ jobs:
           tests/test_process_runtime_e7_3.py
           tests/test_git_worktree_e7_4.py
           tests/test_worktree_root_e7_4.py
+          tests/test_execution_workspace_e8_4_2.py
           tests/test_git_runtime.py
           tests/test_architecture.py

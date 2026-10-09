@@ -2272,3 +2272,65 @@ def test_start_execution_continua_no_limite_da_e8_4() -> None:
         for imported in _imports(path):
             assert not imported.startswith(("app.execution_verification", "app.process_runtime"))
         assert "/execute" not in path.read_text(encoding="utf-8")
+
+
+# ------------------------------------------------- E8.4.2: preparação da execution workspace
+
+_EXECUTION_WORKSPACE = APP_ROOT / "orchestrator" / "execution_workspace.py"
+_WORKSPACE_CONTRACT = APP_ROOT / "orchestrator" / "workspace_contract.py"
+
+
+def test_orchestrator_recebe_path_runtime_e_verificacao_por_injecao() -> None:
+    """E8.4.2: a preparação usa o Path Runtime, a captura da E8.3 e o binding concreto **por
+    injeção** (portas estruturais, dados neutros). Nenhum módulo do Orchestrator importa
+    `path_runtime`, `execution_verification`, `process_runtime`, `tool_executor` ou
+    `agent_runtime` — nem dentro de `TYPE_CHECKING` (`_imports` percorre o arquivo inteiro)."""
+    proibidos = (
+        "app.path_runtime",
+        "app.execution_verification",
+        "app.process_runtime",
+        "app.tool_executor",
+        "app.agent_runtime",
+    )
+    for path in (APP_ROOT / "orchestrator").rglob("*.py"):
+        for imported in _imports(path):
+            assert not imported.startswith(proibidos), (
+                f"orchestrator/{path.name} importa `{imported}`: chega por injeção"
+            )
+    assert _EXECUTION_WORKSPACE.is_file() and _WORKSPACE_CONTRACT.is_file()
+
+
+def test_preparacao_nao_e_operacional() -> None:
+    """E8.4.2 é componente interno: nenhum módulo da aplicação (rota, `main.py`, startup, ponte do
+    composition root) importa o serviço de preparação. A composição integrada é da E8.4.6."""
+    for path in ALL_FILES:
+        if path in (_EXECUTION_WORKSPACE, _WORKSPACE_CONTRACT):
+            continue
+        for imported in _imports(path):
+            assert not imported.startswith("app.orchestrator.execution_workspace"), (
+                f"{_module_name(path)} importa a preparação: integração é E8.4.6"
+            )
+        assert "ExecutionWorkspaceService" not in path.read_text(encoding="utf-8"), path.name
+
+
+def test_admissao_continua_sem_efeito_externo_da_preparacao() -> None:
+    """A admissão (E8.4.1) não chama a preparação nem as escritas dela: worktree, snapshot e
+    binding só nascem depois, fora da transação de admissão."""
+    tree = ast.parse((APP_ROOT / "orchestrator" / "execution_manager.py").read_text("utf-8"))
+    [admit] = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "admit_execution"
+    ]
+    chamadas = {
+        node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", "")
+        for node in ast.walk(admit)
+        if isinstance(node, ast.Call)
+    }
+    assert not chamadas & {
+        "publish_prepared_workspace",
+        "record_workspace_preparation_failure",
+        "read_preparation_facts",
+        "capture_main_tree",
+        "bind_run",
+    }

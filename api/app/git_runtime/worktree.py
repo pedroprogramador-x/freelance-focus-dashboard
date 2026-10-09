@@ -1381,16 +1381,41 @@ def _read_tree_argv(git: str, target: str, base_commit: str) -> tuple[str, ...]:
     )
 
 
+def _step_timeout_s(remaining_s: Callable[[], float] | None) -> float | None:
+    """Prazo de **um** passo mutante: o teto E7.4, encurtado pelo que resta ao chamador (E8.4.2).
+
+    Calculado imediatamente antes do passo. Sem ``remaining_s`` vale o teto histórico. `None` =
+    não resta prazo (ou a consulta falhou: fail closed) — o passo **não** nasce.
+    """
+    if remaining_s is None:
+        return _GIT_STEP_TIMEOUT_S
+    try:
+        remaining = float(remaining_s())
+    except Exception:
+        return None
+    if not remaining > 0.0:  # também recusa NaN
+        return None
+    return min(_GIT_STEP_TIMEOUT_S, remaining)
+
+
 def _run_git_step(
-    argv: tuple[str, ...], cwd: str, is_cancelled: Callable[[], bool]
+    argv: tuple[str, ...],
+    cwd: str,
+    is_cancelled: Callable[[], bool],
+    remaining_s: Callable[[], float] | None = None,
 ) -> ProcessResult | None:
-    """O **único** ponto que roda Git mutante: sob `process_runtime` (adendo E7.4)."""
+    """O **único** ponto que roda Git mutante: sob `process_runtime` (adendo E7.4).
+
+    `None` = o processo não nasceu (spec inválida ou prazo do chamador esgotado)."""
+    timeout_s = _step_timeout_s(remaining_s)
+    if timeout_s is None:
+        return None
     try:
         spec = ProcessSpec(
             argv=argv,
             cwd=cwd,
             env=_git_env(),
-            timeout_s=_GIT_STEP_TIMEOUT_S,
+            timeout_s=timeout_s,
             max_stdout_bytes=_MAX_OUTPUT_BYTES,
             max_stderr_bytes=_MAX_OUTPUT_BYTES,
         )
@@ -1514,8 +1539,13 @@ def create_worktree(
     root: WorktreeRoot,
     tree_writer: TreeWriterFactory,
     is_cancelled: Callable[[], bool] | None = None,
+    remaining_s: Callable[[], float] | None = None,
 ) -> WorktreeOutcome:
     """Cria (ou reconhece para reuso) a worktree da task. Idempotente e fail closed.
+
+    ``remaining_s`` (E8.4.2, opcional) é o prazo que resta ao **chamador**, consultado
+    imediatamente antes de cada passo mutante: o passo recebe ``min(120 s, restante)`` e não
+    nasce sem prazo. Ausente, vale o teto histórico. Não é argv, flag nem configuração: só encurta.
 
     1. Inspeciona e classifica. `REUSABLE` → devolve com `reused=True`; qualquer veredito
        diferente de `ABSENT` → recusa, sem tocar em nada.
@@ -1567,8 +1597,10 @@ def create_worktree(
     if _target_kind(target) is not TargetKind.ABSENT:
         return _outcome(before, WorktreeVerdict.FOREIGN_PATH)
 
+    if remaining_s is not None and not callable(remaining_s):
+        raise InvalidWorktreeRequest("remaining_s precisa ser Callable[[], float]")
     added = _run_git_step(
-        _add_argv(git, local_path, names, target, base_commit), local_path, cancelled
+        _add_argv(git, local_path, names, target, base_commit), local_path, cancelled, remaining_s
     )
     if not _step_ok(added):
         after = _collect(git, local_path, names, base_commit, root)
@@ -1581,13 +1613,15 @@ def create_worktree(
             final = WorktreeVerdict.CREATED_INVALID
         else:
             final = after_verdict
-        outcome = "ProcessSpec inválida" if added is None else added.outcome.value
+        outcome = "não iniciado" if added is None else added.outcome.value
         return _outcome(after, final, result=added, detail=f"git worktree add: {outcome}")
 
-    indexed = _run_git_step(_read_tree_argv(git, target, base_commit), target, cancelled)
+    indexed = _run_git_step(
+        _read_tree_argv(git, target, base_commit), target, cancelled, remaining_s
+    )
     problem: str | None
     if not _step_ok(indexed):
-        outcome = "ProcessSpec inválida" if indexed is None else indexed.outcome.value
+        outcome = "não iniciado" if indexed is None else indexed.outcome.value
         problem = f"git read-tree: {outcome}"
     else:
         problem = _materialize(git, local_path, target, root, snapshot, tree_writer, cancelled)
