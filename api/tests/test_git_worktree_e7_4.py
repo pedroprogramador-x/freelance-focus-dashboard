@@ -1270,9 +1270,14 @@ def _count_steps(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
     steps: list[tuple[str, ...]] = []
     real = wt._run_git_step
 
-    def spy(argv: tuple[str, ...], cwd: str, is_cancelled: Callable[[], bool]) -> object:
+    def spy(
+        argv: tuple[str, ...],
+        cwd: str,
+        is_cancelled: Callable[[], bool],
+        remaining_s: Callable[[], float] | None = None,  # E8.4.2: prazo opcional do chamador
+    ) -> object:
         steps.append(argv)
-        return real(argv, cwd, is_cancelled)
+        return real(argv, cwd, is_cancelled, remaining_s)
 
     monkeypatch.setattr(wt, "_run_git_step", spy)
     return steps

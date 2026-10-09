@@ -73,7 +73,7 @@ from inspect import signature
 from pathlib import Path
 from typing import Any, ParamSpec, TypeVar, cast
 
-from sqlalchemy import CursorResult, select, update
+from sqlalchemy import ColumnElement, CursorResult, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
@@ -148,6 +148,7 @@ from app.orchestrator.state_machine import (
     require_transition,
     transition_fields,
 )
+from app.orchestrator.workspace_contract import PreparationCode, PreparationFacts
 from app.safety import redact
 from app.safety.canonical import canonical_sha256
 from app.safety.capability_verification import CapabilityBinding
@@ -495,6 +496,7 @@ def record_safety_event(
     workspace_id: str | None = None,
     task_id: str | None = None,
     detail: str | None = None,
+    run_id: str | None = None,
 ) -> SafetyEvent:
     """Acrescenta uma linha à trilha append-only de [02] §12.
 
@@ -505,6 +507,7 @@ def record_safety_event(
     event = SafetyEvent(
         workspace_id=workspace_id,
         task_id=task_id,
+        run_id=run_id,
         kind=kind,
         decision=decision,
         rule_id=rule_id,
@@ -1770,6 +1773,294 @@ def admit_execution(
     return ExecutionAdmission(AdmissionOutcome.ADMITTED, get_task(session, task_id), run)
 
 
+# --------------------------------------------------------------------- preparação (E8.4.2)
+#
+# As três funções abaixo são o lado **banco** da preparação da execution workspace
+# (`orchestrator.execution_workspace`). Nenhuma faz IO externo: o serviço as chama em sessões
+# curtas e separadas, e nenhuma transação fica aberta durante Git, filesystem, captura da árvore
+# principal ou registro do binding. Nenhuma transiciona a task: falha depois da admissão deixa a
+# task `executing` e o Run de controle `running` para a finalização agregada da E8.4.5.
+
+_SHA1_HEX = frozenset("0123456789abcdef")
+
+
+def _is_full_sha1(value: str | None) -> bool:
+    return value is not None and len(value) == 40 and set(value) <= _SHA1_HEX
+
+
+def _worktree_claims(
+    session: Session, task: WorkspaceTask, *, control_run_id: str, base_commit: str
+) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
+    """`(colisão de id8, caminhos de outras tasks, caminhos desta task)` — só banco.
+
+    O `id8` é o que vira `ff-task-<id8>`/`ff/task-<id8>` sob a raiz **compartilhada** por todos os
+    workspaces; por isso a colisão considera qualquer outra task, de qualquer workspace e em
+    qualquer status (terminal inclusive: a worktree dela é preservada). Os caminhos registrados
+    por outras tasks e pelos Runs delas também são reivindicações. Os desta task (Task e Runs
+    anteriores sobre a mesma base) são a única proveniência aceita para reuso.
+    """
+    id8 = task.id[:8]
+    collision = (
+        session.scalar(
+            select(WorkspaceTask.id)
+            .where(
+                WorkspaceTask.id.startswith(id8, autoescape=True),
+                WorkspaceTask.id != task.id,
+            )
+            .limit(1)
+        )
+        is not None
+    )
+    foreign = [
+        *session.scalars(
+            select(WorkspaceTask.worktree_path).where(
+                WorkspaceTask.id != task.id, WorkspaceTask.worktree_path.is_not(None)
+            )
+        ),
+        *session.scalars(
+            select(Run.worktree_path).where(Run.task_id != task.id, Run.worktree_path.is_not(None))
+        ),
+    ]
+    own = [
+        *session.scalars(
+            select(Run.worktree_path).where(
+                Run.task_id == task.id,
+                Run.id != control_run_id,
+                Run.base_commit == base_commit,
+                Run.worktree_path.is_not(None),
+            )
+        )
+    ]
+    if task.worktree_path is not None and task.base_commit == base_commit:
+        own.append(task.worktree_path)
+    return (
+        collision,
+        tuple(path for path in foreign if path is not None),
+        tuple(path for path in own if path is not None),
+    )
+
+
+@command
+def read_preparation_facts(
+    session: Session,
+    task_id: str,
+    *,
+    control_run_id: str,
+    developer_binding_resolver: DeveloperBindingResolver | None,
+) -> PreparationFacts:
+    """Relê a admissão para a preparação (E8.4.2, etapa A). **Só leitura**, sem IO externo.
+
+    Na ordem: task e Run de controle existentes e um do outro; task `executing`, Run `running`,
+    sem cancelamento; Run na tentativa corrente (`attempt_index == attempts - 1`, mesmo
+    `fix_round`); workspace ativo; plano, manifest e o manifest do Run coerentes; as quatro bases
+    e a do Run iguais e SHA-1 completo; `TestPolicy` presente e fingerprint recalculado igual ao
+    aprovado (cobre `test_config`, política, limites e binding). Devolve a primeira incoerência em
+    ``code`` — nunca levanta por estado — e os fatos de ownership.
+    """
+    task = session.get(WorkspaceTask, task_id)
+    if task is None:
+        return PreparationFacts(PreparationCode.TASK_MISSING, task_id, control_run_id)
+
+    def refuse(code: PreparationCode) -> PreparationFacts:
+        return PreparationFacts(code, task_id, control_run_id, workspace_id=task.workspace_id)
+
+    run = session.get(Run, control_run_id)
+    if (
+        run is None
+        or run.task_id != task.id
+        or run.agent is not RunAgent.ORCHESTRATOR
+        or run.purpose is not RunPurpose.EXECUTION
+    ):
+        return refuse(PreparationCode.RUN_MISMATCH)
+    if task.status is not TaskStatus.EXECUTING:
+        return refuse(PreparationCode.TASK_NOT_EXECUTING)
+    if run.status is not RunStatus.RUNNING:
+        return refuse(PreparationCode.RUN_NOT_OPEN)
+    if task.cancel_requested:
+        return refuse(PreparationCode.CANCEL_REQUESTED)
+    if run.attempt_index != task.attempts - 1 or run.fix_round != task.fix_rounds:
+        return refuse(PreparationCode.ATTEMPT_MISMATCH)
+
+    workspace = session.get(DevWorkspace, task.workspace_id)
+    if workspace is None or workspace.status is not WorkspaceStatus.ACTIVE:
+        return refuse(PreparationCode.WORKSPACE_INACTIVE)
+
+    manifest = latest_manifest(session, task)
+    if (
+        manifest is None
+        or _plan_incoherence(task, manifest) is not None
+        or run.context_manifest_id != manifest.id
+    ):
+        return refuse(PreparationCode.PLAN_INCOHERENT)
+    base = task.planning_base_commit
+    if (
+        _base_commit_incoherence(task, manifest) is not None
+        or run.base_commit != base
+        or not _is_full_sha1(base)
+    ):
+        return refuse(PreparationCode.BASE_COMMIT_INCOHERENT)
+    assert base is not None
+
+    try:
+        test_policy = read_test_policy(workspace)
+        current_fingerprint, _parts = _recompute_fingerprint(
+            session, task, developer_binding_resolver=developer_binding_resolver
+        )
+    except OrchestratorError:
+        return refuse(PreparationCode.FINGERPRINT_DIVERGED)
+    if test_policy is None:
+        return refuse(PreparationCode.TEST_POLICY_MISSING)
+    if current_fingerprint != task.approved_fingerprint:
+        return refuse(PreparationCode.FINGERPRINT_DIVERGED)
+
+    decision = decision_from_task(task)
+    collision, foreign, own = _worktree_claims(
+        session, task, control_run_id=control_run_id, base_commit=base
+    )
+    return PreparationFacts(
+        code=None,
+        task_id=task.id,
+        control_run_id=run.id,
+        workspace_id=workspace.id,
+        local_path=workspace.local_path,
+        base_commit=base,
+        task_version=task.version,
+        control_invocation_id=run.invocation_id,
+        run_started_at=run.started_at,
+        attempt_index=run.attempt_index,
+        fix_round=run.fix_round,
+        run_timeout_s=decision.run_timeout_s,
+        task_timeout_s=decision.task_timeout_s,
+        id8_collision=collision,
+        foreign_paths=foreign,
+        own_paths=own,
+        control_worktree_path=run.worktree_path,
+    )
+
+
+@command
+def publish_prepared_workspace(
+    session: Session,
+    task_id: str,
+    *,
+    control_run_id: str,
+    expected_version: int,
+    worktree_path: str,
+) -> int:
+    """Etapa J: grava a raiz da worktree na task e no Run de controle, **protegida por CAS**.
+
+    Uma transação curta, sem IO: o CAS `(id, executing, version)` da task (que só grava
+    `worktree_path` — não é transição) e o `UPDATE` do Run condicionado a `running` **e**
+    `worktree_path IS NULL`. Este segundo predicado é a exclusão durável de duas publicações para
+    o mesmo Run, entre processos. Qualquer um que não case → rollback e `ConcurrentTaskUpdate`:
+    cancelamento, finalização ou outra preparação venceu, e nada do vencedor é sobrescrito.
+    Devolve a versão nova da task.
+    """
+    try:
+        task = get_task(session, task_id)
+        _compare_and_set(
+            session,
+            task,
+            expected_status=TaskStatus.EXECUTING,
+            expected_version=expected_version,
+            values={"worktree_path": worktree_path},
+        )
+        result = cast(
+            "CursorResult[Any]",
+            session.execute(
+                update(Run)
+                .where(
+                    Run.id == control_run_id,
+                    Run.task_id == task_id,
+                    Run.status == RunStatus.RUNNING,
+                    Run.worktree_path.is_(None),
+                )
+                .values(worktree_path=worktree_path)
+            ),
+        )
+        if result.rowcount != 1:
+            raise ConcurrentTaskUpdate(
+                f"o Run de controle da task '{task_id}' não está mais aberto e sem worktree "
+                "publicada; a publicação virou no-op ([02] §4)"
+            )
+        session.commit()
+    except BaseException:
+        session.rollback()
+        raise
+    return expected_version + 1
+
+
+@command
+def record_workspace_preparation_failure(
+    session: Session,
+    task_id: str,
+    *,
+    control_run_id: str,
+    summary: str,
+    published_path: str | None = None,
+    residue_path: str | None = None,
+    safety_kind: SafetyEventKind | None = None,
+    rule_id: str | None = None,
+) -> bool:
+    """Registra uma preparação que não concluiu, **sem** tocar o estado da task.
+
+    * ``summary`` (vocabulário fechado, `workspace_preparation:<status>:<código>`) vai para o
+      `error_summary` do Run de controle **só enquanto ele está aberto** e só se a publicação nele
+      é a **desta** preparação (``published_path``) ou nenhuma: Run final é imutável, e o Run que
+      outra preparação publicou nunca é reescrito;
+    * ``residue_path`` — a raiz da worktree que esta preparação chegou a criar ou a reusar com
+      proveniência — vai para `Run.worktree_path` quando nada foi publicado: é o registro honesto
+      do resíduo, para a E8.4.5;
+    * ``safety_kind``/``rule_id`` deixam `SafetyEvent` (append-only, com o `run_id`) quando a
+      causa é decisão de política/integridade. Erro técnico não vira evento.
+
+    Devolve se o Run aberto recebeu o diagnóstico.
+    """
+    try:
+        values: dict[str, Any] = {"error_summary": summary}
+        ours: ColumnElement[bool]
+        if published_path is None:
+            ours = Run.worktree_path.is_(None)
+            if residue_path is not None:
+                values["worktree_path"] = residue_path
+        else:
+            ours = Run.worktree_path == published_path
+        updated = cast(
+            "CursorResult[Any]",
+            session.execute(
+                update(Run)
+                .where(
+                    Run.id == control_run_id,
+                    Run.task_id == task_id,
+                    Run.status == RunStatus.RUNNING,
+                    ours,
+                )
+                .values(**values)
+            ),
+        )
+        recorded = updated.rowcount == 1
+        if safety_kind is not None and rule_id is not None:
+            workspace_id = session.scalar(
+                select(WorkspaceTask.workspace_id).where(WorkspaceTask.id == task_id)
+            )
+            record_safety_event(
+                session,
+                kind=safety_kind,
+                decision=SafetyDecisionKind.DENY,
+                rule_id=rule_id,
+                subject=f"task:{task_id}",
+                workspace_id=workspace_id,
+                task_id=task_id,
+                run_id=control_run_id,
+                detail=summary,
+            )
+        session.commit()
+    except BaseException:
+        session.rollback()
+        raise
+    return recorded
+
+
 # --------------------------------------------------------------------------- recuperação
 
 
@@ -1855,8 +2146,11 @@ __all__ = [
     "list_tasks",
     "plan",
     "plan_standing",
+    "publish_prepared_workspace",
+    "read_preparation_facts",
     "reconcile_on_startup",
     "record_safety_event",
+    "record_workspace_preparation_failure",
     "reject",
     "start_execution",
     "workspace_of",

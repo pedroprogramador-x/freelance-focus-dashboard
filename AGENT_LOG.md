@@ -8649,3 +8649,167 @@ Mesma branch, base `f2911b2`; **não commitada**, sem push/PR/merge; E8.4.2/E8.4
   (plataforma), 0 failed, na 1ª execução; `ruff check`, `ruff format --check`, `mypy`,
   `mypy --platform linux`, `pip check`, `git diff --check` limpos.
 - Pendências: reauditoria final independente; CI Linux não rodou.
+
+## 2026-10-09 — Claude Opus 5.5 (effort: high) — E8.4.2 Execution Workspace — candidate
+
+Preparação da execution workspace como **componente interno não operacional**. Branch local
+`e8/04-2-execution-workspace` criada de `origin/main` = `dd0a8cb` (merge do PR #11), árvore
+`c41944380e9d…` conferida. **Não commitada**, sem push/PR/merge. Nada ligado a `main.py`, startup,
+rota, fila ou worker; `start_execution` segue no `NotImplementedError`. `docs/`/ADRs, frontend,
+`deploy.yml` e schema intocados (nenhuma migration).
+
+- Arquivos alterados:
+  - novos: `api/app/orchestrator/execution_workspace.py` (serviço, portas estruturais, resultado),
+    `api/app/orchestrator/workspace_contract.py` (vocabulário puro: status/etapa/código/binding,
+    `PreparationFacts`), `api/tests/test_execution_workspace_e8_4_2.py` (66 testes).
+  - alterados: `orchestrator/execution_manager.py` (`read_preparation_facts`,
+    `publish_prepared_workspace`, `record_workspace_preparation_failure`, todos `@command`;
+    `record_safety_event` ganha `run_id` opcional); `git_runtime/worktree.py` (`create_worktree`
+    aceita `remaining_s` opcional — passo mutante recebe `min(120 s, restante)` e não nasce sem
+    prazo; padrão histórico preservado); `tool_executor/workspace.py` (`RunWorkspaceBindings`,
+    `InMemoryWorkspaceResolver.unbind_exact`); `tests/test_architecture.py` (3 gates novos);
+    `tests/test_git_worktree_e7_4.py` (assinatura do spy de `_run_git_step`).
+- Decisões tomadas:
+  - Ordem A–L do contrato. **J (CAS) antes de K (binding)**: CAS perdido ⇒ nenhum binding chega
+    a existir; falha em K deixa Task/Run com o caminho real da worktree (resíduo honesto) e o
+    código no `error_summary` do Run aberto; falha em L remove só o binding próprio (token).
+  - Ownership: qualquer outra task com o mesmo `id8` (qualquer status/workspace — a raiz é
+    compartilhada) ⇒ `OWNERSHIP_CONFLICT`; caminho registrado por outra task/Run idem; reuso só
+    com proveniência registrada da **mesma** task e mesma base (Task/Runs anteriores). Worktree
+    estruturalmente REUSABLE sem registro nunca é adotada (crash entre criação e persistência).
+    `reused=True` sem pré-decisão de reuso ⇒ `UNEXPECTED_REUSE`.
+  - `HEAD` revalidado por `probe_head` em B, F, I e L; layout (toplevel/common/prefixo) em B, F, I;
+    identidades da raiz configurada/toplevel/common via porta de Path Runtime em C, F, I; worktree
+    e workspace interno em H, I e L; `expected_identity` vai ao binding canônico.
+  - Snapshot MAIN: captura real E8.3 antes de qualquer efeito, não verificável bloqueia, objeto
+    original guardado no contexto (genérico, nunca consumido/serializado).
+  - Prazo desde `Run.started_at` (relógio de parede injetado); a porta neutra `interrupted` =
+    cancelamento **ou** prazo; o desfecho é decidido por fatos (sinal × relógio), nunca por
+    `WorktreeOutcome.detail`.
+  - Falha não transiciona a task (fica `executing`/Run `running` para a E8.4.5); `SafetyEvent`
+    só para política/integridade (`path_denied` para ownership/worktree recusada,
+    `toctou_recheck_failed` para HEAD/layout/identidade). O diagnóstico no Run só é gravado se ele
+    está aberto e a publicação nele é desta preparação ou nenhuma.
+  - Exclusão local por Run (lock em memória, não vale entre processos); entre processos, o
+    predicado `Run.worktree_path IS NULL` do CAS de J. Nenhum dos dois é a reserva durável.
+  - `bind_component_run` registra bindings de Runs **existentes** (developer/test_runner) da mesma
+    tentativa com o `run_id` do componente; nenhum Run é criado.
+- Testes/gates (Windows, Python 3.11): E8.4.2 66 passed; regressão direcionada (E8.4.1, E7.4,
+  Path Runtime, foundation, E8.3, arquitetura, constraints, state machine) exit 0; **backend
+  completo: 4920 passed, 33 skipped (plataforma/privilégio), 0 failed, exit 0**; `ruff check`,
+  `ruff format --check`, `mypy`, `mypy --platform linux`, `pip check`, `git diff --check` limpos.
+  Mutantes (cópia isolada de `api/`, hash do fonte conferido): HEAD, id8, proveniência, `run_id`
+  do binding, âncoras de identidade, `expected_identity`, snapshot não verificável, última
+  checagem de L, predicado `worktree_path IS NULL` e CAS de versão — todos mortos (os dois
+  últimos de L/CAS só depois de testes acrescentados). Equivalente: remover o **primeiro**
+  `checkpoint` de L (o último cobre o mesmo caso, mesma etapa).
+- Pendências / riscos residuais: TOCTOU residual (troca e restauração entre leituras; não é
+  sandbox); leituras Git não mutantes do `create_worktree` mantêm o timeout fixo de 5 s;
+  `cancel_requested` persistido é conferido nas fronteiras e no CAS, não durante o IO (o sinal
+  injetado é a via em tempo real — E8.4.6 liga os dois); caminhos POSIX (symlink no lugar da
+  worktree, bit de execução) só pelo CI Linux, que não rodou. **E8.4.5 continua obrigatória**
+  (reserva durável, teardown comprovado, recovery). Auditoria independente pendente.
+
+## 2026-10-09 — Claude Sonnet 5.5 (effort: high) — E8.4.2 correções pós-auditoria Codex — candidate
+
+Auditoria independente da E8.4.2: BLOCKED (P0=0, P1=0, P2=3). Mesma branch local
+`e8/04-2-execution-workspace`, base `dd0a8cb` preservada; **não commitada**, sem push/PR/merge;
+E8.4.3+ não iniciadas. Sem migration, sem alteração de contrato, `docs/` e `deploy.yml` intocados.
+
+- E842-AUD-001 (`bind_component_run`, `execution_workspace.py`): `Run.base_commit` precisa existir
+  e ser **igual** a `context.base_commit`; divergente ou `NULL` ⇒ `ComponentBindingRefused`
+  (`base_commit_incoherent`), antes de qualquer registro de binding.
+- E842-AUD-002 (mesmo método): nova checagem de cancelamento/prazo **depois** de `bind_run`. Se
+  interrompido, remove **só** o binding criado (por token) e levanta `ComponentBindingRefused`
+  (`cancel_requested`/`deadline_exceeded`); nenhum token sai. A exceção ganhou
+  `binding_removed` (falso se a remoção não se provou). Bindings de outros Runs ficam intactos.
+- E842-AUD-003 (etapa L de `prepare`): além do `workspace_path`, revalida a identidade de
+  `worktree_path` contra a registrada em H ⇒ `IDENTITY_CHANGED`, sem contexto, compensação
+  exclusiva do binding da preparação.
+- Mutante "primeiro `checkpoint` de L": **não é equivalente** (corrijo a classificação anterior). Com
+  sinal de cancelamento + `cancel` humano durante o binding, o resultado completo é `CANCELLED`;
+  sem o checkpoint vira `SUPERSEDED` (a releitura vê a task cancelada primeiro). Teste novo trava.
+- Testes novos (+14, `test_execution_workspace_e8_4_2.py`, agora 80; +1 worker): base do
+  componente (Developer/Test Runner × correta/divergente/nula = 6); interrupção durante o binding
+  (2 agentes × cancelamento/prazo = 4) e remoção não provada (1); raiz externa trocada em
+  monorepo — o teste renomeia o conteúdo para um diretório novo no mesmo caminho: identidade externa
+  muda, `pkg/ws` mantém a sua e `classify_task_worktree` continua `REUSABLE` (1); sinal × cancel
+  persistido (1); publicação de J entre **dois processos** (`tests/publish_worker_e8_4_2.py`, ~60
+  linhas, padrão do worker da E8.4.1) (1).
+- Mutantes (cópia isolada de `api/`, hash do fonte real conferido antes/depois): base do componente
+  (2 variantes), checkpoint pós-bind, não-remoção do binding, identidade externa em L, primeiro
+  checkpoint de L — todos mortos. O teste de **processos** sozinho NÃO distingue a remoção do
+  predicado `Run.worktree_path IS NULL` nem do CAS de versão (o conflito de snapshot do SQLite já
+  serializa a leitura+escrita, e as duas guardas se cobrem); cada guarda é morta pelos testes
+  deterministas de processo único (`publicacao_exige_versao…`, `segunda_preparacao…`,
+  `cancelamento_antes_da_publicacao…`). O teste de processos é regressão de exclusividade e
+  coerência Task/Run entre processos, não prova de intercalação.
+- CI: `tests/test_execution_workspace_e8_4_2.py` acrescentado ao job `process-runtime-windows`
+  (`.github/workflows/api-ci.yml`, 1 linha + comentário; `timeout-minutes: 15` mantido: medição local
+  ≈ 290 s do job atual + ≈ 248 s do arquivo novo — risco se o runner for bem mais lento). O job
+  Linux já roda a suíte inteira, o que exercita os cenários POSIX (ver riscos).
+- Gates (Windows, Python 3.11): 14 regressões novas passam; regressão direcionada exit 0; **backend
+  completo 4934 passed, 33 skipped (plataforma/privilégio), 0 failed, exit 0**; `ruff check`,
+  `ruff format --check`, `mypy`, `mypy --platform linux`, `pip check`, `git diff --check` limpos.
+  Após a suíte, só o docstring de `bind_component_run` foi ajustado (editorial; `ruff`/`mypy`/
+  `test_architecture` reexecutados). Nenhuma falha do produto; as únicas falhas vistas no caminho
+  foram do próprio teste novo (caminho do layout e escrita em `.git` oculto no Windows).
+- Pendências / riscos residuais: CI Linux/Windows não rodaram (POSIX: troca de raiz por symlink,
+  bit de execução, `sh` dos filtros); a troca da raiz externa foi exercitada por `rename` no
+  Windows (NTFS) — em Linux o mesmo teste usa `rename` e deve valer, a confirmar no CI; TOCTOU
+  residual e E8.4.5 obrigatória inalterados. Reauditoria independente pendente.
+
+## 2026-10-09 — Claude Sonnet 5.5 (effort: high) — E8.4.2 correção definitiva do E842-AUD-002 — candidate
+
+Segunda auditoria Codex: AUD-001 e AUD-003 RESOLVED; **AUD-002 OPEN (P2)**; nenhum finding novo.
+Mesma branch local `e8/04-2-execution-workspace`, base `dd0a8cb`; **não commitada**, sem push/PR;
+E8.4.3+ não iniciadas. Sem migration, banco, serviço externo ou mudança de contrato; `docs/` e
+`deploy.yml` intocados. AUD-001/003 preservadas (seus testes seguem verdes).
+
+- Causa raiz: a "revogação" era só **remoção física** (`unbind_run` → `unbind_exact`), e a
+  autorização do resolvedor (`resolve`) depende apenas de a entrada existir no dicionário. O
+  `False` de `unbind_*` era apenas um *relato* levado à exceção (`binding_removed`): se a remoção
+  não acontece (porta que devolve `False`, token que não é o objeto guardado, falha ao apagar), o
+  `BoundWorkspace` do Run recusado continua sendo entregue; e nada impedia re-registrar o mesmo Run.
+  Reprodução mínima antes da correção (resolvedor concreto, sem serviço): `unbind_run -> False` e a
+  resolução ainda devolvia `BoundWorkspace`.
+- Correção, na camada da autorização (`tool_executor/workspace.py`):
+  - `InMemoryWorkspaceResolver.revoke(token)`: grava a chave `(workspace, task, run)` em
+    `_revoked` **antes** de tentar qualquer remoção, sob o mesmo lock; `resolve` devolve `None` e
+    `bind` levanta `BindingRevoked` para chave revogada. A negação vale na própria resolução,
+    mesmo com a entrada ainda fisicamente guardada (`_drop` falhando), e não é desfeita por
+    `unbind`, `unbind_exact`, novo `bind` ou reuso do Run. Seletiva por token: se a chave guarda
+    **outro** objeto, nada é revogado (`False`); ausente ou igual ⇒ revogada. Outros Runs intactos.
+  - `RunWorkspaceBindings.revoke_run(token)` (nova porta) e `bind_run` agora revoga o próprio
+    registro que falhou na conferência canônica (antes só apagava); re-registro ⇒
+    `WorkspaceUnavailable("binding_revoked")`. `unbind_run` segue sendo o fim normal de uso
+    (libera, não revoga).
+  - Serviço (`execution_workspace.py`): a interrupção em `bind_component_run` e a compensação de
+    `prepare` (falha em L, Run de controle) usam `revoke_run`. `ComponentBindingRefused.binding_removed`
+    virou `binding_revoked` (critério = autorização negada, não remoção). `BindingState.REMOVED`
+    passa a significar "autorização revogada".
+- Limite declarado: revogar impede **resoluções futuras**; um `ResolvedWorkspace` já entregue por
+  `resolve` antes da revogação não é retomado (na janela entre `bind_run` e a revogação, só a
+  própria operação conhece o `run_id`). Resolvedor customizado que implemente só `resolve` não tem
+  como ser revogado pelo serviço — a porta `RunBindingPort.revoke_run` existe para isso.
+- Testes (+8; E8.4.2 agora 88): `recusa_por_interrupcao_revoga_mesmo_sem_provar_a_remocao`
+  (Developer/Test Runner × cancelamento/prazo, com `_StuckResolver` — **toda** remoção física falha
+  — e `unbind_run` devolvendo `False`: a entrada continua no resolvedor e a resolução do Run
+  recusado levanta `WorkspaceUnavailable`, observada diretamente; os outros Runs resolvem);
+  `autorizacao_revogada_nao_e_restaurada…` (re-registro pelo adaptador, pelo resolvedor e por nova
+  tentativa do serviço; `unbind`/`unbind_exact`/`release_binding` não restauram; outro Run se
+  registra); `run_revogado_nao_volta…_com_remocao_fisica_funcionando`; seletividade por token;
+  revogação × `resolve` concorrentes (4 threads; flag lido antes de resolver); compensação de
+  `prepare` com remoção impossível; asserção de `binding_revoked` no resolvedor defeituoso.
+- Mutantes (cópia isolada de `api/`, hash do fonte conferido): `resolve` ignora revogadas, `revoke`
+  não grava a chave, `bind` aceita chave revogada, serviço/compensação usando `unbind`, revoke não
+  seletivo, rollback do `bind_run` só apagando, `unbind` limpando a revogação — todos mortos (MR3 e
+  MR8 só depois de fortalecer os testes: estavam mascarados pela entrada física). **Sobrevive**: mover
+  o `revoke` para fora do lock — só diverge numa intercalação entre a leitura do guardado e a
+  marcação, que um teste determinístico não alcança; a atomicidade é por construção (um lock) e o
+  teste de threads é regressão do contrato visível, não prova.
+- Gates (Windows, Python 3.11): regressões do finding exit 0; E8.4.2 exit 0; regressão direcionada
+  exit 0; **backend completo 4942 passed, 33 skipped (plataforma/privilégio), 0 failed, exit 0**;
+  `ruff check`, `ruff format --check`, `mypy`, `mypy --platform linux`, `pip check`,
+  `git diff --check` limpos. CI Linux/Windows não rodaram.
+- Pendências: reauditoria independente; TOCTOU residual e E8.4.5 obrigatória inalterados.
