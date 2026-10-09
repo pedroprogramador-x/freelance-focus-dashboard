@@ -353,6 +353,26 @@ def preflight(local_path: str) -> GitPreflight:
     )
 
 
+def repository_object_format(local_path: str) -> str | None:
+    """`sha1` ou `sha256`, lido por `rev-parse --show-object-format` (só leitura). Nunca lança.
+
+    `None` = não deu para ler (git ausente, fora de um repositório, timeout, saída fora do
+    vocabulário fechado). Quem usa como *gate* trata `None` como "não suportado": a E8.4.1
+    recusa tudo que não seja comprovadamente `sha1` antes de admitir uma execução.
+    """
+    git = shutil.which("git")
+    if git is None:
+        return None
+    result = _run_git(git, local_path, "rev-parse", "--show-object-format")
+    if result is None or result.returncode != 0:
+        return None
+    if result.stdout == b"sha1\n":
+        return "sha1"
+    if result.stdout == b"sha256\n":
+        return "sha256"
+    return None
+
+
 #: Os desfechos que `probe_head` distingue (E6-CONS4, decisão D3). `preflight` colapsa
 #: os três primeiros em `is_git_repo=False` — correto para a UI de Overview, errado para o
 #: planejamento, que precisa dizer ao humano **qual** pré-condição falta: `git init` (fora do
@@ -1531,6 +1551,7 @@ __all__ = [
     "preflight",
     "probe_head",
     "repository_layout",
+    "repository_object_format",
     "task_worktree_names",
     "working_tree_diff_against",
     "working_tree_status",

@@ -204,6 +204,59 @@ fingerprint divergente.
 | **Nova auditoria** | **Sempre um `Run` novo** (§9). Um `Run` finalizado é append-only e nunca é reaberto |
 | **Recuperação de crash** | `reconcile_on_startup()` é idempotente: rodar duas vezes produz o mesmo estado. Tasks em `planning`/`executing` sem processo vivo → `failed(interrupted)`; `Run` abertos fechados como `interrupted`; worktrees preservadas |
 
+#### Adendo autorizado — E8.4.1 (2026-10-08): admissão durável da execução
+
+> Adendo aprovado por Pedro (contrato da E8.4.1). **Estritamente aditivo**: a tabela de
+> transições, as guardas e as regras de atomicidade acima valem sem alteração. Implementação em
+> `orchestrator/execution_manager.py` (`admit_execution`) e `orchestrator/execution_contract.py`.
+> A admissão é uma **porta interna confiável**: nenhuma rota HTTP a expõe, e `start_execution`
+> (o caminho público) segue parando no `NotImplementedError` até a integração encadeada da E8.4.6
+> — sem worker, uma rota pública deixaria tasks presas em `executing`.
+
+* **Entrada.** `(task_id, invocation_id)`. A chave é obrigatória, é o `invocation_id` do **Run de
+  controle** (§8) e tem alfabeto fechado (`[A-Za-z0-9._-]`, sem `:`). O cliente **não** fornece
+  caminho físico, comando, perfil de capability, provider, credencial nem configuração de worktree.
+* **Idempotência.** Mesma chave + mesma task → devolve o Run de controle existente, sem escrever
+  nada (nem Run, nem `attempts`, nem efeito externo). Mesma chave + outra task, ou chave de um Run
+  que não é o de controle → conflito (`409`). Chave nova com a task já `executing` → conflito
+  (`409`).
+* **Slot.** `max_parallel_agents = 1` é verificado pelo **banco**: o índice único parcial
+  `uq_workspace_task_single_executing` (`status = 'executing'`) garante no máximo uma task
+  `executing`, entre threads **e entre processos**; a reserva de admissão é o próprio `approved →
+  executing`. Subir `max_parallel_agents` exige uma migration que remova o índice. Slot ocupado
+  **não** é erro: devolve `slot_busy` estruturado, a task segue `approved` (a fila de
+  [ADR-0008]), nenhuma tentativa é consumida e nenhum Run nasce.
+* **Limite do índice — obrigação vinculante da E8.4.5** *(correção E841-AUD, 2026-10-08)*. O
+  índice é proteção de **admissão**: impede duas admissões concorrentes enquanto a task está
+  `executing`. Ele **não** comprova que os recursos externos de uma execução (worktree,
+  processos do provider e do Test Runner) foram encerrados depois que a task vira `cancelled` ou
+  `failed` — o status muda num `UPDATE`, os recursos não. A E8.4.5 tem de entregar: (1) reserva
+  durável **independente do estado terminal** da task, liberada só com o encerramento
+  comprovado; (2) encerramento comprovado dos recursos; (3) recuperação idempotente após crash.
+  **Nenhuma execução operacional é habilitada antes dessa garantia.**
+* **Transação de admissão.** Uma só, com `COMMIT` antes de qualquer efeito externo: o CAS
+  `approved → executing` em `(id, status, version)` (reserva o slot), `phase = implementing`,
+  `attempts + 1` exatamente uma vez e o Run de controle `running` com os vínculos de recuperação
+  (`context_manifest_id`, `base_commit`, `attempt_index`). Falhou em qualquer ponto → nada
+  persiste. Nenhuma transação fica aberta durante git, filesystem ou a prova de capability; a
+  janela entre a última leitura e o CAS é declarada (a E8.4.2 revalida o `HEAD` ao criar a
+  worktree).
+* **Recusas de pré-admissão** — nenhuma cria Run nem consome tentativa; as de política deixam
+  `SafetyEvent` durável: task `approved`; workspace existente e ativo; plano, manifest e artefato
+  renderizado coerentes (`plan_hash`, referência e **bytes** do artefato); `planning_base_commit ==
+  manifest.git_head == base_commit == plan.base_commit` e `HEAD` igual a eles; fingerprint
+  recalculado igual ao aprovado; `attempts < max_attempts`; sem cancelamento solicitado; slot;
+  `developer_binding` aprovado concreto e igual ao contexto esperado da prova; capability
+  comprovada (E7.6); política de workflow E8 compatível (§7); `TestPolicy` configurada e de um
+  runner suportado; composição só com agentes disponíveis (apenas `developer`); repositório
+  **SHA-1** (um repositório SHA-256 é recusado antes da admissão, embora a verificação pós-execução
+  da E8.3 já o suporte isoladamente).
+* **Resultado.** `done` na E8 significa "concluído conforme a política E8 single-pass", não
+  "auditado". A classificação pura de resultados (precedência: terminal já confirmado por CAS não é
+  sobrescrito → integridade/política violada → verificação incompleta → falha de provider/runner →
+  testes falhos com integridade verificada → sucesso) está em `execution_contract.classify_execution`;
+  `needs_fix` não dispara retry. A finalização que a aplica é E8.4.5.
+
 ---
 
 ## 5. `ContextManifest` e o Rendered Context Artifact
@@ -371,6 +424,22 @@ Persistido em `WorkspaceTask.approved_fingerprint`, com `approved_fingerprint_pa
 guardando os componentes para que a UI diga **qual campo mudou**. Recalculado no `approve`
 e novamente na guarda `approved → executing`. Nenhuma entidade nova.
 
+#### Adendo autorizado — E8.4.1 (2026-10-08): política E8 single-pass e limites de tempo
+
+> Adendo aprovado por Pedro (contrato da E8.4.1). **Estritamente aditivo**: a estrutura V1 do
+> fingerprint — versão, algoritmo de hash e chaves de topo — **não muda**.
+
+* **Política de workflow E8 (temporária).** A E8.4 ainda não tem Auditor, então a política ativa
+  na fase é `e8_single_pass_policy`: `audit_required_on_nonempty_diff = false` (os demais campos
+  de `WorkflowPolicy` inalterados). A política **normal** — auditoria obrigatória, a que volta a
+  valer na E9 — não foi alterada. A política ativa participa do `workflow_policy_hash`: uma
+  aprovação feita sob outra política diverge em `workflow_policy_hash` e não executa em silêncio, e
+  a troca da política ativa na E9 invalida as aprovações E8 pelo mesmo mecanismo. Nenhum `AuditRun`
+  nem `AuditFinding` fictício é criado; `auditor_binding` segue `null` explícito.
+* **Limites de tempo.** `execution_limits` ganha `run_timeout_s = 1200` e `task_timeout_s = 1800`
+  ([04](04-safety-and-git-runtime.md) §7). Como entram no hash, mudá-los (ou aprovar sem eles, como
+  antes da E8.4.1) invalida a aprovação por divergência de `execution_limits`.
+
 ---
 
 ## 8. `Run`
@@ -434,6 +503,29 @@ não nulo quando `purpose ∈ {workflow_audit, benchmark_evaluation}`.
 
 **Quem altera** apenas o Execution Manager. `agent_runtime/` devolve resultado e não toca
 o banco.
+
+#### Adendo autorizado — E8.4.1 (2026-10-08): `Run` aberto, métricas não medidas e Runs da execução
+
+> Adendo aprovado por Pedro (contrato da E8.4.1). **Aditivo**: nada acima é revogado; a migration
+> `0003_execution_admission` recria a tabela `run` preservando os Runs finalizados.
+
+* **`status = running`** é o Run **aberto** (admitido, não finalizado): `finished_at` e
+  `duration_ms` nulos. Todo outro status é **final e imutável** e tem `finished_at`. O banco
+  recusa `UPDATE` em Run final (inclusive voltar a `running`), recusa trocar a identidade de um
+  Run (`id`, `invocation_id`, `task_id`, `agent`, `purpose`, `started_at`, `attempt_index`,
+  `fix_round`) e recusa fechar sem `finished_at` e `duration_ms`. `ok` nunca é estado provisório.
+  No máximo um Run de controle aberto por task.
+* **Métricas do Git Runtime** (`files_changed`, `diff_added`, `diff_removed`) deixam de ter
+  padrão `[]`/`0`: **`NULL` = não medido**, `[]`/`0` = medido, nada mudou. Os três são tudo ou
+  nada, e um Run aberto não afirma nenhum. A coleta real é da E8.4.4. `files_read`, tokens e suas
+  fontes já tinham essa semântica (§10).
+* **Estrutura de Runs da execução.** *Run de controle* — `agent = orchestrator`, `purpose =
+  execution`, criado na admissão, representa o resultado agregado da tentativa e acompanha o prazo
+  da task. *Run do Developer* (uma invocação do provider, E8.4.3) e *Run do Test Runner* (uma
+  execução de testes, E8.4.4) são criados depois. Os `invocation_id` dos componentes são
+  `<id do Run de controle>:<componente>` — determinísticos e, como a chave do cliente não admite
+  `:`, sem colisão. `subject_run_id` **não** é usado como elo pai-filho: preserva a semântica de
+  auditoria/avaliação (§9).
 
 ---
 

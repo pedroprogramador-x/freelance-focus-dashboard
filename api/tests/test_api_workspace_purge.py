@@ -9,6 +9,7 @@ expirado (relógio mockado) recusado; token reutilizado recusado; purga de works
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -109,6 +110,9 @@ def _run(task_id: str, invocation_id: str, purpose: RunPurpose, subject_run_id: 
         provider_adapter="test",
         transport=RunTransport.CLI,
         status=RunStatus.OK,
+        started_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+        duration_ms=1,
         token_source=TokenSource.UNAVAILABLE,
         files_read_source=FilesReadSource.UNAVAILABLE,
     )

@@ -67,6 +67,7 @@ from app.context_engine.manifest import (
     compute_manifest_hash,
     freeze_manifest,
     render_context,
+    rendered_artifact_intact,
 )
 from app.context_engine.rendering import (
     DEFAULT_TRANSFORMATIONS,
@@ -204,6 +205,7 @@ __all__ = [
     "read_workspace_tree",
     "render_block_text",
     "render_context",
+    "rendered_artifact_intact",
     "select_context",
     "update_entry",
     "verify_freshness",

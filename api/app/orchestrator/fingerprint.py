@@ -94,6 +94,29 @@ class WorkflowPolicy:
         return canonical_sha256(self.as_canonical())
 
 
+def e8_single_pass_policy(*, max_fix_rounds: int, max_attempts: int) -> WorkflowPolicy:
+    """A política **temporária** da E8 (passe único): `audit_required_on_nonempty_diff = False`.
+
+    A E8.4 ainda não tem Auditor: exigir auditoria obrigatória tornaria a execução
+    inalcançável, e fingir uma auditoria seria pior. Esta política declara isso **no hash** —
+    `workflow_policy_hash` muda em relação à política normal (`WorkflowPolicy()`, auditoria
+    obrigatória, que volta a valer na E9) —, de modo que:
+
+    * uma aprovação feita sob outra política diverge em `workflow_policy_hash` e não executa em
+      silêncio;
+    * a transição para a E9 troca a política ativa (`planner.active_workflow_policy`) e invalida
+      toda aprovação E8 pelo mesmo mecanismo.
+
+    `done` sob esta política significa "concluído conforme a política E8 single-pass", **não**
+    "auditado de forma independente". Nenhum `AuditRun`/`AuditFinding` é criado.
+    """
+    return WorkflowPolicy(
+        audit_required_on_nonempty_diff=False,
+        max_fix_rounds=max_fix_rounds,
+        max_attempts=max_attempts,
+    )
+
+
 def tool_profile_hash(profile: dict[str, Any] | None = None) -> str:
     """Hash do perfil de capability **requerido/aprovado**. Ver o docstring do módulo.
 
@@ -187,5 +210,6 @@ __all__ = [
     "FingerprintParts",
     "WorkflowPolicy",
     "diverged_fields",
+    "e8_single_pass_policy",
     "tool_profile_hash",
 ]

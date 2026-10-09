@@ -102,6 +102,7 @@ from app.orchestrator.errors import InvalidTestConfig, WorkspaceNotPlannable
 from app.orchestrator.fingerprint import (
     FingerprintParts,
     WorkflowPolicy,
+    e8_single_pass_policy,
     tool_profile_hash,
 )
 from app.orchestrator.resource_router import (
@@ -111,6 +112,8 @@ from app.orchestrator.resource_router import (
     MAX_ATTEMPTS,
     MAX_FIX_ROUNDS,
     MAX_PARALLEL_AGENTS,
+    RUN_TIMEOUT_S,
+    TASK_TIMEOUT_S,
     ResourceDecision,
     route,
 )
@@ -206,9 +209,9 @@ def git_planning_blocker(workspace: DevWorkspace) -> str | None:
 
 
 def invalid_test_config_blocker(workspace: DevWorkspace) -> str | None:
-    """`test_config` malformado recusa o plano ao montar o fingerprint (`_read_test_policy`)."""
+    """`test_config` malformado recusa o plano ao montar o fingerprint (`read_test_policy`)."""
     try:
-        _read_test_policy(workspace)
+        read_test_policy(workspace)
     except InvalidTestConfig:
         return PLANNING_BLOCKER_INVALID_TEST_CONFIG
     return None
@@ -340,7 +343,7 @@ def stale_manifest_entry_ids(manifest: ContextManifest, states: dict[str, str]) 
     )
 
 
-def _read_test_policy(workspace: DevWorkspace) -> TestPolicy | None:
+def read_test_policy(workspace: DevWorkspace) -> TestPolicy | None:
     """Lê `DevWorkspace.test_config` e valida de novo, na leitura.
 
     `set_test_config` já validou na escrita, então revalidar parece redundante — e não é. A
@@ -360,6 +363,20 @@ def _read_test_policy(workspace: DevWorkspace) -> TestPolicy | None:
             f"`test_config` do workspace '{workspace.name}' está malformado e não pode "
             f"virar um `test_binding`: {error}"
         ) from error
+
+
+def active_workflow_policy(decision: ResourceDecision) -> WorkflowPolicy:
+    """A política de workflow **vigente** nesta fase — o único ponto que a escolhe (E8.4.1).
+
+    E8: passe único, sem Auditor (`e8_single_pass_policy`, `audit_required_on_nonempty_diff =
+    False`). A E9 troca o corpo desta função pela política normal (auditoria obrigatória), o
+    que muda o `workflow_policy_hash` e invalida toda aprovação E8 — nenhuma aprovação feita
+    sob outra política executa em silêncio. `plan`, `approve` e a admissão recalculam o
+    fingerprint pelo mesmo `build_fingerprint_parts`, então os três enxergam a mesma política.
+    """
+    return e8_single_pass_policy(
+        max_fix_rounds=decision.max_fix_rounds, max_attempts=decision.max_attempts
+    )
 
 
 def build_fingerprint_parts(
@@ -391,16 +408,13 @@ def build_fingerprint_parts(
     nenhum binding concreto é inventado. ``developer_binding_resolver`` é obrigatório por
     nome para que nenhum dos dois chamadores o esqueça em silêncio.
     """
-    test_policy = _read_test_policy(workspace)
+    test_policy = read_test_policy(workspace)
 
     developer = select_developer_execution(
         task.risk, task.complexity, resolver=developer_binding_resolver
     )
 
-    workflow_policy = WorkflowPolicy(
-        max_fix_rounds=decision.max_fix_rounds,
-        max_attempts=decision.max_attempts,
-    )
+    workflow_policy = active_workflow_policy(decision)
 
     return FingerprintParts(
         plan_hash=plan_hash,
@@ -445,6 +459,8 @@ def decision_from_task(task: WorkspaceTask) -> ResourceDecision:
         max_fix_rounds=MAX_FIX_ROUNDS,
         max_parallel_agents=MAX_PARALLEL_AGENTS,
         max_agents=MAX_AGENTS,
+        run_timeout_s=RUN_TIMEOUT_S,
+        task_timeout_s=TASK_TIMEOUT_S,
     )
 
 
@@ -581,6 +597,7 @@ __all__ = [
     "PLANNING_BLOCKER_WORKSPACE_ARCHIVED",
     "PLAN_VERSION",
     "PlanResult",
+    "active_workflow_policy",
     "build_fingerprint_parts",
     "classify_git",
     "decision_from_task",
@@ -588,6 +605,7 @@ __all__ = [
     "invalid_test_config_blocker",
     "plan_task",
     "planning_blocker_error",
+    "read_test_policy",
     "reverify_context",
     "stale_manifest_entry_ids",
     "stale_selected_entry_ids",

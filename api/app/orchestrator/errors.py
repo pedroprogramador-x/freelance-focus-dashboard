@@ -220,6 +220,41 @@ class ConcurrentTaskUpdate(OrchestratorError):
     status_code = 409
 
 
+class InvalidInvocationId(OrchestratorError):
+    """A chave idempotente da execução é ausente ou malformada. **422**.
+
+    O alfabeto é fechado e não contém `:` — separador dos `invocation_id` derivados dos Runs
+    dos componentes —, de modo que uma chave de cliente não colide com nenhum deles
+    (`execution_contract`).
+    """
+
+    code = "invalid_invocation_id"
+    status_code = 422
+
+
+class InvocationIdConflict(OrchestratorError):
+    """A chave já pertence a outra task, ou a um Run que não é o de controle. **409**.
+
+    Mesma chave com a **mesma** task é repetição (devolve a execução existente); com outra
+    task é reaproveitamento indevido da chave, e executar a segunda pediria ao cliente o
+    contrário do que a idempotência promete.
+    """
+
+    code = "invocation_id_conflict"
+    status_code = 409
+
+
+class TaskAlreadyExecuting(OrchestratorError):
+    """A task já está em execução sob **outra** chave idempotente. **409**.
+
+    Uma segunda tentativa só nasce depois de a primeira terminar; a repetição legítima da
+    primeira usa a chave dela.
+    """
+
+    code = "task_already_executing"
+    status_code = 409
+
+
 class TaskPurgeBlocked(OrchestratorError):
     """A task não pode ser purgada. **409**.
 
@@ -251,11 +286,14 @@ class PurgeTokenRejected(OrchestratorError):
 __all__ = [
     "ApprovalFingerprintMismatch",
     "ConcurrentTaskUpdate",
+    "InvalidInvocationId",
     "InvalidTask",
     "InvalidTestConfig",
     "InvalidTransition",
+    "InvocationIdConflict",
     "OrchestratorError",
     "PurgeTokenRejected",
+    "TaskAlreadyExecuting",
     "TaskBenchmarkProtected",
     "TaskNotFound",
     "TaskPurgeBlocked",

@@ -64,6 +64,10 @@ def _run(session: Session, task: WorkspaceTask, **overrides: object) -> Run:
         "files_read_source": enums.FilesReadSource.UNAVAILABLE,
     }
     values.update(overrides)
+    # E8.4.1: todo status que não seja `running` é final e tem `finished_at`.
+    if values["status"] is not enums.RunStatus.RUNNING and "finished_at" not in overrides:
+        values["finished_at"] = datetime.now(UTC)
+        values["duration_ms"] = values.get("duration_ms", 0)
     run = Run(**values)
     session.add(run)
     session.commit()
@@ -244,7 +248,7 @@ def test_run_finalizado_e_append_only(session: Session, engine: Engine) -> None:
 def test_run_em_andamento_ainda_pode_ser_atualizado(session: Session, engine: Engine) -> None:
     workspace = _workspace(session)
     task = _task(session, workspace)
-    run = _run(session, task, finished_at=None)
+    run = _run(session, task, status=enums.RunStatus.RUNNING)
 
     with engine.connect() as connection:
         connection.execute(
