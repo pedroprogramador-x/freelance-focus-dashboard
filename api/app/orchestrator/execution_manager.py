@@ -53,9 +53,14 @@ releitura enxergar a vencedora e não sobrescrevê-la.
 
 ## O que esta fase deliberadamente não faz
 
-Nenhum `Run` é criado. Nenhum worktree é criado. Nenhum provider é invocado. `POST
-/approve` produz uma task `approved`, e é onde a E6 para — a entrada em `executing` é
-recusada por desenho (ver `state_machine`).
+Nenhum worktree é criado. Nenhum provider é invocado. `POST /approve` produz uma task
+`approved`, e é onde o **caminho público** para — `start_execution` recusa/para por desenho
+(ver `state_machine`).
+
+E8.4.1: existe uma **porta interna** de admissão durável, `admit_execution` (seção
+"admissão", abaixo): `approved → executing` + Run de controle `running` + `attempts + 1` +
+slot, numa transação. Ela não é um comando público e não é alcançável pela camada HTTP; o
+encadeamento com worktree, Developer, Test Runner e verificação é da E8.4.2–E8.4.6.
 """
 
 from __future__ import annotations
@@ -69,42 +74,65 @@ from pathlib import Path
 from typing import Any, ParamSpec, TypeVar, cast
 
 from sqlalchemy import CursorResult, select, update
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
+from app.context_engine import ARTIFACT_STORE_PREFIX, rendered_artifact_intact
 from app.db.conflicts import is_write_conflict
 from app.db.enums import (
     ComplexityLevel,
     ExecutionMode,
     FailureReason,
+    FilesReadSource,
     RiskLevel,
     RiskSource,
+    RunAgent,
+    RunPurpose,
+    RunStatus,
+    RunTransport,
     SafetyDecisionKind,
     SafetyEventKind,
+    TaskPhase,
     TaskStatus,
+    TokenSource,
     WorkspaceStatus,
 )
-from app.db.models import ContextManifest, DevWorkspace, SafetyEvent, WorkspaceTask
-from app.git_runtime import preflight
+from app.db.models import ContextManifest, DevWorkspace, Run, SafetyEvent, WorkspaceTask
+from app.git_runtime import preflight, repository_object_format
 from app.orchestrator.analyzer import AnalyzerEnrichmentPort
 from app.orchestrator.developer_binding import DeveloperBindingResolver
 from app.orchestrator.errors import (
     ApprovalFingerprintMismatch,
     ConcurrentTaskUpdate,
     InvalidTask,
+    InvocationIdConflict,
     OrchestratorError,
+    TaskAlreadyExecuting,
     TaskNotFound,
     TransitionGuardFailed,
     WorkspaceNotPlannable,
+)
+from app.orchestrator.execution_contract import (
+    E2E_OBJECT_FORMATS,
+    SLOT_BUSY_CODE,
+    SUPPORTED_TEST_RUNNER_IDS,
+    AdmissionGuard,
+    AdmissionOutcome,
+    ExecutionAdmission,
+    unavailable_agents,
+    validate_invocation_id,
+    workflow_policy_supported,
 )
 from app.orchestrator.fingerprint import diverged_fields
 from app.orchestrator.planner import (
     PLANNING_BLOCKER_WORKSPACE_ARCHIVED,
     PlanResult,
+    active_workflow_policy,
     build_fingerprint_parts,
     decision_from_task,
     plan_task,
     planning_blocker_error,
+    read_test_policy,
     reverify_context,
     stale_manifest_entry_ids,
     workspace_planning_blocker,
@@ -113,12 +141,15 @@ from app.orchestrator.state_machine import (
     CapabilityProver,
     EntryGuardFacts,
     check_approval_guard,
+    check_entry_capability,
     check_entry_guard,
+    check_entry_preconditions,
     check_needs_fix_guard,
     require_transition,
     transition_fields,
 )
 from app.safety import redact
+from app.safety.canonical import canonical_sha256
 from app.safety.capability_verification import CapabilityBinding
 from app.workspace.service import get_workspace
 
@@ -1061,6 +1092,11 @@ def start_execution(
     mesma porta do `plan`/`approve`). Ele não prova capability nem abre a execução: sem
     provador, a guarda continua recusando.
 
+    E8.4.1: a admissão real (Run de controle, `attempts`, slot, idempotência por
+    `invocation_id`) existe em `admit_execution`, **porta interna** exercitada por testes. Este
+    caminho público segue parando no `NotImplementedError` depois da guarda — sem o worker das
+    etapas seguintes, abrir `executing` por aqui deixaria a task presa. A E8.4.6 religa os dois.
+
     A função existe agora, e não em E7, porque a **guarda** é o entregável: escrevê-la junto
     com a máquina de estados é o que garante que E7 acrescente o provador a um ponto de
     extensão já fechado, em vez de abrir um caminho novo ao lado dela.
@@ -1096,21 +1132,59 @@ def start_execution(
             expected_binding=expected_capability_binding,
         )
     except TransitionGuardFailed as exc:
-        # [02] §4: "guardas que falham geram `409` com o motivo, e `SafetyEvent` quando a
-        # causa é política". Só `TransitionGuardFailed` é capturado: um erro inesperado
-        # aqui é defeito, não decisão de política, e registrá-lo como `SafetyEvent`
-        # poluiria a trilha com ruído que ninguém sabe interpretar.
-        record_safety_event(
+        invalidation = _record_entry_refusal(
             session,
-            kind=_ENTRY_GUARD_EVENT_KINDS.get(exc.guard, SafetyEventKind.APPROVAL_INVALIDATED),
-            decision=SafetyDecisionKind.DENY,
-            rule_id=f"orchestrator.entry_guard.{exc.guard}",
-            subject=f"task:{task.id}",
-            workspace_id=task.workspace_id,
-            task_id=task.id,
-            detail=exc.message,
+            task,
+            exc,
+            current_fingerprint=current_fingerprint,
+            current_parts=current_parts,
+            approved_fingerprint=approved_fingerprint,
+            approved_parts=approved_parts,
         )
+        if invalidation is not None:
+            raise invalidation from exc
+        raise
 
+    raise NotImplementedError(  # a continuação real é E8; só um provador injetado chega aqui
+        "a guarda de entrada passou, mas a continuação da execução é E8"
+    )
+
+
+def _record_entry_refusal(
+    session: Session,
+    task: WorkspaceTask,
+    exc: TransitionGuardFailed,
+    *,
+    current_fingerprint: str | None,
+    current_parts: dict[str, Any] | None,
+    approved_fingerprint: str | None,
+    approved_parts: dict[str, Any] | None,
+) -> OrchestratorError | None:
+    """O que a recusa de uma guarda de entrada deixa **durável**. Devolve o erro rico, se houver.
+
+    Compartilhada por `start_execution` e pela admissão (E8.4.1): [02] §4 — "guardas que falham
+    geram `409` com o motivo, e `SafetyEvent` quando a causa é política". Só
+    `TransitionGuardFailed` chega aqui: um erro inesperado é defeito, não decisão de política, e
+    registrá-lo como `SafetyEvent` poluiria a trilha com ruído que ninguém sabe interpretar.
+
+    Nenhum `Run` é criado e nenhuma tentativa é consumida: o único efeito de estado possível é
+    a invalidação da aprovação (`approved → awaiting_approval`), e só para as duas guardas de
+    `_APPROVAL_INVALIDATING_GUARDS` — que exigem o fingerprint recalculado.
+    """
+    record_safety_event(
+        session,
+        kind=_ENTRY_GUARD_EVENT_KINDS.get(exc.guard, SafetyEventKind.APPROVAL_INVALIDATED),
+        decision=SafetyDecisionKind.DENY,
+        rule_id=f"orchestrator.entry_guard.{exc.guard}",
+        subject=f"task:{task.id}",
+        workspace_id=task.workspace_id,
+        task_id=task.id,
+        detail=exc.message,
+    )
+
+    invalidation: OrchestratorError | None = None
+    if exc.guard in _APPROVAL_INVALIDATING_GUARDS:
+        assert current_fingerprint is not None and current_parts is not None
         invalidation = _invalidate_approval_on_entry(
             session,
             task,
@@ -1121,17 +1195,10 @@ def start_execution(
             approved_parts=approved_parts,
         )
 
-        # Ver `_commit_audit_trail`: sem isto o `session_scope` da camada HTTP descarta o
-        # evento **e** a transição que acabaram de ser gravados.
-        _commit_audit_trail(session)
-
-        if invalidation is not None:
-            raise invalidation from exc
-        raise
-
-    raise NotImplementedError(  # a continuação real é E8; só um provador injetado chega aqui
-        "a guarda de entrada passou, mas a continuação da execução é E8"
-    )
+    # Ver `_commit_audit_trail`: sem isto o `session_scope` da camada HTTP descarta o
+    # evento **e** a transição que acabaram de ser gravados.
+    _commit_audit_trail(session)
+    return invalidation
 
 
 #: As duas guardas de entrada que significam **a aprovação não vale mais**, e não "agora
@@ -1153,6 +1220,7 @@ _ENTRY_GUARD_EVENT_KINDS: dict[str, SafetyEventKind] = {
     "capability_profile_proven": SafetyEventKind.CAPABILITY_UNENFORCEABLE,
     "capability_profile_matches_approved": SafetyEventKind.CAPABILITY_DENIED,
     "attempts_below_max": SafetyEventKind.RETRY_LIMIT,
+    AdmissionGuard.NOT_CANCELLED.value: SafetyEventKind.CANCELLED,
 }
 
 
@@ -1265,6 +1333,443 @@ def _slot_available(session: Session, *, exclude_task_id: str) -> bool:
     return session.scalar(statement) is None
 
 
+# --------------------------------------------------------------------------- admissão (E8.4.1)
+#
+# `admit_execution` é a **porta interna confiável** da admissão durável de uma execução. Ela
+# NÃO é um comando público: nenhuma rota HTTP a alcança (`test_architecture` impede), e
+# `start_execution` — o único caminho público — segue parando no `NotImplementedError`. A razão
+# é de segurança de fluxo: admitir deixa a task `executing`, e sem o worker que a E8.4.2–E8.4.6
+# constroem, um caminho público deixaria tasks presas nesse estado. A integração encadeada é da
+# E8.4.6.
+#
+# O cliente nunca fornece caminho físico, comando, perfil de capability, provider, credencial ou
+# configuração de worktree: só `(task_id, invocation_id)`. Tudo o mais vem do banco ou do
+# chamador **confiável** (composition root: prover, binding esperado, resolver, artifacts_dir).
+
+
+def _find_run_by_key(session: Session, key: str) -> Run | None:
+    return session.scalar(select(Run).where(Run.invocation_id == key))
+
+
+def _existing_admission(session: Session, task_id: str, key: str) -> ExecutionAdmission | None:
+    """A execução já existente para esta chave, ou `None`. Conflito de chave levanta.
+
+    Mesma chave + mesma task = repetição: devolve o Run de controle existente, **sem** escrever
+    nada (nem Run, nem `attempts`, nem efeito externo). Chave de outra task, ou de um Run que
+    não é o de controle, é conflito.
+    """
+    run = _find_run_by_key(session, key)
+    if run is None:
+        return None
+    if (
+        run.task_id != task_id
+        or run.agent is not RunAgent.ORCHESTRATOR
+        or run.purpose is not RunPurpose.EXECUTION
+    ):
+        raise InvocationIdConflict(
+            "o `invocation_id` já identifica outra execução; use uma chave nova para uma "
+            "tentativa nova"
+        )
+    return ExecutionAdmission(AdmissionOutcome.REPLAYED, get_task(session, task_id), run)
+
+
+def _slot_busy(task: WorkspaceTask) -> ExecutionAdmission:
+    return ExecutionAdmission(AdmissionOutcome.SLOT_BUSY, task, code=SLOT_BUSY_CODE)
+
+
+def _refuse_admission(
+    session: Session, task: WorkspaceTask, guard: AdmissionGuard, message: str
+) -> TransitionGuardFailed:
+    """Registra a recusa (SafetyEvent durável) e devolve o erro para o chamador levantar.
+
+    Nenhuma recusa de pré-admissão cria Run, consome tentativa ou toca o estado da task.
+    """
+    error = TransitionGuardFailed(message, guard=guard.value)
+    _record_entry_refusal(
+        session,
+        task,
+        error,
+        current_fingerprint=None,
+        current_parts=None,
+        approved_fingerprint=None,
+        approved_parts=None,
+    )
+    return error
+
+
+def _plan_incoherence(task: WorkspaceTask, manifest: ContextManifest | None) -> str | None:
+    """Plano, manifest e referência do artefato são coerentes entre si? Só banco, sem IO."""
+    if task.approved_at is None or task.plan is None or task.plan_hash is None:
+        return "a task não tem um plano congelado e aprovado"
+    try:
+        plan_digest = canonical_sha256(task.plan)
+    except (TypeError, ValueError):
+        return "o plano persistido não é um documento canônico"
+    if plan_digest != task.plan_hash:
+        return "o plano persistido não corresponde ao `plan_hash` aprovado"
+    if manifest is None or manifest.task_id != task.id:
+        return "o manifest aprovado não existe ou pertence a outra task"
+    expected_ref = f"{ARTIFACT_STORE_PREFIX}/{manifest.rendered_context_hash}.json"
+    if manifest.rendered_context_ref != expected_ref:
+        return "a referência do artefato renderizado não corresponde ao hash do manifest"
+    return None
+
+
+def _base_commit_incoherence(task: WorkspaceTask, manifest: ContextManifest) -> str | None:
+    """`planning_base_commit == manifest.git_head == base_commit == plan.base_commit` ([02] §6)."""
+    commits = {
+        task.planning_base_commit,
+        manifest.git_head,
+        task.base_commit,
+        (task.plan or {}).get("base_commit"),
+    }
+    if None in commits or len(commits) != 1:
+        return "o commit-base do plano, da task e do manifest não é o mesmo"
+    return None
+
+
+def _static_prerequisites(
+    session: Session,
+    task: WorkspaceTask,
+    workspace: DevWorkspace,
+) -> ContextManifest:
+    """Pré-condições de pré-admissão que só leem o banco. Devolve o manifest aprovado.
+
+    Cada recusa deixa `SafetyEvent` durável e **nada mais**: sem Run, sem tentativa consumida.
+    """
+    if workspace.status is not WorkspaceStatus.ACTIVE:
+        raise _refuse_admission(
+            session,
+            task,
+            AdmissionGuard.WORKSPACE_ACTIVE,
+            f"o workspace '{workspace.name}' não está ativo ([02] §1)",
+        )
+
+    if task.cancel_requested:
+        raise _refuse_admission(
+            session,
+            task,
+            AdmissionGuard.NOT_CANCELLED,
+            "o cancelamento foi solicitado para esta task; ela não será executada",
+        )
+
+    decision = decision_from_task(task)
+    policy = active_workflow_policy(decision)
+    if not workflow_policy_supported(policy):
+        raise _refuse_admission(
+            session,
+            task,
+            AdmissionGuard.WORKFLOW_POLICY_SUPPORTED,
+            "a política de workflow vigente exige auditoria obrigatória e esta fase não tem "
+            "Auditor (E9); nenhuma auditoria fictícia será criada",
+        )
+
+    agents = tuple(task.agents or ())
+    if not agents or agents[0] != "developer" or unavailable_agents(agents):
+        raise _refuse_admission(
+            session,
+            task,
+            AdmissionGuard.COMPOSITION_AVAILABLE,
+            "a composição aprovada exige agentes que ainda não existem nesta fase; só o "
+            "`developer` é invocável na E8",
+        )
+
+    test_policy = read_test_policy(workspace)
+    if test_policy is None:
+        raise _refuse_admission(
+            session,
+            task,
+            AdmissionGuard.TEST_POLICY_SUPPORTED,
+            "o workspace não tem `TestPolicy` configurada; sem ela não há como concluir uma "
+            "execução (testes são obrigatórios na E8)",
+        )
+    if test_policy.runner_id not in SUPPORTED_TEST_RUNNER_IDS:
+        raise _refuse_admission(
+            session,
+            task,
+            AdmissionGuard.TEST_POLICY_SUPPORTED,
+            "o `runner_id` da `TestPolicy` não é suportado pelo Test Runner V1",
+        )
+
+    manifest = latest_manifest(session, task)
+    incoherence = _plan_incoherence(task, manifest)
+    if incoherence is not None or manifest is None:
+        raise _refuse_admission(
+            session,
+            task,
+            AdmissionGuard.PLAN_ARTIFACTS_COHERENT,
+            incoherence or "o manifest aprovado não existe",
+        )
+
+    base_incoherence = _base_commit_incoherence(task, manifest)
+    if base_incoherence is not None:
+        raise _refuse_admission(
+            session, task, AdmissionGuard.BASE_COMMIT_COHERENT, base_incoherence
+        )
+    return manifest
+
+
+def _developer_binding_refusal(
+    current_parts: dict[str, Any], expected: CapabilityBinding | None
+) -> str | None:
+    """O binding aprovado é concreto e é o que o chamador confiável espera provar?
+
+    Sem `developer_binding` no fingerprint não há adaptador/modelo a executar. Com ele, o
+    contexto esperado da prova de capability tem de nomear o **mesmo** adaptador, versão e
+    modelo — senão a prova atestaria um provider diferente do que o humano aprovou.
+    """
+    binding = current_parts.get("developer_binding")
+    if not isinstance(binding, dict):
+        return "a aprovação não tem `developer_binding` concreto; não há provider a executar"
+    if expected is None:
+        return None  # a guarda de capability recusa por `expected_context_missing`
+    if (
+        expected.adapter_id != binding.get("adapter")
+        or expected.adapter_version != binding.get("adapter_version")
+        or expected.model != binding.get("model")
+    ):
+        return (
+            "o contexto esperado da prova de capability não corresponde ao `developer_binding` "
+            "aprovado (adaptador, versão ou modelo)"
+        )
+    return None
+
+
+def _resolve_lost_claim(
+    session: Session, task_id: str, key: str, original: Exception
+) -> ExecutionAdmission:
+    """O *claim* perdeu uma corrida: relê o banco (já com rollback) e diz **por quê**.
+
+    Quatro desfechos, nesta precedência: a chave já existe (repetição ou conflito); a task já
+    está `executing` sob outra chave; a task saiu de `approved` (aresta inválida); a task segue
+    `approved` e outra ocupa o slot (`slot_busy`). Se nada explica a perda, ela é um defeito e
+    o erro original sobe — nunca é mascarado como "ocupado".
+    """
+    existing = _existing_admission(session, task_id, key)
+    if existing is not None:
+        return existing
+    task = get_task(session, task_id)
+    if task.status is TaskStatus.EXECUTING:
+        raise TaskAlreadyExecuting(
+            f"a task '{task_id}' já está em execução sob outra chave idempotente"
+        ) from original
+    require_transition(task.status, TaskStatus.EXECUTING)
+    if not _slot_available(session, exclude_task_id=task.id):
+        return _slot_busy(task)
+    raise original
+
+
+def _claim_execution(
+    session: Session,
+    task: WorkspaceTask,
+    *,
+    key: str,
+    manifest: ContextManifest,
+    now: datetime,
+) -> Run:
+    """A transação de admissão: **uma** transação, `COMMIT` antes de qualquer efeito externo.
+
+    1. reserva o slot — o índice único parcial `uq_workspace_task_single_executing` faz
+       `approved → executing` falhar atomicamente (entre processos) se outra task ocupa o slot;
+    2. confirma versão/status por CAS;
+    3. `approved → executing`, `phase = implementing`, `attempts + 1` (exatamente uma vez);
+    4. cria o Run de controle `running`, com os vínculos de recuperação (manifest, base
+       commit, posição no ciclo).
+
+    O `UPDATE` do CAS é a **primeira** instrução da transação: uma transação SQLite que começa
+    por escrita pega o lock de escrita com a visão mais recente, sem o `SQLITE_BUSY_SNAPSHOT` de
+    uma leitura anterior. Nada aqui chama HTTP, provider, git ou toca o filesystem.
+
+    Qualquer falha — inclusive a do meio — desfaz tudo: a task segue `approved`, sem Run e com
+    `attempts` intacto.
+    """
+    task_id = task.id
+    attempt_index = task.attempts
+    fix_round = task.fix_rounds
+    expected_version = task.version
+    started_at = task.started_at or now
+    base_commit = task.planning_base_commit
+    manifest_id = manifest.id
+
+    try:
+        _compare_and_set(
+            session,
+            task,
+            expected_status=TaskStatus.APPROVED,
+            expected_version=expected_version,
+            values={
+                **transition_fields(TaskStatus.EXECUTING, phase=TaskPhase.IMPLEMENTING),
+                "attempts": WorkspaceTask.attempts + 1,
+                "started_at": started_at,
+            },
+        )
+        run = Run(
+            invocation_id=key,
+            task_id=task_id,
+            context_manifest_id=manifest_id,
+            agent=RunAgent.ORCHESTRATOR,
+            purpose=RunPurpose.EXECUTION,
+            attempt_index=attempt_index,
+            fix_round=fix_round,
+            provider="orchestrator",
+            provider_adapter="execution_manager",
+            transport=RunTransport.PROCESS,
+            status=RunStatus.RUNNING,
+            started_at=now,
+            # Aberto: nenhuma métrica é afirmada. `NULL` = não medido ([02] §10).
+            token_source=TokenSource.UNAVAILABLE,
+            files_read=None,
+            files_read_source=FilesReadSource.UNAVAILABLE,
+            files_changed=None,
+            diff_added=None,
+            diff_removed=None,
+            base_commit=base_commit,
+        )
+        session.add(run)
+        session.flush()
+        session.commit()
+    except BaseException:
+        session.rollback()
+        raise
+    return run
+
+
+@command
+def admit_execution(
+    session: Session,
+    task_id: str,
+    *,
+    invocation_id: str,
+    artifacts_dir: Path,
+    prover: CapabilityProver | None = None,
+    expected_capability_binding: CapabilityBinding | None = None,
+    developer_binding_resolver: DeveloperBindingResolver | None = None,
+) -> ExecutionAdmission:
+    """Admissão durável de uma execução (E8.4.1). **Porta interna**, sem rota pública.
+
+    `approved → executing` (`phase = implementing`) + Run de controle `running` + `attempts + 1`
+    + slot reservado, numa só transação commitada antes de qualquer efeito externo. **Não**
+    cria worktree, não invoca provider nem Test Runner, não verifica nada pós-execução: isso é
+    E8.4.2–E8.4.5. Quem a chamar sem esse encadeamento deixa a task `executing` sem worker —
+    por isso ela não está exposta.
+
+    ## Resultados
+
+    * `ADMITTED` — admissão nova;
+    * `REPLAYED` — mesma chave + mesma task: o Run de controle existente, sem escrita alguma;
+    * `SLOT_BUSY` — outra task ocupa o slot: a task segue `approved`, nada é consumido nem criado.
+
+    Chave de outra task ou de Run que não é de controle → `InvocationIdConflict`; chave nova
+    com a task já `executing` → `TaskAlreadyExecuting`; qualquer pré-condição não satisfeita →
+    `TransitionGuardFailed` (409) com `SafetyEvent`, sem Run e sem tentativa consumida.
+
+    ## Fases, e por que a transação de escrita é curta
+
+    1. leitura barata do banco (idempotência, estado, pré-requisitos estáticos);
+    2. fatos que exigem IO — git (HEAD, formato de objeto) e bytes do artefato —, **sem**
+       transação aberta;
+    3. fingerprint recalculado, guardas puras, `slot_busy`, binding e prova de capability;
+    4. o *claim* atômico (`_claim_execution`).
+
+    Entre 3 e 4 há uma janela em que um fato lido pode mudar (HEAD, `test_config`). Ela é
+    declarada e tolerada: a E8.4.2 revalida o HEAD ao criar a worktree, e o CAS de versão
+    protege tudo o que passa pela task.
+    """
+    key = validate_invocation_id(invocation_id)
+
+    task = get_task(session, task_id)
+    existing = _existing_admission(session, task_id, key)
+    if existing is not None:
+        return existing
+
+    if task.status is TaskStatus.EXECUTING:
+        raise TaskAlreadyExecuting(
+            f"a task '{task_id}' já está em execução sob outra chave idempotente"
+        )
+    require_transition(task.status, TaskStatus.EXECUTING)
+
+    workspace = get_workspace(session, task.workspace_id)
+    manifest = _static_prerequisites(session, task, workspace)
+
+    # Fim da transação de leitura ANTES de git e filesystem.
+    session.commit()
+
+    facts_git = preflight(workspace.local_path)
+    if facts_git.is_git_repo and repository_object_format(workspace.local_path) not in (
+        E2E_OBJECT_FORMATS
+    ):
+        raise _refuse_admission(
+            session,
+            task,
+            AdmissionGuard.OBJECT_FORMAT_SUPPORTED,
+            "o fluxo E2E da V1 só suporta repositórios SHA-1; o formato do repositório é "
+            "outro ou não pôde ser lido",
+        )
+    if not rendered_artifact_intact(artifacts_dir, manifest.rendered_context_hash):
+        raise _refuse_admission(
+            session,
+            task,
+            AdmissionGuard.PLAN_ARTIFACTS_COHERENT,
+            "o artefato renderizado aprovado não existe ou seus bytes não correspondem ao hash "
+            "do manifest",
+        )
+
+    current_fingerprint, current_parts = _recompute_fingerprint(
+        session, task, developer_binding_resolver=developer_binding_resolver
+    )
+    decision = decision_from_task(task)
+    approved_fingerprint = task.approved_fingerprint
+    approved_parts = task.approved_fingerprint_parts
+    slot_free = _slot_available(session, exclude_task_id=task.id)
+    session.commit()  # nenhuma transação aberta durante a prova de capability
+
+    try:
+        check_entry_preconditions(
+            EntryGuardFacts(
+                fingerprint_matches=current_fingerprint == approved_fingerprint,
+                slot_available=True,  # decidido abaixo e, de verdade, atomicamente no claim
+                is_git_repo=facts_git.is_git_repo,
+                head=facts_git.head,
+                planning_base_commit=task.planning_base_commit,
+                attempts=task.attempts,
+                max_attempts=decision.max_attempts,
+            )
+        )
+        if not slot_free:
+            # A chave pode ter sido tomada enquanto isto rodava (outra admissão concorrente): a
+            # resposta determinística é a da chave — repetição ou conflito —, não "ocupado".
+            taken = _existing_admission(session, task_id, key)
+            return taken if taken is not None else _slot_busy(task)
+        binding_refusal = _developer_binding_refusal(current_parts, expected_capability_binding)
+        if binding_refusal is not None:
+            raise TransitionGuardFailed(
+                binding_refusal, guard=AdmissionGuard.DEVELOPER_BINDING_APPROVED.value
+            )
+        check_entry_capability(prover, expected_capability_binding)
+    except TransitionGuardFailed as exc:
+        invalidation = _record_entry_refusal(
+            session,
+            task,
+            exc,
+            current_fingerprint=current_fingerprint,
+            current_parts=current_parts,
+            approved_fingerprint=approved_fingerprint,
+            approved_parts=approved_parts,
+        )
+        if invalidation is not None:
+            raise invalidation from exc
+        raise
+
+    try:
+        run = _claim_execution(session, task, key=key, manifest=manifest, now=_utcnow())
+    except (ConcurrentTaskUpdate, IntegrityError) as lost:
+        # `_claim_execution` já fez rollback. IntegrityError aqui é, esperadamente, o índice
+        # único do slot ou a chave do Run; `_resolve_lost_claim` confirma relendo o banco.
+        return _resolve_lost_claim(session, task_id, key, lost)
+
+    return ExecutionAdmission(AdmissionOutcome.ADMITTED, get_task(session, task_id), run)
+
+
 # --------------------------------------------------------------------------- recuperação
 
 
@@ -1340,6 +1845,7 @@ __all__ = [
     "PLAN_STANDING_FINAL",
     "PLAN_STANDING_HISTORICAL",
     "PLAN_STANDING_NONE",
+    "admit_execution",
     "approval_state",
     "approve",
     "cancel",

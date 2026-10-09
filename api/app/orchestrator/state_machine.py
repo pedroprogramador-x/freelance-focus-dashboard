@@ -212,22 +212,12 @@ class EntryGuardFacts:
     max_attempts: int
 
 
-def check_entry_guard(
-    facts: EntryGuardFacts,
-    *,
-    prover: CapabilityProver | None,
-    expected_binding: CapabilityBinding | None = None,
-) -> None:
-    """As seis guardas de `approved → executing` ([02] §4). Levanta na primeira que falha.
+def check_entry_preconditions(facts: EntryGuardFacts) -> None:
+    """As cinco primeiras guardas de `approved → executing` ([02] §4): tudo menos a capability.
 
-    ``expected_binding`` é o contexto esperado (papel, adaptador, versão, transport, model,
-    `execution_config_hash`, declaração) fornecido pelo chamador **confiável**. Sem ele, a
-    guarda de capability recusa — uma prova não escolhe contra o que será comparada.
-
-    A ordem é a de [02] §4 e não é arbitrária: as baratas e determinísticas primeiro, a
-    prova de capability por último. Provar capability pode custar um processo de provider;
-    fazê-lo antes de conferir que o `HEAD` nem mudou seria pagar caro para descobrir algo
-    que uma comparação de string já sabia.
+    Puras e baratas, na ordem de [02] §4. Separadas de `check_entry_guard` (E8.4.1) para que a
+    admissão possa decidir `slot_busy` **antes** de pagar a prova de capability, que pode custar
+    um processo de provider.
     """
     if not facts.fingerprint_matches:
         raise TransitionGuardFailed(
@@ -262,7 +252,33 @@ def check_entry_guard(
             guard="attempts_below_max",
         )
 
+
+def check_entry_capability(
+    prover: CapabilityProver | None, expected_binding: CapabilityBinding | None = None
+) -> None:
+    """A última guarda de `approved → executing`: o perfil de capability, *fail closed*."""
     _check_capability(prover, expected_binding)
+
+
+def check_entry_guard(
+    facts: EntryGuardFacts,
+    *,
+    prover: CapabilityProver | None,
+    expected_binding: CapabilityBinding | None = None,
+) -> None:
+    """As seis guardas de `approved → executing` ([02] §4). Levanta na primeira que falha.
+
+    ``expected_binding`` é o contexto esperado (papel, adaptador, versão, transport, model,
+    `execution_config_hash`, declaração) fornecido pelo chamador **confiável**. Sem ele, a
+    guarda de capability recusa — uma prova não escolhe contra o que será comparada.
+
+    A ordem é a de [02] §4 e não é arbitrária: as baratas e determinísticas primeiro, a
+    prova de capability por último. Provar capability pode custar um processo de provider;
+    fazê-lo antes de conferir que o `HEAD` nem mudou seria pagar caro para descobrir algo
+    que uma comparação de string já sabia.
+    """
+    check_entry_preconditions(facts)
+    check_entry_capability(prover, expected_binding)
 
 
 #: Recusas que significam "não há prova positiva" (→ `capability_profile_proven`,
@@ -474,7 +490,9 @@ __all__ = [
     "EntryGuardFacts",
     "can_transition",
     "check_approval_guard",
+    "check_entry_capability",
     "check_entry_guard",
+    "check_entry_preconditions",
     "check_needs_fix_guard",
     "is_terminal",
     "require_transition",

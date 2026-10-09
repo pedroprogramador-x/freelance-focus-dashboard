@@ -127,6 +127,9 @@ class RunTransport(str, Enum):
 
 
 class RunStatus(str, Enum):
+    #: Execução admitida e ainda não finalizada (E8.4.1). É o **único** estado aberto: tem
+    #: `finished_at`/`duration_ms` nulos, e todo outro status é final e imutável.
+    RUNNING = "running"
     OK = "ok"
     ERROR = "error"
     TIMEOUT = "timeout"

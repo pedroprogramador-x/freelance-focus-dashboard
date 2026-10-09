@@ -8490,3 +8490,162 @@ teste falha e o diagnóstico muda.
   classificador de ambiente intocados; `LC_CTYPE`/`LANG`/`PYTHON*` não foram adicionados.
 - Gates locais (Windows): backend 4630 passed, 33 skipped, 0 failed; ruff, format, mypy, mypy
   Linux, pip check e diff check limpos. Aguardando o CI do PR #10.
+
+## 2026-10-08 — Claude Sonnet 5.5 (effort: high solicitado; o prompt declarava Opus 5.5) — E8.4.1 Execution Contract & Durable Admission — candidate
+
+Primeira subetapa da E8.4: admissão durável, idempotência, ciclo de vida dos Runs, limites e
+política de passe único. Branch `e8/04-1-execution-contract-admission`, base `main` em `f2911b2`
+(merge do PR #10). **Não commitada**, sem push/PR/merge; E8.4.2 não iniciada. Nenhum pipeline
+operacional: sem worktree, sem Developer, sem Test Runner, sem verificação pós-execução, sem
+worker, sem rota `/execute`; `start_execution` público segue no `NotImplementedError`.
+
+- Arquivos alterados:
+  - novos: `api/app/orchestrator/execution_contract.py` (contrato puro),
+    `api/migrations/versions/0003_execution_admission.py`, `api/tests/test_execution_contract_e8_4_1.py`,
+    `test_execution_admission_e8_4_1.py`, `test_run_lifecycle_e8_4_1.py`,
+    `admission_support_e8_4_1.py`, `admission_worker_e8_4_1.py` (worker de processo).
+  - alterados: `db/enums.py` (`RunStatus.RUNNING`), `db/models.py`, `orchestrator/{execution_manager,
+    state_machine,fingerprint,planner,resource_router,errors,__init__}.py`, `git_runtime/__init__.py`
+    (`repository_object_format`, só leitura), `context_engine/{manifest,__init__}.py`
+    (`rendered_artifact_intact`, só leitura), `tests/test_db_constraints.py` e
+    `tests/test_api_workspace_purge.py` (helpers de Run alinhados ao ciclo de vida novo).
+  - docs (adendos, ADRs intocados): `02-data-model.md` §4/§7/§8 e `04-safety-and-git-runtime.md` §7.
+- Decisões tomadas:
+  - Política E8 temporária: `fingerprint.e8_single_pass_policy` (`audit_required_on_nonempty_diff =
+    False`); a normal (`WorkflowPolicy()`, auditoria obrigatória) ficou intacta para a E9. O ponto
+    único `planner.active_workflow_policy` escolhe a vigente e entra no `workflow_policy_hash`:
+    aprovação sob outra política diverge (`workflow_policy_hash`) e não executa; sem Auditor, uma
+    política vigente que exija auditoria é recusada (`workflow_policy_supported`). Nenhum AuditRun/
+    AuditFinding fictício.
+  - Limites: `run_timeout_s = 1200` e `task_timeout_s = 1800` em `execution_limits` (fingerprint V1
+    inalterado em versão/algoritmo/chaves de topo). Só os valores e o helper puro
+    `operation_timeout_s`; nenhuma supervisão. Aprovações anteriores divergem em `execution_limits`.
+  - `Run`: `running` = único estado aberto. Migration 0003 recria `run` (procedimento oficial do
+    SQLite, FK desligadas, fail closed antes de DDL): CHECKs (`running` ⇒ sem fim/duração; final ⇒
+    `finished_at`; métricas do Git Runtime tudo-ou-nada e `NULL` em Run aberto), triggers (final
+    imutável por status, identidade imutável, fechar exige `finished_at`+`duration_ms`) e índice único
+    parcial de um Run de controle aberto por task. `files_changed`/`diff_added`/`diff_removed`
+    passaram a nullable: `NULL` = não medido. Downgrade recusa perder a distinção medido/não medido.
+  - Slot: índice único parcial `uq_workspace_task_single_executing` — a garantia é do banco, entre
+    threads e processos; derivado do status, sem o que liberar. Descartado: tabela de slots (exigiria
+    liberação em cancel/reconcile) e lock em memória.
+  - Admissão (`execution_manager.admit_execution`, porta interna, sem rota): leitura → IO (git, bytes
+    do artefato) sem transação → fingerprint/guardas/`slot_busy`/binding/capability → claim atômico
+    (CAS como 1ª instrução da transação + `attempts + 1` + Run de controle). Chave: obrigatória,
+    alfabeto sem `:`; ids dos componentes `<run_controle_id>:<componente>`. Repetição devolve o Run
+    sem escrever; chave de outra task / de Run não-controle → `InvocationIdConflict`; chave nova com a
+    task `executing` → `TaskAlreadyExecuting`; slot ocupado → `AdmissionOutcome.SLOT_BUSY` (task segue
+    `approved`, nada consumido). Recusas de pré-admissão deixam `SafetyEvent` e nenhum Run/tentativa.
+  - `state_machine.check_entry_guard` dividido em `check_entry_preconditions` + `check_entry_capability`
+    (comportamento idêntico) para decidir `slot_busy` antes de pagar a prova de capability;
+    `_record_entry_refusal` extraído de `start_execution` e compartilhado.
+  - Classificação pura (`classify_execution`, 3×8×7×2×4 combinações verificadas por propriedades):
+    precedência da spec; `needs_fix` não dispara retry. Mapeamento de `Run.status` do Run de controle
+    (ex.: `needs_fix` → `error`, limite/política → `blocked`) é proposta minha, a confirmar.
+- Testes/gates (Windows, Python 3.11, Git 2.53): 168 testes novos. Mutantes A1–A7 e A10–A15 (slot,
+  chave, attempts, rollback, precedência, CHECK, trigger, política, artefato, timeouts, ordem do slot,
+  SHA-256) aplicados in loco e restaurados — três só morreram depois de ajustes (A6 por correção do
+  mutante; A7 e A13 por testes adicionados); a suíte completa rodou depois da restauração. **Backend completo: 4801 passed, 33 skipped, 0 failed, exit 0**;
+  `ruff check`, `ruff format --check`, `mypy`, `mypy --platform linux`, `pip check`, `git diff --check`
+  limpos. CI Linux não rodou. A linha de base completa antes da mudança não foi concluída (suíte
+  interrompida por lentidão); a referência é o log da E8.3 (4630 passed / 33 skipped).
+- Pendências / riscos residuais: janela entre a leitura dos fatos e o claim (HEAD, `test_config`) —
+  a E8.4.2 revalida o HEAD na worktree; `reconcile_on_startup` ainda NÃO fecha o Run de controle
+  `running` de uma task marcada `failed(interrupted)` (E8.4.5; o doc 02 §4 já promete "Run abertos
+  fechados como interrupted"); o índice único fixa `max_parallel_agents = 1` no schema; DDL do
+  SQLite no Alembic não é transacional (pré-checagens falham antes do DDL; `run_new` residual é
+  descartado numa nova tentativa); `busy_timeout` de 5 s sob contenção extrema vira
+  `ConcurrentTaskUpdate`. Auditoria independente (Codex) pendente.
+
+## 2026-10-08 — Claude Opus 5.5 (effort: high) — E8.4.1 correção da auditoria: E841-AUD-001 e E841-AUD-002 — candidate
+
+Auditoria independente encontrou dois P2 na migration `0003_execution_admission`. Mesma branch
+`e8/04-1-execution-contract-admission`, base `f2911b2`; **não commitada**, sem push/PR/merge;
+E8.4.2 não iniciada. Contratos da E8.4.1 (política single-pass, 1200/1800, fingerprint V1,
+idempotência, CAS, attempts, classificação, métricas nullable, sem endpoint/worker) intocados.
+
+- Arquivos alterados: `api/migrations/versions/0003_execution_admission.py`, `api/migrations/env.py`,
+  `api/tests/test_migration_atomicity_e8_4_1.py` (novo), `api/tests/test_run_lifecycle_e8_4_1.py`
+  (removido o teste do helper extinto `_foreign_keys_off`, comentário do slot), comentário em
+  `api/tests/test_execution_admission_e8_4_1.py`, `api/app/db/models.py` (comentário do índice),
+  adendo E8.4.1 de `docs/architecture/02-data-model.md` §4. ADRs intocados.
+- Causa raiz (reproduzida com SQLite real antes da correção): o Alembic trata o SQLite como DDL
+  não transacional e abre só uma transação do SQLAlchemy por migration; o `sqlite3` legado só
+  inicia transação SQLite antes de DML. AUD-001: `DROP INDEX`/`CREATE TABLE run_new` anteriores ao
+  `INSERT` eram autocommit — falha na cópia deixava a versão em 0003, o índice de exclusão
+  removido e `run_new` órfão. AUD-002: o `PRAGMA foreign_keys=ON` do `finally` rodava dentro da
+  transação implícita aberta pelo `INSERT` e era ignorado — FK 1 → 0 na conexão do chamador.
+- Decisões tomadas:
+  - E841-AUD-001 corrigido: `_begin_atomic` roda antes de qualquer leitura/DDL; recusa em modo
+    offline, com FK ligada ou sem transação dona do commit; abre `BEGIN IMMEDIATE` quando não há
+    transação SQLite aberta (com uma aberta — `BEGIN` por evento, transação externa — roda dentro
+    dela). Pré-checagens, `DROP INDEX`, reconstrução, triggers, `PRAGMA foreign_key_check` final e o
+    carimbo de versão do Alembic ficam numa única transação; a migration nunca comita.
+  - E841-AUD-002 corrigido: reconstruir a tabela pai com FK ligada não é viável (o `DROP TABLE`
+    faz `DELETE` implícito e cascateia em `audit_finding`), então o pragma passou para o `env.py`
+    (`_SqliteForeignKeys`): lê pela conexão DBAPI (sem *autobegin*), desliga só fora de transação e
+    fora de transação externa do chamador; religa e confere **depois** do commit/rollback do
+    Alembic, no sucesso e na falha; se não conseguir, invalida a conexão e falha. Transação externa
+    com FK ligada → a migration recusa antes de qualquer DDL.
+  - Slot: o índice `uq_workspace_task_single_executing` foi reclassificado como proteção de
+    **admissão**. Obrigação vinculante da E8.4.5: reserva durável independente do estado terminal
+    da task, encerramento comprovado dos recursos externos e recovery idempotente; nenhuma execução
+    operacional antes disso. Nenhum worker/lease implementado.
+- Testes/gates (Windows, Python 3.11, SQLite 3.45.1, Alembic 1.14.1, SQLAlchemy 2.0.54): 33 testes
+  novos, cada cenário nos três modos de conexão (driver legado com FK desligada, legado com FK
+  ligada, engine da aplicação com `BEGIN` por evento): downgrade e upgrade interrompidos antes da
+  cópia, durante a cópia (TEMP trigger) e depois dela (no carimbo de versão) → schema, dados e
+  versão idênticos ao inicial e segunda task `executing` recusada; downgrade recusado pelos dados;
+  downgrade/upgrade legítimos; FK continua ligada **e aplicada** na mesma conexão (Run e finding
+  órfãos recusados); transação externa (FK ligada → recusa sem efeito; FK desligada → rollback do
+  chamador desfaz tudo). Mutantes numa cópia isolada de `api/` (hash do fonte real conferido):
+  M841-1 (`DROP INDEX` fora da transação) morto por 8 testes; M841-2 (FK religada dentro da
+  transação, sem restauração no `env.py`) morto por 21. Direcionados: 749 passed. Backend completo:
+  **4833 passed, 33 skipped, 0 failed, exit 0** (= 4801 + 33 novos − 1 removido). Uma execução
+  anterior teve 2 failed + 1 error só em `test_post_execution_verification_e8_3.py`
+  (`deadline_exceeded` do orçamento de 60 s e pós-condição de worktree `unverifiable` sob a carga
+  da suíte no OneDrive — residual E83-CORR-006); o arquivo isolado passou (132/10 skipped) e a
+  repetição completa saiu limpa. `ruff check`, `ruff format --check`, `mypy`, `mypy --platform linux`,
+  `pip check`, `git diff --check` limpos.
+- Pendências: reauditoria independente; CI Linux não rodou.
+
+## 2026-10-08 — Claude Opus 5.5 (effort: high) — E8.4.1 — E841-AUD-002 exception-safe FK cleanup — candidate
+
+Reauditoria reabriu E841-AUD-002: exceção no próprio cuidado com `PRAGMA foreign_keys` deixava a
+conexão SQLite sem FKs reutilizável. E841-AUD-001 segue RESOLVED (migration `0003` intocada).
+Mesma branch, base `f2911b2`; **não commitada**, sem push/PR/merge; E8.4.2/E8.4.5 não iniciadas.
+
+- Arquivos: `api/migrations/env.py`, `api/tests/test_migration_fk_cleanup_e8_4_1.py` (novo).
+- Causa raiz (reproduzida antes da correção): (A) `restore()` não protegia o próprio `ON`/leitura —
+  `set_authorizer` negando `PRAGMA foreign_keys=ON` levantava `not authorized` sem invalidar, FK 0
+  e Run órfão aceito na mesma conexão; (B) o helper desligava as FKs no construtor, **fora** do
+  `try/finally` de `_run` — falha na conferência pós-`OFF` saía sem cleanup, FK 0.
+- Correção: construtor não executa nada; `disable_if_safe()` roda dentro do `try` e assume a
+  responsabilidade **antes** do `OFF`. `restore()` trata religar + reler + conferir (e transação
+  aberta, conexão fechada, erro do driver) como um bloco: sem prova → invalidação. Invalidação não
+  é presumida: `Connection.invalidate()` (descarta o registro do pool e fecha o DBAPI) e, como o pool
+  do SQLAlchemy só **loga** erro de `close()`, o fechamento físico é conferido e, se preciso, feito
+  direto. Erro estruturado `ForeignKeysRestoreError` (causa original da migration, falha da
+  restauração, falhas da invalidação, `physically_closed`); se a física continuar aberta, a mensagem
+  diz "CONEXÃO INSEGURA". Contrato de transação externa inalterado (FK ON → recusa antes de DDL;
+  FK OFF → commit/rollback do chamador; nada é tocado).
+- Contraprovas (SQLite real, fluxo real `command.upgrade/downgrade` → `_run`): FK-01/05 (`ON` negado
+  por authorizer, upgrade e downgrade comitados, legado e app), FK-05 com falha da migration + falha
+  da restauração (causa preservada, banco no estado inicial), FK-02 (leitura pós-`ON` falha,
+  transação aberta após commit, conexão fechada após commit), FK-03 (falha pós-`OFF` única →
+  restaurado e comprovado na mesma conexão; persistente → invalidada), FK-04 (`invalidate()` falha →
+  fechamento direto, erro relata; `close()` falha → "CONEXÃO INSEGURA", nada declarado seguro).
+  Três desfechos distintos: (1) restauração comprovada (FK-03, falha única pós-`OFF`): a mesma
+  conexão física segue em uso com FK 1 e recusa finding órfão; (2) invalidação com fechamento
+  físico comprovado (FK-01/02/05, FK-03 persistente, FK-04 com `invalidate()` falho e `close()`
+  direto): a conexão física antiga recusa qualquer uso, e a mesma `Connection` e o pool entregam
+  conexão nova que recusa finding órfão; (3) falha artificial de `DBAPI.close()` (FK-04):
+  `physically_closed=False` e a conexão é expressamente classificada como INSEGURA no erro — a
+  física continua aberta, apenas o pool a largou; não há alegação de que ela recusa uso.
+- Mutantes (cópia isolada de `api/`, hash do fonte real conferido): M841-3 (restore sem invalidar)
+  morto por 11 testes; M841-4 (desligar fora do `try`) morto por 2.
+- Gates: direcionados 761 passed (migrations, lifecycle, admissão/concorrência, contrato,
+  constraints, state machine, fingerprint, arquitetura); backend completo 4845 passed, 33 skipped
+  (plataforma), 0 failed, na 1ª execução; `ruff check`, `ruff format --check`, `mypy`,
+  `mypy --platform linux`, `pip check`, `git diff --check` limpos.
+- Pendências: reauditoria final independente; CI Linux não rodou.

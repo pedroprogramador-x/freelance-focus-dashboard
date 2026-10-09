@@ -209,6 +209,19 @@ class WorkspaceTask(Base):
             "finished_at IS NULL OR started_at IS NOT NULL", name="finished_requires_started"
         ),
         sa.Index("ix_workspace_task_workspace_status", "workspace_id", "status"),
+        # E8.4.1 — `max_parallel_agents = 1` ([04] §7) verificado pelo **banco**: no máximo uma
+        # task `executing` no processo inteiro e entre processos. É proteção de ADMISSÃO: impede
+        # duas admissões concorrentes enquanto a task está `executing`, mas NÃO prova que os
+        # recursos externos (worktree, processos) foram encerrados depois de `cancelled`/
+        # `failed`. Reserva durável independente do estado terminal, encerramento comprovado e
+        # recovery idempotente são obrigação da E8.4.5 — antes dela não há execução operacional.
+        # Subir `max_parallel_agents` exige uma migration que remova este índice.
+        sa.Index(
+            "uq_workspace_task_single_executing",
+            "status",
+            unique=True,
+            sqlite_where=sa.text("status = 'executing'"),
+        ),
     )
 
 
@@ -260,6 +273,16 @@ class Run(Base):
     Idempotência por `invocation_id` UNIQUE. A constraint antiga
     `(task_id, agent, attempt_index, fix_round, purpose)` **não existe**: ela impedia duas
     auditorias legítimas sobre o mesmo sujeito (REAUD-005).
+
+    ## Ciclo de vida (E8.4.1)
+
+    `status = running` é o Run **aberto**: admitido e não finalizado, com `finished_at` e
+    `duration_ms` nulos e nenhuma métrica do Git Runtime afirmada. Qualquer outro status é
+    **final e imutável** — o banco recusa `UPDATE` num Run final, a volta para `running` e o
+    fechamento sem `finished_at`/`duration_ms`. `ok` nunca é usado como estado provisório.
+    O Run de controle (`agent = orchestrator`, `purpose = execution`) é criado na admissão e
+    representa o resultado agregado da tentativa; os Runs do Developer e do Test Runner (E8.4.3
+    e E8.4.4) têm `invocation_id` derivado do `id` dele (`execution_contract`).
     """
 
     __tablename__ = "run"
@@ -328,9 +351,12 @@ class Run(Base):
     )
 
     #: Sempre derivados pelo Git Runtime — nunca reportados pelo provider ([02] §10).
-    files_changed: Mapped[list[str]] = mapped_column(sa.JSON, nullable=False, default=list)
-    diff_added: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=0)
-    diff_removed: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=0)
+    #: **`NULL` = não medido** (E8.4.1). `[]` e `0` significam *medido, nada mudou*; um Run
+    #: aberto ou cujo Git Runtime não chegou a medir não pode afirmar zero. Os três são tudo
+    #: ou nada (CHECK), e a coleta real é da E8.4.4.
+    files_changed: Mapped[list[str] | None] = mapped_column(nullable_json(), nullable=True)
+    diff_added: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    diff_removed: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
 
     test_summary: Mapped[dict[str, Any] | None] = mapped_column(nullable_json(), nullable=True)
     worktree_path: Mapped[str | None] = mapped_column(sa.String(4096), nullable=True)
@@ -366,11 +392,42 @@ class Run(Base):
         sa.CheckConstraint(
             "output_tokens IS NULL OR output_tokens >= 0", name="output_tokens_non_negative"
         ),
-        sa.CheckConstraint("diff_added >= 0", name="diff_added_non_negative"),
-        sa.CheckConstraint("diff_removed >= 0", name="diff_removed_non_negative"),
+        sa.CheckConstraint("diff_added IS NULL OR diff_added >= 0", name="diff_added_non_negative"),
+        sa.CheckConstraint(
+            "diff_removed IS NULL OR diff_removed >= 0", name="diff_removed_non_negative"
+        ),
         sa.CheckConstraint("attempt_index >= 0", name="attempt_index_non_negative"),
         sa.CheckConstraint("fix_round >= 0", name="fix_round_non_negative"),
+        # E8.4.1 — ciclo de vida. `running` é o único estado aberto: sem fim e sem duração.
+        # Todo outro status é final e **tem** `finished_at`. A imutabilidade do final e a
+        # exigência de fechamento na transição estão nos *triggers* da migration 0003.
+        sa.CheckConstraint(
+            "status <> 'running' OR (finished_at IS NULL AND duration_ms IS NULL)",
+            name="open_run_has_no_closure",
+        ),
+        sa.CheckConstraint(
+            "status = 'running' OR finished_at IS NOT NULL", name="final_run_is_finished"
+        ),
+        # E8.4.1 — métricas do Git Runtime: tudo medido ou nada medido, e um Run aberto não
+        # afirma métrica nenhuma ([02] §10).
+        sa.CheckConstraint(
+            "(files_changed IS NULL) = (diff_added IS NULL)"
+            " AND (diff_added IS NULL) = (diff_removed IS NULL)",
+            name="git_metrics_all_or_none",
+        ),
+        sa.CheckConstraint(
+            "status <> 'running' OR files_changed IS NULL", name="open_run_has_no_git_metrics"
+        ),
         sa.Index("ix_run_subject_purpose", "subject_run_id", "purpose"),
+        # E8.4.1 — no máximo um Run de controle aberto por task.
+        sa.Index(
+            "uq_run_open_control_per_task",
+            "task_id",
+            unique=True,
+            sqlite_where=sa.text(
+                "agent = 'orchestrator' AND purpose = 'execution' AND status = 'running'"
+            ),
+        ),
     )
 
 

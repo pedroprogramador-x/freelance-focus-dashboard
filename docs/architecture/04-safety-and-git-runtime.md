@@ -587,6 +587,20 @@ arquivos, escrita fora da worktree, acesso à rede, acesso a segredos, uso de AP
 criação de processos por mecanismos externos à árvore (serviços, WMI, COM, Agendador de
 Tarefas). O que §6 declara sobre o Test Runner continua valendo integralmente.
 
+#### Adendo autorizado — E8.4.1 (2026-10-08): valores e interpretação dos timeouts
+
+> Adendo aprovado por Pedro (contrato da E8.4.1). Aditivo; a tabela acima e o adendo E7.3 valem
+> sem alteração. **Esta etapa fixa os valores; a supervisão operacional é das etapas de runtime.**
+
+* `run_timeout_s = 1200` e `task_timeout_s = 1800`, em `execution_limits` (entram no
+  `execution_fingerprint`; [02](02-data-model.md) §7).
+* Cada operação — a invocação do Developer, a execução de testes — tem no máximo 20 minutos. A
+  tentativa completa — preparação, execução, testes e verificação — tem no máximo 30 minutos. O Run
+  de controle acompanha o prazo da task (`started_at + task_timeout_s`).
+* O limite de cada operação futura respeita o tempo restante da task
+  (`execution_contract.operation_timeout_s`: o menor entre `run_timeout_s`, o que resta da task e o
+  timeout da `TestPolicy`/budget). `TestPolicy` e budgets mais restritivos continuam prevalecendo.
+
 ### Aprovação vinculada
 
 `approve` exige o `execution_fingerprint` completo ([02](02-data-model.md) §7). Qualquer

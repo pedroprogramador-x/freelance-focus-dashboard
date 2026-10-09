@@ -43,6 +43,15 @@ MAX_AGENTS = 3
 MAX_PARALLEL_AGENTS = 1
 MAX_ATTEMPTS = 2
 
+#: Limites de tempo de [04] §7 (E8.4.1). `RUN_TIMEOUT_S` é o teto de **cada operação** (uma
+#: invocação do Developer, uma execução de testes); `TASK_TIMEOUT_S` é o da tentativa inteira —
+#: preparação, execução, testes e verificação. O Run de controle acompanha o prazo da task, e o
+#: limite de cada operação futura respeita o tempo restante dela (`execution_contract`).
+#: Entram no `execution_fingerprint` (mudá-los invalida a aprovação). A supervisão operacional
+#: é das etapas de runtime; aqui são só os valores aprovados.
+RUN_TIMEOUT_S = 1200
+TASK_TIMEOUT_S = 1800
+
 #: **Inerte até E10.** Ver o docstring do módulo.
 MAX_FIX_ROUNDS = 2
 
@@ -74,15 +83,18 @@ class ResourceDecision:
     max_fix_rounds: int
     max_parallel_agents: int
     max_agents: int
+    #: Limites de tempo aprovados (E8.4.1). Ver `RUN_TIMEOUT_S`/`TASK_TIMEOUT_S`.
+    run_timeout_s: int
+    task_timeout_s: int
 
     def as_execution_limits(self) -> dict[str, Any]:
         """O `execution_limits` de [02] §7 — "timeouts, orçamentos, max_attempts,
         max_fix_rounds".
 
-        Os timeouts (`run_timeout_s`, `task_timeout_s` de [04] §7) **não** entram nesta
-        fase: eles governam supervisão de processo, que é E7, e nenhum valor desta fase
-        seria honesto. Acrescentá-los depois muda o hash e invalida aprovações vigentes —
-        que é exatamente o comportamento correto para uma mudança de limite ([04] §7).
+        E8.4.1: `run_timeout_s` e `task_timeout_s` ([04] §7) passam a fazer parte do
+        documento. Acrescentá-los muda o hash e invalida as aprovações vigentes — exatamente o
+        comportamento correto para uma mudança de limite ([04] §7); a estrutura do
+        fingerprint (versão, algoritmo, chaves de topo) não muda.
         """
         return {
             "max_context_tokens": self.max_context_tokens,
@@ -91,6 +103,8 @@ class ResourceDecision:
             "max_fix_rounds": self.max_fix_rounds,
             "max_parallel_agents": self.max_parallel_agents,
             "max_agents": self.max_agents,
+            "run_timeout_s": self.run_timeout_s,
+            "task_timeout_s": self.task_timeout_s,
         }
 
 
@@ -142,6 +156,8 @@ def route(
         max_fix_rounds=MAX_FIX_ROUNDS,
         max_parallel_agents=MAX_PARALLEL_AGENTS,
         max_agents=MAX_AGENTS,
+        run_timeout_s=RUN_TIMEOUT_S,
+        task_timeout_s=TASK_TIMEOUT_S,
     )
 
 
@@ -156,6 +172,8 @@ __all__ = [
     "MAX_FIX_ROUNDS",
     "MAX_PARALLEL_AGENTS",
     "PREFER_SINGLE_AGENT",
+    "RUN_TIMEOUT_S",
+    "TASK_TIMEOUT_S",
     "ResourceDecision",
     "route",
 ]

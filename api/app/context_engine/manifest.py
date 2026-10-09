@@ -209,6 +209,16 @@ def _matches_digest(target: Path, digest: str) -> bool:
     return hashlib.sha256(existing).hexdigest() == digest
 
 
+def rendered_artifact_intact(artifacts_dir: Path, digest: str) -> bool:
+    """O artefato `<digest>.json` existe em `artifacts_dir` e seus bytes hasheiam para `digest`?
+
+    A mesma verificação que `render_context` faz antes de reaproveitar um blob (AUD-009),
+    exposta para quem precisa **conferir sem gravar** — a admissão de execução (E8.4.1) não
+    pode confiar em "o manifest aponta para um artefato" sem ler os bytes.
+    """
+    return _matches_digest(artifacts_dir / f"{digest}.json", digest)
+
+
 def _encode_source_file(item: dict[str, Any]) -> dict[str, Any]:
     """`{path, blob_sha}` com `path` pré-codificado — identidade de caminho, não texto
     para leitura humana ([02] §7). `blob_sha` já é hex de 40 caracteres ASCII, imune a
@@ -367,4 +377,5 @@ __all__ = [
     "compute_manifest_hash",
     "freeze_manifest",
     "render_context",
+    "rendered_artifact_intact",
 ]
