@@ -66,6 +66,7 @@ from app.context_engine.manifest import (
     build_rendered_payload,
     compute_manifest_hash,
     freeze_manifest,
+    read_rendered_artifact,
     render_context,
     rendered_artifact_intact,
 )
@@ -202,6 +203,7 @@ __all__ = [
     "list_entries",
     "normalize_text",
     "normalize_transformations",
+    "read_rendered_artifact",
     "read_workspace_tree",
     "render_block_text",
     "render_context",

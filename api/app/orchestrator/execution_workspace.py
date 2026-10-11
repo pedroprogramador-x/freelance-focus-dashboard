@@ -1088,6 +1088,31 @@ class ExecutionWorkspaceService(Generic[SnapshotT]):
         except Exception:
             return False
 
+    def revoke_binding(self, token: object) -> bool:
+        """Revoga a autorização do binding de ``token`` (falha, violação ou resultado
+        contraditório). `True` só se a negação vale; remoção física não é exigida (E842-AUD-002)."""
+        return self._revoke(token)
+
+    def verify_component_binding(self, context: object, *, run_id: str, invocation_id: str) -> bool:
+        """O binding do Run de componente **ainda** resolve, com a raiz na identidade registrada?
+
+        A mesma conferência canônica do registro (`verify_run`). Qualquer falha — binding
+        revogado ou removido, raiz trocada, base diferente — é `False`: nunca levanta.
+        """
+        if not isinstance(context, PreparedWorkspace):
+            return False
+        try:
+            self._ports.bindings.verify_run(
+                workspace_id=context.workspace_id,
+                task_id=context.task_id,
+                run_id=run_id,
+                invocation_id=invocation_id,
+                base_commit=context.base_commit,
+            )
+        except Exception:
+            return False
+        return True
+
 
 __all__ = [
     "ComponentBindingRefused",

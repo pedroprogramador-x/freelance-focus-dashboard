@@ -101,6 +101,18 @@ from app.db.models import ContextManifest, DevWorkspace, Run, SafetyEvent, Works
 from app.git_runtime import preflight, repository_object_format
 from app.orchestrator.analyzer import AnalyzerEnrichmentPort
 from app.orchestrator.developer_binding import DeveloperBindingResolver
+from app.orchestrator.developer_invocation_contract import (
+    LIMIT_RULE_ID,
+    ClaimOutcome,
+    ClaimResult,
+    CloseOutcome,
+    CloseResult,
+    DeveloperRunSpec,
+    ExistingRunFacts,
+    InvocationFacts,
+    RunClosure,
+    claim_compatible,
+)
 from app.orchestrator.errors import (
     ApprovalFingerprintMismatch,
     ConcurrentTaskUpdate,
@@ -2059,6 +2071,374 @@ def record_workspace_preparation_failure(
         session.rollback()
         raise
     return recorded
+
+
+# ------------------------------------------------------------ invocação do Developer (E8.4.3)
+#
+# Lado **banco** da invocação do Developer (`orchestrator.developer_invocation`). Nenhuma faz IO
+# externo e nenhuma transiciona a task nem fecha o Run de controle: a classificação e a
+# finalização agregadas são da E8.4.5. O Run do Developer é criado e fechado só aqui.
+
+
+def _json_str(value: object) -> str | None:
+    return value if isinstance(value, str) and value.strip() else None
+
+
+@command
+def read_invocation_facts(
+    session: Session,
+    task_id: str,
+    *,
+    control_run_id: str,
+    developer_binding_resolver: DeveloperBindingResolver | None,
+) -> InvocationFacts:
+    """Relê a admissão e o que foi **aprovado**, para a invocação do Developer. Só leitura.
+
+    Reaproveita `read_preparation_facts` (task `executing`, Run de controle aberto na tentativa
+    corrente, sem cancelamento, plano/manifest/bases coerentes, fingerprint recalculado igual ao
+    aprovado) e acrescenta o que governa a chamada: objetivo e critérios do **plano aprovado**,
+    o manifest, o `developer_binding` e o `tool_profile_hash` do fingerprint aprovado e o
+    orçamento total de tokens aprovado. Nada disso vem de quem invoca. Devolve a primeira
+    incoerência em ``code`` — nunca levanta por estado.
+    """
+    base = read_preparation_facts(
+        session,
+        task_id,
+        control_run_id=control_run_id,
+        developer_binding_resolver=developer_binding_resolver,
+    )
+    if base.code is not None:
+        return InvocationFacts(
+            code=base.code,
+            task_id=task_id,
+            control_run_id=control_run_id,
+            workspace_id=base.workspace_id,
+        )
+
+    def refuse(code: PreparationCode) -> InvocationFacts:
+        return InvocationFacts(
+            code=code,
+            task_id=task_id,
+            control_run_id=control_run_id,
+            workspace_id=base.workspace_id,
+        )
+
+    task = session.get(WorkspaceTask, task_id)
+    manifest = None if task is None else latest_manifest(session, task)
+    if task is None or manifest is None:
+        return refuse(PreparationCode.PLAN_INCOHERENT)
+    plan_document = task.plan
+    criteria = plan_document.get("acceptance_criteria") if isinstance(plan_document, dict) else None
+    goal = _json_str(task.goal)
+    if (
+        goal is None
+        or not isinstance(criteria, list)
+        or not all(_json_str(item) is not None for item in criteria)
+    ):
+        return refuse(PreparationCode.PLAN_INCOHERENT)
+
+    parts = task.approved_fingerprint_parts
+    if not isinstance(parts, dict):
+        return refuse(PreparationCode.FINGERPRINT_DIVERGED)
+    binding = parts.get("developer_binding")
+    limits = parts.get("execution_limits")
+    if not isinstance(binding, dict) or not isinstance(limits, dict):
+        return refuse(PreparationCode.FINGERPRINT_DIVERGED)
+    budget = limits.get("max_total_tokens")
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+        return refuse(PreparationCode.FINGERPRINT_DIVERGED)
+
+    return InvocationFacts(
+        code=None,
+        task_id=task.id,
+        control_run_id=control_run_id,
+        workspace_id=base.workspace_id,
+        base_commit=base.base_commit,
+        task_version=base.task_version,
+        control_worktree_path=base.control_worktree_path,
+        run_started_at=base.run_started_at,
+        attempt_index=base.attempt_index,
+        fix_round=base.fix_round,
+        run_timeout_s=base.run_timeout_s,
+        task_timeout_s=base.task_timeout_s,
+        context_manifest_id=manifest.id,
+        rendered_context_hash=manifest.rendered_context_hash,
+        goal=goal,
+        acceptance_criteria=tuple(str(item) for item in criteria),
+        approved_adapter=_json_str(binding.get("adapter")),
+        approved_adapter_version=_json_str(binding.get("adapter_version")),
+        approved_model=_json_str(binding.get("model")),
+        approved_tool_profile_hash=_json_str(parts.get("tool_profile_hash")),
+        max_total_tokens=budget,
+    )
+
+
+def _existing_claim(session: Session, task_id: str, spec: DeveloperRunSpec) -> ClaimResult | None:
+    """O Run que já tem este `invocation_id`, classificado: ``ALREADY`` só se for o claim **deste**
+    Developer (identidade completa compatível, `claim_compatible`); qualquer outra coisa é
+    ``COLLISION``, que não carrega o id nem o status do Run alheio. `None` = não existe Run."""
+    row = session.scalar(select(Run).where(Run.invocation_id == spec.invocation_id))
+    if row is None:
+        return None
+    control = session.get(Run, spec.control_run_id)
+    linked = (
+        control is not None
+        and control.task_id == row.task_id
+        and control.agent is RunAgent.ORCHESTRATOR
+        and control.purpose is RunPurpose.EXECUTION
+        and control.attempt_index == row.attempt_index
+        and control.fix_round == row.fix_round
+    )
+    facts = ExistingRunFacts(
+        invocation_id=row.invocation_id,
+        task_id=row.task_id,
+        agent=row.agent.value,
+        purpose=row.purpose.value,
+        attempt_index=row.attempt_index,
+        fix_round=row.fix_round,
+        base_commit=row.base_commit,
+        context_manifest_id=row.context_manifest_id,
+        subject_run_id=row.subject_run_id,
+        supersedes_run_id=row.supersedes_run_id,
+        provider=row.provider,
+        provider_adapter=row.provider_adapter,
+        adapter_version=row.adapter_version,
+        model=row.model,
+        transport=row.transport.value,
+        control_linked=linked,
+    )
+    if claim_compatible(facts, spec, task_id):
+        return ClaimResult(ClaimOutcome.ALREADY, row.id, row.status)
+    return ClaimResult(ClaimOutcome.COLLISION)
+
+
+@command
+def find_developer_claim(
+    session: Session, task_id: str, *, spec: DeveloperRunSpec
+) -> ClaimResult | None:
+    """Consulta de recuperação (claim de resultado incerto): o mesmo veredito de compatibilidade da
+    reivindicação. Nunca devolve id/status de um Run que não seja o claim deste Developer."""
+    return _existing_claim(session, task_id, spec)
+
+
+@command
+def open_developer_run(session: Session, task_id: str, *, spec: DeveloperRunSpec) -> ClaimResult:
+    """**Reivindica** a invocação: cria o Run do Developer `running`, atomicamente.
+
+    O `INSERT` é a **primeira** instrução da transação (pega o lock de escrita com a visão mais
+    recente) e `invocation_id` é `UNIQUE`: dois reivindicantes — threads ou processos — nunca
+    vencem os dois. Só depois do `INSERT`, ainda sob o lock, o estado é reconferido (task
+    `executing` na versão publicada, Run de controle aberto na mesma tentativa e base, sem
+    cancelamento, worktree publicada igual): qualquer divergência desfaz o `INSERT`. O `COMMIT`
+    acontece **antes** de qualquer chamada ao provider — é isso que torna "no máximo uma
+    chamada por `invocation_id`" uma garantia do banco e não da memória.
+
+    Chave já existente → ``ALREADY`` **só** se o Run for o claim deste Developer (identidade
+    completa compatível; inclusive `running` de um crash): o provider **não** é chamado de novo.
+    Run de outro componente, task, tentativa ou propósito → ``COLLISION``: recusa explícita, sem
+    adotar id/status e sem criar um segundo claim (E843-AUD-001).
+    """
+    if spec.started_at is None:
+        raise ValueError("`started_at` é obrigatório")
+    try:
+        run = Run(
+            invocation_id=spec.invocation_id,
+            task_id=task_id,
+            context_manifest_id=spec.context_manifest_id,
+            agent=RunAgent.DEVELOPER,
+            purpose=RunPurpose.EXECUTION,
+            attempt_index=spec.attempt_index,
+            fix_round=spec.fix_round,
+            provider=spec.identity.provider,
+            provider_adapter=spec.identity.adapter,
+            adapter_version=spec.identity.adapter_version,
+            model=spec.identity.model,
+            transport=RunTransport(spec.identity.transport),
+            tool_profile_hash=spec.tool_profile_hash,
+            status=RunStatus.RUNNING,
+            started_at=spec.started_at,
+            token_source=TokenSource.UNAVAILABLE,
+            files_read=None,
+            files_read_source=FilesReadSource.UNAVAILABLE,
+            files_changed=None,
+            diff_added=None,
+            diff_removed=None,
+            worktree_path=spec.worktree_path,
+            base_commit=spec.base_commit,
+        )
+        session.add(run)
+        try:
+            session.flush()
+        except IntegrityError:
+            session.rollback()
+            existing = _existing_claim(session, task_id, spec)
+            if existing is None:
+                raise
+            return existing  # ALREADY (compatível) ou COLLISION (Run de outro componente)
+        run_id = run.id
+
+        control = session.get(Run, spec.control_run_id)
+        task = session.get(WorkspaceTask, task_id)
+        code: PreparationCode | None = None
+        if (
+            control is None
+            or control.task_id != task_id
+            or control.agent is not RunAgent.ORCHESTRATOR
+            or control.purpose is not RunPurpose.EXECUTION
+        ):
+            code = PreparationCode.RUN_MISMATCH
+        elif task is None:
+            code = PreparationCode.TASK_MISSING
+        elif task.status is not TaskStatus.EXECUTING:
+            code = PreparationCode.TASK_NOT_EXECUTING
+        elif control.status is not RunStatus.RUNNING:
+            code = PreparationCode.RUN_NOT_OPEN
+        elif task.cancel_requested:
+            code = PreparationCode.CANCEL_REQUESTED
+        elif task.version != spec.expected_task_version:
+            code = PreparationCode.TASK_VERSION_CHANGED
+        elif (
+            control.attempt_index != spec.attempt_index
+            or control.fix_round != spec.fix_round
+            or task.attempts - 1 != control.attempt_index
+            or task.fix_rounds != control.fix_round
+        ):
+            code = PreparationCode.ATTEMPT_MISMATCH
+        elif (
+            control.base_commit != spec.base_commit or task.planning_base_commit != spec.base_commit
+        ):
+            code = PreparationCode.BASE_COMMIT_INCOHERENT
+        elif (
+            control.worktree_path != spec.worktree_path or task.worktree_path != spec.worktree_path
+        ):
+            code = PreparationCode.FINAL_CHECK_FAILED
+        if code is not None:
+            session.rollback()
+            return ClaimResult(ClaimOutcome.REFUSED, code=code)
+        session.commit()
+    except BaseException:
+        session.rollback()
+        raise
+    return ClaimResult(ClaimOutcome.CLAIMED, run_id)
+
+
+@command
+def close_developer_run(
+    session: Session, task_id: str, *, run_id: str, closure: RunClosure
+) -> CloseResult:
+    """Fecha o Run do Developer **uma vez**, com as negações como `SafetyEvent`, numa transação.
+
+    O `UPDATE` condicionado a `running` é a primeira instrução; um Run já final nunca é
+    reescrito (`NOT_OPEN` + o status que está no banco, sem escrever nada). Cada negação do
+    executor vira um `SafetyEvent` com o `run_id` do Developer, na categoria que o próprio
+    executor classificou; o orçamento esgotado vira `limit_exceeded`. `summary` e
+    `error_summary` passam pelo redator aqui, no ponto de escrita.
+    """
+    try:
+        values: dict[str, Any] = {
+            "status": closure.status,
+            "finished_at": closure.finished_at,
+            "duration_ms": closure.duration_ms,
+            "token_source": closure.token_source,
+            "input_tokens": closure.input_tokens,
+            "output_tokens": closure.output_tokens,
+            "summary": redact(closure.summary) if closure.summary else None,
+            "error_summary": redact(closure.error_summary) if closure.error_summary else None,
+        }
+        if closure.files_read is None:
+            values["files_read"] = None
+            values["files_read_source"] = FilesReadSource.UNAVAILABLE
+        else:
+            values["files_read"] = list(closure.files_read)
+            values["files_read_source"] = FilesReadSource.REPORTED
+        updated = cast(
+            "CursorResult[Any]",
+            session.execute(
+                update(Run)
+                .where(
+                    Run.id == run_id,
+                    Run.task_id == task_id,
+                    Run.agent == RunAgent.DEVELOPER,
+                    Run.purpose == RunPurpose.EXECUTION,
+                    Run.status == RunStatus.RUNNING,
+                )
+                .values(**values)
+            ),
+        )
+        if updated.rowcount != 1:
+            session.rollback()
+            current = session.scalar(
+                select(Run.status).where(Run.id == run_id, Run.task_id == task_id)
+            )
+            return CloseResult(CloseOutcome.NOT_OPEN, current)
+        workspace_id = session.scalar(
+            select(WorkspaceTask.workspace_id).where(WorkspaceTask.id == task_id)
+        )
+        events = 0
+        for denial in closure.denials:
+            record_safety_event(
+                session,
+                kind=SafetyEventKind(denial.category),
+                decision=SafetyDecisionKind.DENY,
+                rule_id=denial.rule_id,
+                subject=denial.subject_redacted,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                run_id=run_id,
+                detail=denial.reason,
+            )
+            events += 1
+        if closure.limit_exceeded:
+            record_safety_event(
+                session,
+                kind=SafetyEventKind.LIMIT_EXCEEDED,
+                decision=SafetyDecisionKind.DENY,
+                rule_id=LIMIT_RULE_ID,
+                subject=f"run:{run_id}",
+                workspace_id=workspace_id,
+                task_id=task_id,
+                run_id=run_id,
+                detail="orçamento total de tokens do run esgotado",
+            )
+            events += 1
+        session.commit()
+    except BaseException:
+        session.rollback()
+        raise
+    return CloseResult(CloseOutcome.CLOSED, closure.status, events)
+
+
+@command
+def record_developer_invocation_refusal(
+    session: Session,
+    task_id: str,
+    *,
+    control_run_id: str,
+    kind: SafetyEventKind,
+    rule_id: str,
+    detail: str,
+) -> None:
+    """Deixa `SafetyEvent` (append-only, com o `run_id` do Run de controle) para uma recusa de
+    **política** antes da reivindicação — capability não comprovada ou divergente. Sem Run novo."""
+    try:
+        workspace_id = session.scalar(
+            select(WorkspaceTask.workspace_id).where(WorkspaceTask.id == task_id)
+        )
+        record_safety_event(
+            session,
+            kind=kind,
+            decision=SafetyDecisionKind.DENY,
+            rule_id=rule_id,
+            subject=f"task:{task_id}",
+            workspace_id=workspace_id,
+            task_id=task_id,
+            run_id=control_run_id,
+            detail=detail,
+        )
+        session.commit()
+    except BaseException:
+        session.rollback()
+        raise
 
 
 # --------------------------------------------------------------------------- recuperação

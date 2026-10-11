@@ -49,14 +49,18 @@ from app.agent_runtime.verification import (
     observe_declared_capabilities,
 )
 from app.tool_executor.contracts import (
+    DecisionCategory,
+    DecisionJournal,
     ExecutionWorkspaceRef,
     MediatedTools,
     MediatedUsage,
     RunScope,
+    ToolDecisionRecord,
     ToolExecutor,
     ToolExecutorFactory,
     ToolRequest,
     ToolResult,
+    WorkspaceKind,
 )
 
 __all__ = [
@@ -71,6 +75,8 @@ __all__ = [
     "CapabilityDeclaration",
     "CapabilityVerifier",
     "CapabilityVerifierContractViolation",
+    "DecisionCategory",
+    "DecisionJournal",
     "DeveloperExecutionRequest",
     "DeveloperProvider",
     "EnforcementEvidence",
@@ -92,12 +98,14 @@ __all__ = [
     "TestRunnerFailureCode",
     "TestSummary",
     "TokenSource",
+    "ToolDecisionRecord",
     "ToolExecutor",
     "ToolExecutorFactory",
     "ToolRequest",
     "ToolResult",
     "VerificationResult",
     "Verified",
+    "WorkspaceKind",
     "binding_of",
     "observe_declared_capabilities",
 ]

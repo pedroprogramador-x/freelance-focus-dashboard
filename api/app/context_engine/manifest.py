@@ -219,6 +219,26 @@ def rendered_artifact_intact(artifacts_dir: Path, digest: str) -> bool:
     return _matches_digest(artifacts_dir / f"{digest}.json", digest)
 
 
+def read_rendered_artifact(artifacts_dir: Path, digest: str, *, max_bytes: int) -> bytes | None:
+    """Os bytes de `<digest>.json`, **lidos uma única vez** e devolvidos só se hasheiam para
+    `digest` e cabem em `max_bytes`; senão `None` (ausente, ilegível, grande demais, adulterado).
+
+    Existe para quem precisa **usar** o conteúdo e não só conferi-lo (a invocação do Developer,
+    E8.4.3): conferir com `rendered_artifact_intact` e reler abriria uma janela entre a prova e
+    o uso. Leitura binária, pelo mesmo motivo de `_matches_digest`.
+    """
+    target = artifacts_dir / f"{digest}.json"
+    try:
+        if target.stat().st_size > max_bytes:
+            return None
+        data = target.read_bytes()
+    except OSError:
+        return None
+    if len(data) > max_bytes or hashlib.sha256(data).hexdigest() != digest:
+        return None
+    return data
+
+
 def _encode_source_file(item: dict[str, Any]) -> dict[str, Any]:
     """`{path, blob_sha}` com `path` pré-codificado — identidade de caminho, não texto
     para leitura humana ([02] §7). `blob_sha` já é hex de 40 caracteres ASCII, imune a
@@ -376,6 +396,7 @@ __all__ = [
     "build_rendered_payload",
     "compute_manifest_hash",
     "freeze_manifest",
+    "read_rendered_artifact",
     "render_context",
     "rendered_artifact_intact",
 ]
