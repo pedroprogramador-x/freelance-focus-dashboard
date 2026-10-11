@@ -1687,7 +1687,11 @@ def test_contratos_usam_so_stdlib_de_tipos() -> None:
 #: Os módulos que podem importar `agent_runtime`: o próprio pacote e a **ponte** do composition
 #: root (E7.6), que existe justamente para que `orchestrator` e `agent_runtime` não se
 #: importem. `main.py` e a ponte são os únicos que enxergam as duas camadas.
-_COMPOSITION_ROOT_MODULES = {"app.capability_wiring", "app.developer_wiring"}
+_COMPOSITION_ROOT_MODULES = {
+    "app.capability_wiring",
+    "app.developer_wiring",
+    "app.developer_invocation_wiring",  # E8.4.3: a porta da invocação sobre provider + executor
+}
 
 
 def test_so_agent_runtime_importa_tool_executor_e_ninguem_importa_agent_runtime() -> None:
@@ -2278,6 +2282,9 @@ def test_start_execution_continua_no_limite_da_e8_4() -> None:
 
 _EXECUTION_WORKSPACE = APP_ROOT / "orchestrator" / "execution_workspace.py"
 _WORKSPACE_CONTRACT = APP_ROOT / "orchestrator" / "workspace_contract.py"
+_DEVELOPER_INVOCATION = APP_ROOT / "orchestrator" / "developer_invocation.py"
+_INVOCATION_CONTRACT = APP_ROOT / "orchestrator" / "developer_invocation_contract.py"
+_INVOCATION_WIRING = APP_ROOT / "developer_invocation_wiring.py"
 
 
 def test_orchestrator_recebe_path_runtime_e_verificacao_por_injecao() -> None:
@@ -2302,9 +2309,13 @@ def test_orchestrator_recebe_path_runtime_e_verificacao_por_injecao() -> None:
 
 def test_preparacao_nao_e_operacional() -> None:
     """E8.4.2 é componente interno: nenhum módulo da aplicação (rota, `main.py`, startup, ponte do
-    composition root) importa o serviço de preparação. A composição integrada é da E8.4.6."""
+    composition root) importa o serviço de preparação. A composição integrada é da E8.4.6.
+
+    E8.4.3: a única exceção é o serviço da invocação do Developer (`developer_invocation`), que
+    usa `PreparedWorkspace` e `ComponentBindingRefused`; ele próprio é interno (ver o teste
+    seguinte)."""
     for path in ALL_FILES:
-        if path in (_EXECUTION_WORKSPACE, _WORKSPACE_CONTRACT):
+        if path in (_EXECUTION_WORKSPACE, _WORKSPACE_CONTRACT, _DEVELOPER_INVOCATION):
             continue
         for imported in _imports(path):
             assert not imported.startswith("app.orchestrator.execution_workspace"), (
@@ -2334,3 +2345,144 @@ def test_admissao_continua_sem_efeito_externo_da_preparacao() -> None:
         "capture_main_tree",
         "bind_run",
     }
+
+
+# ------------------------------------------------- E8.4.3: invocação do Developer (interna)
+
+
+def test_invocacao_do_developer_nao_e_operacional() -> None:
+    """E8.4.3 é componente interno: nenhum módulo da aplicação — rota, `main.py`, startup, fila,
+    worker ou outra ponte do composition root — importa o serviço, o contrato ou a ponte da
+    invocação. A composição integrada é da E8.4.6; os testes são os únicos consumidores."""
+    internos = (_DEVELOPER_INVOCATION, _INVOCATION_CONTRACT, _INVOCATION_WIRING)
+    for path in ALL_FILES:
+        if path in internos:
+            continue
+        for imported in _imports(path):
+            if (
+                path.name == "execution_manager.py"
+                and imported == "app.orchestrator.developer_invocation_contract"
+            ):
+                continue  # o lado banco consome o contrato PURO (dados e vocabulário)
+            assert not imported.startswith(
+                (
+                    "app.orchestrator.developer_invocation",
+                    "app.developer_invocation_wiring",
+                )
+            ), f"{_module_name(path)} importa a invocação do Developer: integração é E8.4.6"
+        texto = path.read_text(encoding="utf-8")
+        for nome in ("DeveloperInvocationService", "ProviderBackedDeveloperRuntime"):
+            assert nome not in texto, (path.name, nome)
+    for path in (APP_ROOT / "api").rglob("*.py"):
+        assert "/execute" not in path.read_text(encoding="utf-8")
+
+
+def test_invocacao_do_developer_so_importa_o_permitido() -> None:
+    """O núcleo (`orchestrator/`) não importa `agent_runtime`, `tool_executor`, adaptador,
+    processo, rede nem Path Runtime — tudo chega por injeção. A ponte do composition root
+    importa `agent_runtime`/`safety`/contrato, mas nunca `tool_executor` direto, nem banco, nem
+    `orchestrator` além do contrato puro, nem processo ou rede."""
+    nucleo_proibido = (
+        "app.agent_runtime",
+        "app.tool_executor",
+        "app.path_runtime",
+        "app.process_runtime",
+        "app.execution_verification",
+        "app.git_runtime.worktree",
+        "app.api",
+        "app.main",
+    )
+    for path in (_DEVELOPER_INVOCATION, _INVOCATION_CONTRACT):
+        for imported in _imports(path):
+            assert not imported.startswith(nucleo_proibido), f"{path.name} importa `{imported}`"
+            assert imported.split(".")[0] not in {
+                "subprocess",
+                "socket",
+                "ssl",
+                "http",
+                "urllib",
+                "httpx",
+                "requests",
+                "anthropic",
+                "asyncio",
+                "os",
+                "shutil",
+            } or (path == _DEVELOPER_INVOCATION and imported == "os"), (
+                f"{path.name} importa `{imported}`"
+            )
+    permitido_na_ponte = (
+        "app.agent_runtime",
+        "app.safety",
+        "app.orchestrator.developer_invocation_contract",
+    )
+    for imported in _imports(_INVOCATION_WIRING):
+        raiz = imported.split(".")[0]
+        if raiz == "app":
+            assert imported.startswith(permitido_na_ponte), f"ponte importa `{imported}`"
+        assert raiz not in {"subprocess", "socket", "ssl", "http", "urllib", "httpx", "anthropic"}
+
+
+def test_invocacao_so_usa_threading_como_mutex_do_coletor_de_evidencia() -> None:
+    """`threading` aparece só no contrato (o `Lock` do `EvidenceCollector`); nenhum dos três módulos
+    cria thread, timer ou executor: a concorrência é do provider, não da invocação."""
+    for path in (_DEVELOPER_INVOCATION, _INVOCATION_CONTRACT, _INVOCATION_WIRING):
+        texto = path.read_text(encoding="utf-8")
+        for proibido in (
+            "Thread(",
+            "Timer(",
+            "ThreadPoolExecutor",
+            "ProcessPoolExecutor",
+            ".start()",
+        ):
+            assert proibido not in texto, (path.name, proibido)
+        usa_threading = "threading" in _imports(path)
+        assert usa_threading == (path == _INVOCATION_CONTRACT), path.name
+    assert "threading.Lock()" in _INVOCATION_CONTRACT.read_text(encoding="utf-8")
+
+
+def test_invocacao_nao_executa_comando_nem_ferramenta_nativa() -> None:
+    """Nenhum `ExecCommand`/shell/`subprocess`/`os.system` nos três módulos novos, e o `Developer`
+    continua tendo exatamente as nove operações mediadas."""
+    from app.tool_executor.contracts import TOOL_OPERATIONS
+
+    assert len(TOOL_OPERATIONS) == 9
+    for path in (_DEVELOPER_INVOCATION, _INVOCATION_CONTRACT, _INVOCATION_WIRING):
+        texto = path.read_text(encoding="utf-8")
+        for proibido in ("subprocess", "os.system", "shell=True", "ExecCommand", "Popen", "execv"):
+            assert proibido not in texto, (path.name, proibido)
+
+
+def test_invocacao_so_o_execution_manager_escreve_run_e_safety_event() -> None:
+    """O serviço e a ponte não importam o ORM de escrita: `Run`/`SafetyEvent` só são escritos
+    pelos comandos do Execution Manager (`open_developer_run`, `close_developer_run`…)."""
+    for path in (_DEVELOPER_INVOCATION, _INVOCATION_CONTRACT, _INVOCATION_WIRING):
+        for imported in _imports(path):
+            assert not imported.startswith("app.db.models"), f"{path.name} importa `{imported}`"
+        texto = path.read_text(encoding="utf-8")
+        for escrita in ("session.add", "session.execute", "update(Run", "insert("):
+            assert escrita not in texto, (path.name, escrita)
+    for comando in (
+        "open_developer_run",
+        "close_developer_run",
+        "read_invocation_facts",
+        "find_developer_claim",
+        "record_developer_invocation_refusal",
+    ):
+        from app.orchestrator.execution_manager import GUARDED_COMMANDS
+
+        assert comando in GUARDED_COMMANDS, comando
+
+
+def test_start_execution_continua_no_limite_apos_a_e8_4_3() -> None:
+    """A invocação não liga nada ao caminho público: `start_execution` segue no
+    `NotImplementedError` e o Execution Manager não referencia o serviço, a ponte nem o provider."""
+    texto = (APP_ROOT / "orchestrator" / "execution_manager.py").read_text(encoding="utf-8")
+    assert "NotImplementedError" in texto
+    for nome in (
+        "DeveloperInvocationService",
+        "ProviderBackedDeveloperRuntime",
+        "DeveloperProvider",
+        "ToolExecutorFactory",
+        "developer_invocation_wiring",
+    ):
+        assert nome not in texto, nome

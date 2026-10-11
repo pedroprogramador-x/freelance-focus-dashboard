@@ -8813,3 +8813,167 @@ E8.4.3+ não iniciadas. Sem migration, banco, serviço externo ou mudança de co
   `ruff check`, `ruff format --check`, `mypy`, `mypy --platform linux`, `pip check`,
   `git diff --check` limpos. CI Linux/Windows não rodaram.
 - Pendências: reauditoria independente; TOCTOU residual e E8.4.5 obrigatória inalterados.
+
+## 2026-10-10 — Claude Sonnet 5.5 (effort: não declarado no prompt; padrão da sessão) — E8.4.3 Developer Invocation — candidate
+
+Núcleo da invocação do Developer como **componente interno não operacional**. Branch local
+`e8/04-3-developer-invocation` criada de `origin/main` = `1efac19` (merge do PR #12; a branch
+`e8/04-2-execution-workspace` não foi reutilizada), workspace limpo antes. **Não commitada**, sem
+push/PR/merge. Nada ligado a `main.py`, startup, rota, fila ou worker; `start_execution` segue no
+`NotImplementedError`; o Claude Agent SDK não participa; nenhuma chamada a modelo, rede ou
+credencial (transporte falso). `docs/`/ADRs, frontend, `deploy.yml`, schema e migrations intocados.
+
+- Arquivos alterados:
+  - novos: `api/app/orchestrator/developer_invocation_contract.py` (vocabulários, dados neutros,
+    `decide_run` puro), `api/app/orchestrator/developer_invocation.py` (serviço),
+    `api/app/developer_invocation_wiring.py` (composition root: `ProviderBackedDeveloperRuntime`),
+    `api/tests/test_developer_invocation_e8_4_3.py` (95), `test_developer_invocation_contract_e8_4_3.py`
+    (37), `developer_invocation_support_e8_4_3.py`, `claim_worker_e8_4_3.py` (worker de processo).
+  - alterados: `orchestrator/execution_manager.py` (5 `@command`: `read_invocation_facts`,
+    `find_developer_run`, `open_developer_run`, `close_developer_run`,
+    `record_developer_invocation_refusal`), `orchestrator/execution_workspace.py`
+    (`verify_component_binding`, `revoke_binding`, aditivos), `context_engine/{manifest,__init__}.py`
+    (`read_rendered_artifact`: leitura única conferida contra o hash), `agent_runtime/__init__.py`
+    (reexporta `DecisionCategory`, `DecisionJournal`, `ToolDecisionRecord`, `WorkspaceKind`, que já
+    existiam em `tool_executor.contracts`), `tests/test_architecture.py`.
+- Decisões tomadas (plano aprovado D1–D5 + ajustes 1–6):
+  - **No máximo uma chamada ao provider por `invocation_id`, persistente e atômica.** O `INSERT` do
+    Run do Developer (`invocation_id = <controle>:developer`, `UNIQUE`) é a 1ª instrução da transação;
+    sob o lock de escrita o estado é reconferido (task `executing` na versão publicada, Run de controle
+    aberto na mesma tentativa/base, sem cancelamento, worktree publicada igual) e o `COMMIT` ocorre
+    **antes** da chamada. Quem perde, ou chega depois de um crash, vê o Run existente
+    (`ALREADY_CLAIMED`, `requires_finalization` se `running`) e não chama o provider. Provado entre
+    threads (4) e entre **processos** (4 workers).
+  - **Capability vinculada ao aprovado (ajuste 2).** O serviço recebe prover e expectativa só do
+    composition root, na construção; `invoke(context, is_cancelled)` não aceita nenhuma. Identidade do
+    provider × `developer_binding` do fingerprint **aprovado** × expectativa × `tool_profile_hash`
+    aprovado precisam concordar; depois `check_entry_capability` (a guarda da admissão) é reavaliada.
+    Recusa antes do claim, com `SafetyEvent` (`capability_unenforceable`/`capability_denied`).
+  - **`plan_steps=()`** (ajuste 3): o plano aprovado não tem passos; objetivo, critérios, manifest,
+    orçamento (`max_total_tokens`) e contexto vêm do aprovado/banco, nunca de quem invoca. O contexto
+    entregue é o artefato renderizado (JSON canônico) lido uma vez e conferido contra o hash do manifest.
+  - **Decisão fail-closed (`decide_run`, pura e testada exaustivamente):** relatório contraditório →
+    `error`; violação crítica (`out_of_worktree_write`, `toctou_recheck_failed`) → `blocked`; binding
+    não mais autorizado ao fim (`verify_run`) → `blocked`; `ok` com executor não encerrado → `error`;
+    senão o status do provider (`limit_exceeded` → `blocked` + `SafetyEvent`). Uma negação comum de
+    ferramenta **não** é violação global ([E8.4.1] §11): vira `SafetyEvent` na categoria que o próprio
+    executor classificou, com o `run_id` do Developer, na mesma transação do fechamento.
+    **Escolha minha a confirmar:** só essas duas categorias são "críticas".
+  - **Encerramento (ajuste 5):** binding liberado se `ok`, **revogado** em qualquer outro desfecho (e
+    revogado como contingência se a liberação não se prova); fechamento condicionado a `running`,
+    idempotente, tentado 2 vezes (nunca o provider). Se falhar: `UNFINALIZED`, `finalization=FAILED`,
+    **causa original preservada** em `code`, Run pode seguir `running`, sem retry implícito. Run já
+    fechado por outro escritor nunca é reescrito (`ALREADY_FINAL`). `KeyboardInterrupt`/`SystemExit`
+    fecham o Run `interrupted`, revogam e propagam. Recuperação durável continua na E8.4.5.
+  - **Relatório contraditório não é fonte de nada:** nem tokens, nem `files_read`, nem eventos. Por
+    causa do gate AUD-007 (nenhum código em `app/` compara `error_summary`), a regra "`ok` não pode
+    trazer `error_summary`" foi **removida**, não contornada.
+  - O resultado devolve os fatos que a E8.4.5 consome (`developer_outcome` = `DeveloperOutcome`,
+    `integrity_violation`, `requires_finalization`); não transiciona a task, não fecha o Run de
+    controle, não roda testes, não mede diff (`files_changed` segue `NULL` no Run do Developer).
+  - **Arquitetura:** o núcleo (`orchestrator/`) não importa `agent_runtime`/`tool_executor`; a ponte é
+    um novo módulo do composition root (`_COMPOSITION_ROOT_MODULES` ganhou
+    `app.developer_invocation_wiring`); `developer_invocation.py` é o único módulo autorizado a importar
+    `execution_workspace`. 5 gates novos: não operacional, imports permitidos, sem comando/shell/nativa,
+    só o Execution Manager escreve `Run`/`SafetyEvent`, `start_execution` inalterado.
+- Testes/gates (Windows, Python 3.11): 132 testes novos (95 integração + 37 contrato) + 5 gates de
+  arquitetura. Integração com Git/SQLite/worktree/binding/admissão/preparação **reais** e dois
+  provedores: porta scriptada (cada estado inconsistente) e o provider Anthropic **real** do E8.2 sobre
+  `FakeTransport` + `LocalWorktreeToolExecutorFactory` real (leitura/escrita só na worktree, negação de
+  `.env`/`../`/`.git`, `Bash` fora da superfície sem executar, orçamento, timeout real de ~1 s, nove
+  ferramentas exatas no request). Guarda de rede: nenhum `connect` fora de loopback. **Backend
+  completo: 5087 passed, 33 skipped (plataforma/privilégio), 0 failed** — total coletado 5120;
+  contagem feita do log de progresso (nenhum `F`/`E`), porque a linha-resumo final do pytest não foi
+  gravada no log redirecionado nesta rodada (a mesma suíte direcionada que cobre os arquivos novos, a
+  arquitetura e o adapter E8.2 terminou com exit 0). `ruff check`, `ruff format --check`, `mypy`,
+  `mypy --platform linux`, `pip check`, `git diff --check` limpos. CI Linux/Windows não rodaram.
+- Mutação (cópia isolada de `api/`, hash dos fontes conferido ao fim): 43 mutantes — claim sem
+  reconferência, `ALREADY` ignorado, violação crítica/binding/contradição/executor ignorados, vínculo
+  ao aprovado e prova de capability removidos, cancelamento e prazo nas duas fronteiras, nunca revogar,
+  fechamento 1 tentativa, causa mascarada, `NOT_OPEN` como fechado, contexto/hash do artefato,
+  orçamento fora do aprovado, passos inventados, interrupção engolida, perfil do provider, executor
+  não encerrado, negações/`files_read` da ponte, categoria crítica. **43/43 mortos.** Dois sobreviveram na
+  1ª passada (M19: prazo na última fronteira nunca era alcançado — o teste expirava o prazo antes do
+  binding; M38: o provider "mal rotulado" do teste levantava e a ponte engolia) e só morreram depois
+  de testes corrigidos/acrescentados. A remoção da regra de `error_summary` veio **depois** da
+  mutação; ela não é alvo de nenhum mutante.
+- Pendências / riscos residuais: **E8.4.4** (Test Runner e verificação do diff), **E8.4.5** (reserva
+  durável, teardown comprovado, recovery, finalização agregada — um Run do Developer `running` hoje só
+  é *reconhecido*, não recuperado) e **E8.4.6** (composição, rota, worker, cancelamento persistido em
+  tempo real) continuam obrigatórias; nenhuma execução operacional existe. Revogar nega resoluções
+  **futuras**: um `ResolvedWorkspace` já entregue ao executor não é retomado (E842-AUD-002) — por isso
+  o binding é conferido ao fim. Negações de ferramenta não geram falha global; a política de agregação
+  é da E8.4.5. `ToolResult` com erro técnico não é visível ao núcleo (`MediatedUsage` não conta
+  erros). Cancelamento em tempo real depende do sinal injetado. Auditoria independente (Codex) pendente.
+
+## 2026-10-11 — Claude Sonnet 5.5 (effort: não declarado no prompt; padrão da sessão) — E8.4.3 correção de E843-AUD-001 e E843-AUD-002 — candidate
+
+Auditoria independente (Codex) da E8.4.3: BLOCKED com dois P2 comprovados. Mesma branch local
+`e8/04-3-developer-invocation` (base `origin/main` = `1efac19`); **não commitada**, sem push/PR/merge.
+Nada ligado a `main.py`/rota; Agent SDK desabilitado; nenhuma chamada a modelo, rede ou credencial;
+`docs/`, schema e migrations intocados; E8.4.4–E8.4.6 não antecipadas. O teste preexistente de
+logging da E8.2 não foi tocado.
+
+- **E843-AUD-001 — colisão adotava Run de outro componente.**
+  - Causa raiz: `invocation_id` é `UNIQUE`, mas a unicidade só diz que *existe* um Run, não *de quem*
+    ele é. `open_developer_run` (após `IntegrityError`) e `find_developer_run` (recuperação /
+    commit incerto) devolviam `ALREADY` com `id`/`status` de qualquer Run com a chave — inclusive um
+    `TEST_RUNNER` válido, e até de outra task (a consulta filtrava por task e dava "não achado").
+  - Correção: `claim_compatible` (puro) exige identidade completa — `invocation_id` igual e derivado
+    do Run de controle (`<controle>:developer`), mesma task, `agent = developer`, `purpose =
+    execution`, mesma tentativa (`attempt_index`/`fix_round`), mesma base e manifest, sem
+    `subject_run_id`/`supersedes_run_id`, mesma identidade de provider e vínculo com o Run de controle
+    conferido pelo banco. O mesmo veredito (`_existing_claim`) vale nos três caminhos. Incompatível ⇒
+    `ClaimOutcome.COLLISION` → `InvocationCode.CLAIM_COLLISION`, `REFUSED`, **sem id/status/dado do
+    Run alheio** (`ClaimResult` recusa construir colisão com id). `find_developer_run` virou
+    `find_developer_claim(spec)`. UNIQUE e atomicidade (INSERT como 1ª instrução, COMMIT antes do
+    provider) inalterados.
+- **E843-AUD-002 — contradição do provider apagava SafetyEvents.**
+  - Causa raiz: negações e metadados do provider viajavam no **mesmo** `DeveloperInvocationReport`, e
+    `report_contradictions` tratava tudo como um bloco: uma contradição de identidade descartava as
+    negações do executor e o `integrity_violation`. Além disso uma decisão sem relatório (exceção do
+    provider) nem lia a evidência.
+  - Correção — duas fontes separadas: (1) **metadados do provider** (`provider_metadata_contradictions`)
+    impedem o sucesso e tiram a confiança em tokens/resumo/diagnóstico; (2) **evidência do executor**:
+    o relatório **não tem mais campo de negação**. As negações chegam por um `EvidenceCollector` do
+    serviço, vinculado a `(run_id, task_id, invocation_id)` e alimentado só pelo `DecisionJournal` do
+    executor (composition root); o provider nunca o recebe. O coletor descarta registro de outro
+    escopo e duplicata e marca lacuna como inconsistência. Precedência: violação crítica da
+    evidência > binding revogado > metadado contraditório/evidência incoerente > `ok` com executor
+    aberto > status do provider. `escalate_for_evidence` impede que decisões sem relatório (exceção,
+    interrupção, binding recusado) escondam violação crítica já provada. O fechamento persiste sempre
+    as negações aceitas e o `files_read` do executor; só tokens/resumo/diagnóstico dependem do metadado.
+    Idempotência: eventos só são gravados na transação do `UPDATE` que casou `running` (segunda
+    tentativa ⇒ `NOT_OPEN`, 0 eventos). Mecanismo real de revogação **não alterado** (sem defeito).
+- Arquivos: `orchestrator/developer_invocation_contract.py`, `developer_invocation.py`,
+  `execution_manager.py` (`_existing_claim`, `find_developer_claim`), `developer_invocation_wiring.py`;
+  testes: `test_developer_invocation_audit_e8_4_3.py` (novo, 39), `…_contract_…` (72), `…_e8_4_3.py` (96),
+  apoio e `test_architecture.py` (gate de `threading` só como mutex do coletor; nome do comando).
+- Contraprovas antes → depois (reproduzidas em banco temporário, executor real + provider real sobre
+  transporte falso): AUD-001 `ALREADY_CLAIMED` adotando o Run do `TEST_RUNNER` → `REFUSED`/
+  `CLAIM_COLLISION`, 0 chamadas ao provider, Run preexistente byte a byte igual; AUD-002-A negação de
+  `.env` com modelo divergente: 0 → 1 `SafetyEvent`; AUD-002-B `toctou_recheck_failed` (raiz da
+  worktree trocada) com a mesma contradição: `integrity_violation=False`/sem evento →
+  `True`/evento persistido/Run `blocked`; C metadado contraditório sozinho ainda impede `ok`;
+  D texto/`files_read` forjados no resultado do provider e evidência forjada por porta hostil (outro
+  run, outra task, outra invocação, duplicata) não viram evidência.
+- Revogação: teste determinístico de rebind após revogação (`resolver.bind` ⇒ `BindingRevoked`;
+  `bind_run` ⇒ `WorkspaceUnavailable("binding_revoked")`) e o contraste com a liberação normal (não
+  revoga). Mata o mutante "revogação = só remoção física".
+- Testes/gates (Windows, Python 3.11): **suíte completa 5161 passed, 33 skipped, 0 failed,
+  `EXIT_CODE=0` capturado** (38 min; iniciada antes de 2 testes do vínculo com o controle, que
+  passaram isolados — total coletado 5196); `ruff check`, `ruff format --check`, `mypy`,
+  `mypy --platform linux`, `pip check`, `git diff --check` limpos. CI Linux/Windows não rodaram.
+  (Nota de processo: o `pyproject` já injeta `-q`; um `-q` extra faz o pytest omitir a linha-resumo.)
+- Mutação (cópia isolada de `api/`, hash conferido, "nenhum teste coletado"/sintaxe contam como
+  inválido): 49 mutantes diretamente ligados às correções (cada cláusula da compatibilidade do claim,
+  os três caminhos, o coletor — run/task/invocação/duplicata/lacuna —, a precedência, a persistência
+  de negações e `files_read`, a escalada, a ponte, a revogação) + regressões dos pontos aprovados:
+  **49/49 mortos**. Dois sobreviveram na 1ª passada e só morreram com teste novo/padrão corrigido: N14
+  (vínculo com o controle: faltava um caso em que o spec e o Run existente concordam numa tentativa que
+  não é a do controle) e N24 (padrão obsoleto do runner, não do código).
+- Riscos residuais: a autenticidade da evidência depende de o journal do executor ser entregue ao
+  coletor pelo composition root (não é sandbox: código hostil no mesmo processo alcançaria o coletor
+  por reflexão); `MediatedUsage` não conta erros técnicos de ferramenta; só `out_of_worktree_write` e
+  `toctou_recheck_failed` contam como violação crítica (escolha a confirmar); revogar nega resoluções
+  futuras (E842-AUD-002); E8.4.4/E8.4.5/E8.4.6 continuam obrigatórias. Reauditoria independente pendente.
