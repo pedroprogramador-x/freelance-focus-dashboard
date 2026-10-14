@@ -8977,3 +8977,198 @@ logging da E8.2 não foi tocado.
   por reflexão); `MediatedUsage` não conta erros técnicos de ferramenta; só `out_of_worktree_write` e
   `toctou_recheck_failed` contam como violação crítica (escolha a confirmar); revogar nega resoluções
   futuras (E842-AUD-002); E8.4.4/E8.4.5/E8.4.6 continuam obrigatórias. Reauditoria independente pendente.
+
+## 2026-10-12 — Claude Sonnet 5.5 (effort: não declarado no prompt; padrão da sessão) — E8.4.4 Tests and Results — candidate
+
+Branch `e8/04-4-tests-and-results`, criada de `origin/main` = `37a534d` (merge do PR #13) com o
+workspace limpo; a branch da E8.4.3 não foi reutilizada e o upstream foi desfeito para que nenhum
+`push` ambíguo vá à `main`. **Não commitada**, sem push/PR/merge. Nada ligado a `main.py`, startup,
+rota, fila ou worker; `start_execution` segue no `NotImplementedError`; nenhuma chamada a modelo,
+rede ou credencial (guarda de rede nos testes). `docs/`/ADRs, schema, migrations, frontend e
+`deploy.yml` intocados; E8.4.5/E8.4.6 não antecipadas (ver "Pendências").
+
+- Arquivos alterados:
+  - novos: `api/app/orchestrator/verify_and_test_contract.py` (vocabulários, dados neutros, sinal com
+    causa, decisões e eventos puros), `api/app/orchestrator/verify_and_test.py` (serviço),
+    `api/app/verify_and_test_wiring.py` (composition root: as duas portas),
+    `api/app/git_runtime/diff_stats.py` (métricas do diff); testes
+    `test_verify_and_test_e8_4_4.py`, `test_verify_and_test_audit_e8_4_4.py`,
+    `test_verify_and_test_contract_e8_4_4.py`, `test_verify_and_test_wiring_e8_4_4.py`,
+    `test_diff_stats_e8_4_4.py`, `verify_and_test_support_e8_4_4.py`, `claim_worker_e8_4_4.py`.
+  - alterados: `orchestrator/execution_manager.py` (4 `@command`: `read_verify_facts`,
+    `find_runner_claim`, `open_runner_run`, `close_runner_run`; `_existing_run_facts` extraído de
+    `_existing_claim` sem mudar comportamento), `git_runtime/post_execution.py` e
+    `execution_verification.py` (aditivos: `oid` observado em `added`/`modified`, `anchor` do
+    resultado `VERIFIED`, `PostExecutionVerifier.measure_diff`), `tests/test_architecture.py`.
+- Decisões tomadas (planejamento D1–D6 aprovado + ajustes):
+  - **Ordem:** (1) fatos e Run do Developer relidos **do banco**; (2) **claim** do Run do Test Runner
+    (`INSERT` `UNIQUE` como 1ª instrução, `COMMIT`); (3) binding do Run do Test Runner; (4)
+    verificação pós-Developer **uma vez** (o snapshot é de uso único, consumido só depois do claim);
+    (5) `VERIFIED` ⇒ métricas ⇒ cancelamento/prazo/binding ainda válidos ⇒ **uma** execução da
+    `TestPolicy`; (6) fechamento (2 tentativas, idempotente), eventos e binding liberado/revogado.
+    Verificação reprovada ⇒ processo de teste não nasce (`NOT_RUN`), `SafetyEvent` com o `run_id` do
+    Run reivindicado. `process_started` é o fato de que o processo rodou: abrir o Run não é rodar.
+  - **Integridade (D5):** `out_of_worktree_write`, `integrity_violation`, `outside_workspace_change`
+    e `path_policy_denied` ⇒ `VIOLATED`; `unverifiable` ⇒ `UNVERIFIABLE`. Eventos com os códigos já
+    existentes (`out_of_worktree_write`, `path_denied`, `toctou_recheck_failed`, `limit_exceeded`,
+    `timeout`, `cancelled`); nenhum nomeia o Developer nem afirma autoria. `UNVERIFIABLE` só gera
+    evento quando a causa é orçamento/prazo/cancelamento.
+  - **Métricas (D2/D3):** `git_runtime/diff_stats.py`, sem `git diff`/filtro/shell: base lida por
+    `MediatedGit.read_blob` (oid recalculado), worktree por leitura estável com o oid recalculado e
+    **comparado ao oid que a verificação observou** (por isso `WorktreeChange.oid`, fora da igualdade).
+    Conteúdo diferente do verificado ⇒ `CHANGED_SINCE_VERIFIED` ⇒ nenhum teste roda. Limites:
+    2 000 caminhos, 256 KiB e 5 000 linhas por lado, 8 MiB totais, 50 M de custo de comparação
+    (`difflib` não é interrompível) e o orçamento da E8.3. Binário/limite/inconsistência ⇒ **todas**
+    `NULL`. A contagem é por linhas (`difflib`, sem *autojunk*), **não idêntica** a `--numstat`.
+    Persistência no Run de controle é da E8.4.5: aqui as métricas vão no resultado.
+  - **Prazo (D4):** `AttemptSignal` (cancelamento externo + prazo monotônico da passagem) registra a
+    causa da primeira parada; prazo ⇒ `timeout`, cancelamento externo ⇒ `cancelled`; `cancelled`
+    sem causa nossa ⇒ relatório contraditório. A `TestPolicy` e os hashes ficam intactos (o runner
+    impõe o timeout dela). Árvore não confirmada (`timeout`/`supervision_failed` ≠ `True`,
+    exceção do runner) ⇒ `requires_finalization`. Sem retry.
+  - **Claim por identidade completa** (como E843-AUD-001): `runner_claim_compatible` exige chave
+    derivada do controle, task, `test_runner`/`execution`, tentativa, base, manifest, sem
+    `subject`/`supersedes`, identidade do runner, transporte `process` e vínculo com o controle;
+    senão `COLLISION` sem id/status do Run alheio. `open_runner_run` reconfere sob o lock o Run do
+    Developer (`ok`, mesma chave derivada, tentativa, base, manifest e worktree).
+  - **Binding:** liberado no fim normal (testes que rodaram, `ok` ou `exit != 0`, integridade
+    verificada, árvore não contradita); revogado em qualquer outro desfecho. Binding que não se
+    prova ao fim nunca fecha `ok`.
+  - **Arquitetura:** núcleo (`orchestrator/`) não importa `agent_runtime`/`execution_verification`/
+    `git_runtime`; `app.verify_and_test_wiring` entrou em `_COMPOSITION_ROOT_MODULES`. Gates:
+    `verify_and_test.py` junta-se a `developer_invocation.py` como importador de
+    `execution_workspace`/da invocação (usa `PreparedWorkspace` e o contrato puro); 6 gates novos.
+- **Resultado (Windows, Python 3.11, Git real; CI Linux/Windows não rodaram):**
+  - testes novos: contrato puro, diff/medição (Git real), integração (Git/SQLite/worktree/binding/
+    admissão/preparação/Developer reais; Test Runner real e roteirizado), auditoria/concorrência
+    (4 threads e 4 **processos**; cancelamento e prazo com árvore de processos real), ponte do
+    composition root e 6 gates de arquitetura (`test_architecture.py`: 90 → 96 testes);
+  - **suíte completa na árvore final: 5420 passed, 34 skipped, 0 failed, `EXIT_CODE=0` capturado**
+    (54 min; total coletado 5454). Uma rodada anterior da suíte completa teve 1 falha — um teste
+    novo meu, escrito depois da última execução, com `UPDATE` que violava
+    `ck_workspace_task_phase_iff_executing` (nunca tinha rodado); corrigido (`phase = NULL`) e a
+    suíte completa foi refeita do zero;
+  - `ruff check`, `ruff format --check`, `mypy`, `mypy --platform linux`, `pip check`,
+    `git diff --check` limpos; os testes da E8.3 (`post_execution`, `test_runner`) seguem verdes
+    com o `oid` aditivo.
+- **Mutação** (cópias isoladas de `api/`, hash dos fontes conferido igual ao do repositório ao fim,
+  "nenhum teste coletado" contaria como inválido — nenhum ocorreu): **54/54 mortos** — claim
+  (`ALREADY`/`COLLISION` ignorados, conferência do Developer sob o lock e na leitura de fatos,
+  `cancel_requested`, predicados do `UPDATE` de fechamento, eventos não gravados), ordem e fronteiras
+  (verificação reprovada/`None`, snapshot, última fronteira de cancelamento/prazo/binding, prazo
+  infinito, contexto em memória × banco, identidade do runner), decisões puras (integridade,
+  `exit_code`, mapeamento de causa, árvore não confirmada, `requires_finalization`, sinal sem
+  *latch* ou com precedência trocada), claim por identidade (cláusulas), métricas (oid verificado,
+  binário, teto de arquivo/caminhos/custo, `HEAD`, removido, contagem), ponte (divergência de
+  conteúdo e prova da árvore) e `oid`/`anchor` do E8.3. **15 sobreviveram na 1ª passada** (7 por
+  teste ausente — fronteira de prazo < 1 s, contexto divergente, binding não provado ao fim,
+  `cancel_requested` direto no claim, Developer de outra chave, teto de bytes isolado do de linhas,
+  `tree_confirmed_dead` na ponte — e 8 por padrão textual que não casava depois do refactor) e só
+  morreram na 2ª passada, já com os testes novos. Depois da mutação só mudou o `UPDATE` de um teste
+  (a falha da rodada anterior da suíte completa); nenhum fonte de `app/` mudou.
+- Pendências / riscos residuais: (1) **E8.4.5** (reserva durável, teardown comprovado, recovery,
+  persistência agregada das métricas no Run de controle, `classify_execution` e transição da task) e
+  **E8.4.6** (composição, rota, worker, cancelamento persistido em tempo real) continuam
+  obrigatórias; um Run do Test Runner `running` hoje só é *reconhecido* (`ALREADY_CLAIMED` com
+  `requires_finalization`). (2) Escrita fora da worktree **durante** os testes não é detectada (a
+  árvore principal é verificada antes deles — D1; risco R1/E14 declarado). (3) `ADDED` agora também
+  lê o arquivo para obter o oid (custo maior na verificação; mesmo orçamento). (4) TOCTOU entre a
+  verificação e o início do processo continua residual (o binding é conferido, não elimina a
+  janela). (5) **Divergência documental conhecida, sem alteração em `docs/`** — ver abaixo.
+- **Adendo mínimo proposto para `docs/` (aguardando aprovação separada):**
+  - Trecho conflitante: `docs/architecture/04-safety-and-git-runtime.md`, §8 "Protocolo do Git
+    runtime" (o `sequenceDiagram` do fluxo, linhas ≈ 756–776): `TestRunner.run → GR: diff(worktree,
+    base_commit) → … → verificação pós-execução + persistência` coloca a verificação **depois** do
+    Test Runner e prevê `UnifiedDiff + files_changed + diff_stat` por `diff`. A E8.4.4 verifica e mede
+    o diff **antes** dos testes e não gera `UnifiedDiff`.
+  - Texto sugerido (novo "Adendo autorizado — E8.4.4" logo após o diagrama de §8; §7 "Verificação pós-execução" segue valendo):
+    "No fluxo E8 de passe único, o Execution Manager (1) reivindica o Run do Test Runner, (2)
+    executa a verificação pós-execução e mede `files_changed`/`diff_added`/`diff_removed` pelo Git
+    Runtime — somente leitura, sem `git diff`, tudo ou `NULL` — e (3) só então executa a `TestPolicy`,
+    uma vez. Verificação reprovada ou incompleta impede o processo de teste. A escrita fora da
+    worktree feita pelos próprios testes não é detectada (§6). O diagrama acima é ilustrativo para a
+    ordem Developer → Test Runner; a ordem normativa é a deste adendo. `UnifiedDiff` não é produzido
+    nesta fase."
+
+## 2026-10-12 — Claude Sonnet 5.5 (effort: não declarado no prompt; padrão da sessão) — E8.4.4 correção dos seis findings da auditoria (Codex BLOCKED: 4 P1 + 2 P2) — candidate
+
+Mesma branch `e8/04-4-tests-and-results`; **não commitada**, sem push/PR. Sem schema/migrations/
+frontend; sem chamada a modelo/rede; sem execução operacional; E8.4.5/E8.4.6 não antecipadas; o adendo
+documental aprovado em `04` §8 foi preservado.
+
+- Contraprovas primeiro (`test_verify_and_test_findings_e8_4_4.py`): contra o código auditado,
+  **29 falhavam e 7 (controles) passavam**; os de latência reproduziram a auditoria (comparação de
+  2 000 linhas ignorou o cancelamento por 11,3 s e o prazo por 10,1 s).
+- **P1-001** (`diff_stats.py`): a medição virou **integridade primeiro**. Para todo caminho verificado
+  revalida-se tipo (regular/diretório/ausente), identidade e o conteúdo inteiro (oid recalculado,
+  sob o orçamento da E8.3, sem ampliar limites); divergência é `CHANGED_SINCE_VERIFIED` e vence
+  qualquer falha de mensuração; um binário/grande não aborta a revalidação dos demais, nem
+  `TOO_MANY_PATHS`. `INTEGRITY_PROVEN_FAILURES = {BINARY, TOO_LARGE, TOO_MANY_PATHS}` são as únicas
+  falhas que permitem métricas `NULL` com os testes seguindo; orçamento, cancelamento e leitura que
+  não prova **bloqueiam** (`MetricsReport.integrity_proven`/`.blocks`; `decide_measurement_unproven`;
+  o padrão de `integrity_proven` é falso). Mudança de comportamento: porta de medição que levanta
+  agora bloqueia (antes: métricas ausentes e sucesso).
+- **P1-002**: `difflib` removido. Myers (só a distância, memória O(n+m)) sobre linhas internadas, com
+  `TICK_EVERY = 2048` passos entre consultas ao orçamento e `MAX_DIFF_OPS = 5 000 000` somados no
+  diff inteiro, impostos dentro do laço — sem região sem consulta, o que dispensa isolar em
+  processo. A contagem passa a ser a edição **mínima** (antes: `SequenceMatcher`).
+- **P1-003**: `decide_after_runner` no ramo de processo terminado: binding perdido não apaga
+  `tree_confirmed_dead=False` (`requires_finalization=True`, `UNFINALIZED`, código `binding_revoked`).
+- **P1-004**: o `AttemptSignal` é criado e o prazo monotônico fixado **antes do claim**; claim,
+  binding, verificação e métricas gastam do mesmo orçamento (1 201 s no claim ⇒ `timeout`, zero
+  chamadas à verificação e ao runner).
+- **P2-005**: `ExistingRunFacts.worktree_path` (opcional, só o claim do Test Runner o compara) e
+  `runner_claim_compatible` exige a mesma worktree: `COLLISION` na abertura, no claim incerto e em
+  `find_runner_claim`. **Observação:** o claim do Developer (E8.4.3) tem a mesma lacuna e não foi
+  alterado (fora do escopo pedido).
+- **P2-006**: `runner_events` distingue pendência de prova: regra `*_unproven` e texto "encerramento
+  da árvore de processos não comprovado; recuperação pendente" quando `requires_finalization`;
+  nunca afirma encerramento e não carrega texto de exceção.
+- Arquivos: `git_runtime/diff_stats.py`, `orchestrator/verify_and_test_contract.py`,
+  `orchestrator/verify_and_test.py`, `orchestrator/execution_manager.py` (`_existing_run_facts`),
+  `orchestrator/developer_invocation_contract.py` (campo opcional), `verify_and_test_wiring.py`;
+  testes: `test_verify_and_test_findings_e8_4_4.py` (novo) e ajustes em `test_diff_stats`,
+  `test_verify_and_test`, `test_verify_and_test_contract`, apoio.
+- Validação: focada (E8.4.4, E8.3, lifecycle, 4.2/4.3, arquitetura): 1 261 passed, 1 falha de teste
+  meu (premissa de prazo da medição, corrigida); `ruff`, `format`, `mypy` (+linux), `pip check`,
+  `git diff --check` limpos. Mutação (cópias isoladas, hash dos fontes conferido): **22/24 mortos**;
+  sobrevivem N10 (remover a checagem `lstat` regular/reparse: redundante com a leitura estável
+  `_read_regular` no Windows; há teste POSIX com symlink, **skipped** aqui) e N16 (equivalente: o
+  teto de operações continua valendo com sobrepasso ≤ `TICK_EVERY`). 5 sobreviveram na 1ª passada e
+  morreram com testes novos (diretório vazio trocado por arquivo, teto cumulativo, causa preservada).
+  **Suíte completa final: 5460 passed, 35 skipped, 0 failed, `EXIT_CODE=0`** (48 min).
+- Tempos (relógio): implementação+contraprovas ≈ 14:37–15:12; testes focados 21 min; mutação 17 min
+  (2 passadas); suíte completa 48 min (sem mutação concorrente).
+- Riscos residuais: revalidação cobre os caminhos verificados, não um novo arquivo que apareça depois
+  (a janela TOCTOU entre verificação e processo segue declarada); a leitura integral para o oid é
+  paga na medição (dentro do orçamento da E8.3); CI Linux não rodou (teste do symlink); o claim do
+  Developer não compara worktree; E8.4.5/E8.4.6 obrigatórias.
+
+## 2026-10-14 — Claude Sonnet 5.5 (effort: não declarado no prompt; padrão da sessão) — E8.4.4 correção final P2-R1 e P2-R2 — candidate
+
+Mesma branch; **não commitada**, sem push/PR. Sem schema/migrations; sem modelo/rede; E8.4.5/E8.4.6 não
+antecipadas; documentação aprovada preservada.
+
+- Contraprovas (`test_verify_and_test_reaudit_e8_4_4.py`): contra o código reauditado, 12 falhavam e 3
+  (controles) passavam.
+- **P2-R1** (`diff_stats._edit_distance`): a conclusão retornava sem validar o teto. Agora todo retorno
+  bem-sucedido (inclusive a entrada vazia) valida `ops > max_ops` (limite exatamente atingido passa,
+  uma operação a mais é `TOO_LARGE`) e consulta `tick()` (cancelamento/prazo). Algoritmo, memória linear
+  e `TICK_EVERY` inalterados; o orçamento acumulado entre arquivos segue em `_measure`.
+- **P2-R2 — correção retroativa da E8.4.3 incluída na E8.4.4**: `claim_compatible` (Developer) passa a
+  exigir `existing.worktree_path == spec.worktree_path` (ausente/vazia/divergente ⇒ `COLLISION`, sem
+  adotar id/status). A worktree do spec é a do contexto preparado, já conferida contra a publicada no
+  banco (`_context_incoherence`). Vale na abertura, no claim incerto e em `find_developer_claim`
+  (mesmo `_existing_claim`). UNIQUE, atomicidade e as cláusulas da E843-AUD-001 inalteradas. Efeito em
+  testes aprovados da E8.4.3: só o dado de `test_developer_invocation_contract_e8_4_3.py`
+  (`_existing` ganhou `worktree_path`, mais 3 mutações de worktree); nenhuma asserção enfraquecida.
+- Mutação (cópias isoladas, hash conferido): 11 mutantes; **10 mortos**, incluindo o N16 original
+  (R04) e as remoções do teto/tick na conclusão e da worktree no claim. Sobrevive R07 (`>=`→`>` no
+  gatilho): o laço só adia a consulta por um passo e a validação da conclusão cobre o teto — não
+  provado equivalente em geral. **N10** (checagem regular/reparse) segue **sem equivalência
+  demonstrada**: o teste de symlink POSIX foi preservado e fica *skipped* no Windows; roda no CI
+  Linux (o teste não depende de privilégio lá).
+- Validação: 1 168 passed no conjunto focado (Myers, claims do Developer e do Test Runner, E8.3,
+  arquitetura) + 1 falha esperada no dado do teste da E8.4.3, corrigida; `ruff`, `format`, `mypy`
+  (+linux), `pip check`, `git diff --check` limpos. **Suíte completa NÃO repetida**, conforme pedido,
+  até a reauditoria.

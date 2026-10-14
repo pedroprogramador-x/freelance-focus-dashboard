@@ -1691,6 +1691,7 @@ _COMPOSITION_ROOT_MODULES = {
     "app.capability_wiring",
     "app.developer_wiring",
     "app.developer_invocation_wiring",  # E8.4.3: a porta da invocação sobre provider + executor
+    "app.verify_and_test_wiring",  # E8.4.4: as portas de verificação e do Test Runner
 }
 
 
@@ -2285,6 +2286,10 @@ _WORKSPACE_CONTRACT = APP_ROOT / "orchestrator" / "workspace_contract.py"
 _DEVELOPER_INVOCATION = APP_ROOT / "orchestrator" / "developer_invocation.py"
 _INVOCATION_CONTRACT = APP_ROOT / "orchestrator" / "developer_invocation_contract.py"
 _INVOCATION_WIRING = APP_ROOT / "developer_invocation_wiring.py"
+_VERIFY_AND_TEST = APP_ROOT / "orchestrator" / "verify_and_test.py"
+_VERIFY_CONTRACT = APP_ROOT / "orchestrator" / "verify_and_test_contract.py"
+_VERIFY_WIRING = APP_ROOT / "verify_and_test_wiring.py"
+_DIFF_STATS = APP_ROOT / "git_runtime" / "diff_stats.py"
 
 
 def test_orchestrator_recebe_path_runtime_e_verificacao_por_injecao() -> None:
@@ -2315,7 +2320,12 @@ def test_preparacao_nao_e_operacional() -> None:
     usa `PreparedWorkspace` e `ComponentBindingRefused`; ele próprio é interno (ver o teste
     seguinte)."""
     for path in ALL_FILES:
-        if path in (_EXECUTION_WORKSPACE, _WORKSPACE_CONTRACT, _DEVELOPER_INVOCATION):
+        if path in (
+            _EXECUTION_WORKSPACE,
+            _WORKSPACE_CONTRACT,
+            _DEVELOPER_INVOCATION,
+            _VERIFY_AND_TEST,  # E8.4.4: usa `PreparedWorkspace` e `ComponentBindingRefused`
+        ):
             continue
         for imported in _imports(path):
             assert not imported.startswith("app.orchestrator.execution_workspace"), (
@@ -2354,7 +2364,15 @@ def test_invocacao_do_developer_nao_e_operacional() -> None:
     """E8.4.3 é componente interno: nenhum módulo da aplicação — rota, `main.py`, startup, fila,
     worker ou outra ponte do composition root — importa o serviço, o contrato ou a ponte da
     invocação. A composição integrada é da E8.4.6; os testes são os únicos consumidores."""
-    internos = (_DEVELOPER_INVOCATION, _INVOCATION_CONTRACT, _INVOCATION_WIRING)
+    # E8.4.4: a passagem de verificação + testes é o único consumidor interno da invocação (usa o
+    # contrato PURO e a porta de binding); nada operacional a importa.
+    internos = (
+        _DEVELOPER_INVOCATION,
+        _INVOCATION_CONTRACT,
+        _INVOCATION_WIRING,
+        _VERIFY_AND_TEST,
+        _VERIFY_CONTRACT,
+    )
     for path in ALL_FILES:
         if path in internos:
             continue
@@ -2486,3 +2504,166 @@ def test_start_execution_continua_no_limite_apos_a_e8_4_3() -> None:
         "developer_invocation_wiring",
     ):
         assert nome not in texto, nome
+
+
+# ------------------------------------------------- E8.4.4: verificação do diff + testes (interno)
+
+
+def test_verificacao_e_testes_nao_sao_operacionais() -> None:
+    """E8.4.4 é componente interno: nenhum módulo da aplicação — rota, `main.py`, startup, fila,
+    worker ou outra ponte — importa o serviço, o contrato ou a ponte. A composição integrada é da
+    E8.4.6; os testes são os únicos consumidores."""
+    internos = (_VERIFY_AND_TEST, _VERIFY_CONTRACT, _VERIFY_WIRING)
+    for path in ALL_FILES:
+        if path in internos:
+            continue
+        for imported in _imports(path):
+            if (
+                path.name == "execution_manager.py"
+                and imported == "app.orchestrator.verify_and_test_contract"
+            ):
+                continue  # o lado banco consome o contrato PURO (dados e vocabulário)
+            assert not imported.startswith(
+                ("app.orchestrator.verify_and_test", "app.verify_and_test_wiring")
+            ), f"{_module_name(path)} importa verificação + testes: integração é E8.4.6"
+        texto = path.read_text(encoding="utf-8")
+        for nome in ("VerifyAndTestService", "PostExecutionVerificationPort", "TestRunnerPort"):
+            assert nome not in texto, (path.name, nome)
+    for path in (APP_ROOT / "api").rglob("*.py"):
+        assert "/execute" not in path.read_text(encoding="utf-8")
+
+
+def test_verificacao_e_testes_so_importam_o_permitido() -> None:
+    """O núcleo (`orchestrator/`) recebe tudo por injeção: nem `agent_runtime`, `tool_executor`,
+    Path/Process Runtime, `execution_verification`, Git Runtime concreto, rede ou ORM. A ponte
+    importa `agent_runtime`, `execution_verification`, o diff e o contrato — nunca banco, processo,
+    rede ou `orchestrator` além do contrato puro."""
+    nucleo_proibido = (
+        "app.agent_runtime",
+        "app.tool_executor",
+        "app.path_runtime",
+        "app.process_runtime",
+        "app.execution_verification",
+        "app.git_runtime",
+        "app.api",
+        "app.main",
+        "app.db.models",
+    )
+    proibidas_raiz = {
+        "subprocess",
+        "socket",
+        "ssl",
+        "http",
+        "urllib",
+        "httpx",
+        "requests",
+        "anthropic",
+        "asyncio",
+        "shutil",
+        "os",
+    }
+    for path in (_VERIFY_AND_TEST, _VERIFY_CONTRACT):
+        for imported in _imports(path):
+            assert not imported.startswith(nucleo_proibido), f"{path.name} importa `{imported}`"
+            raiz = imported.split(".")[0]
+            assert raiz not in proibidas_raiz or (path == _VERIFY_AND_TEST and raiz == "os"), (
+                f"{path.name} importa `{imported}`"
+            )
+    permitido_na_ponte = (
+        "app.agent_runtime",
+        "app.safety",
+        "app.execution_verification",
+        "app.git_runtime.diff_stats",
+        "app.orchestrator.verify_and_test_contract",
+    )
+    for imported in _imports(_VERIFY_WIRING):
+        raiz = imported.split(".")[0]
+        if raiz == "app":
+            assert imported.startswith(permitido_na_ponte), f"ponte importa `{imported}`"
+        assert raiz not in {"subprocess", "socket", "ssl", "http", "urllib", "httpx", "anthropic"}
+
+
+def test_verificacao_e_testes_nao_executam_comando_nem_criam_thread() -> None:
+    """Nenhum shell/`subprocess`/`os.system` nos módulos novos; `threading` só como mutex do sinal
+    (contrato); nenhum cria thread, timer ou executor: o processo é do Test Runner (E8.3)."""
+    for path in (_VERIFY_AND_TEST, _VERIFY_CONTRACT, _VERIFY_WIRING, _DIFF_STATS):
+        texto = path.read_text(encoding="utf-8")
+        for proibido in ("subprocess", "os.system", "shell=True", "ExecCommand", "Popen", "execv"):
+            assert proibido not in texto, (path.name, proibido)
+        for proibido in (
+            "Thread(",
+            "Timer(",
+            "ThreadPoolExecutor",
+            "ProcessPoolExecutor",
+            ".start()",
+        ):
+            assert proibido not in texto, (path.name, proibido)
+        assert ("threading" in _imports(path)) == (path == _VERIFY_CONTRACT), path.name
+    assert "threading.Lock()" in _VERIFY_CONTRACT.read_text(encoding="utf-8")
+
+
+def test_verificacao_e_testes_so_o_execution_manager_escreve_run_e_safety_event() -> None:
+    """O serviço, o contrato e a ponte não escrevem no banco: `Run`/`SafetyEvent` só são escritos
+    pelos comandos do Execution Manager."""
+    for path in (_VERIFY_AND_TEST, _VERIFY_CONTRACT, _VERIFY_WIRING):
+        texto = path.read_text(encoding="utf-8")
+        for escrita in ("session.add", "session.execute", "update(Run", "insert(", "record_safety"):
+            assert escrita not in texto, (path.name, escrita)
+    from app.orchestrator.execution_manager import GUARDED_COMMANDS
+
+    for comando in (
+        "open_runner_run",
+        "close_runner_run",
+        "read_verify_facts",
+        "find_runner_claim",
+    ):
+        assert comando in GUARDED_COMMANDS, comando
+
+
+def test_verificacao_e_testes_nao_ligam_o_caminho_publico() -> None:
+    """`start_execution` segue no `NotImplementedError` e o Execution Manager não referencia o
+    serviço, a ponte, o runner nem o verificador."""
+    texto = (APP_ROOT / "orchestrator" / "execution_manager.py").read_text(encoding="utf-8")
+    assert "NotImplementedError" in texto
+    for nome in (
+        "VerifyAndTestService",
+        "verify_and_test_wiring",
+        "LocalSubprocessTestRunner",
+        "PostExecutionVerifier",
+        "PostExecutionVerificationPort",
+    ):
+        assert nome not in texto, nome
+
+
+def _code_strings(path: Path) -> set[str]:
+    """Os literais de texto do **código** de um módulo, sem docstrings."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    docstrings: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.FunctionDef | ast.ClassDef | ast.AsyncFunctionDef):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                docstrings.add(id(body[0].value))
+    return {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+    }
+
+
+def test_medicao_do_diff_nao_usa_git_diff_nem_filtro_nem_shell() -> None:
+    """O contador de linhas é Python sobre blobs lidos de forma estável: nenhum `git diff`,
+    `numstat`, `textconv`, `ext-diff`, processo ou rede; só o Git Runtime e a stdlib."""
+    literais = _code_strings(_DIFF_STATS)
+    for proibido in ("diff", "status", "--numstat", "--textconv", "--ext-diff", "add", "apply"):
+        assert proibido not in literais, proibido
+    texto = _DIFF_STATS.read_text(encoding="utf-8")
+    for proibido in ("subprocess", "run_supervised", "os.system", "Popen"):
+        assert proibido not in texto, proibido
+    for imported in _imports(_DIFF_STATS):
+        raiz = imported.split(".")[0]
+        assert raiz not in {"subprocess", "socket", "http", "urllib", "httpx"}, imported
+        if raiz == "app":
+            assert imported.startswith("app.git_runtime"), imported
