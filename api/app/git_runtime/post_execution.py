@@ -639,8 +639,13 @@ class WorktreeChangeKind(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class WorktreeChange:
+    """Uma mudança. ``oid`` (E8.4.4) é o oid de blob **observado** no disco para `added`/`modified`
+    (`None` nas demais espécies): a medição do diff exige que o conteúdo medido seja este. Não
+    entra na igualdade — a identidade da mudança continua sendo `(path, kind)`."""
+
     path: str
     kind: WorktreeChangeKind
+    oid: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -817,17 +822,19 @@ def _filesystem_changes(
                 raise _Failed(VerificationFailure.UNSUPPORTED_ENTRY)  # nunca aberto
             spec = tree.get(relative)
             if spec is None:
-                changes.append(WorktreeChange(relative, WorktreeChangeKind.ADDED))
+                observed = _blob_oid(full, info, git, budget)
+                changes.append(WorktreeChange(relative, WorktreeChangeKind.ADDED, observed))
                 continue
             seen.add(relative)
             mode, oid, size = spec
             executable = bool(info.st_mode & stat.S_IXUSR)
+            observed = _blob_oid(full, info, git, budget)
             if (
                 info.st_size != size
                 or (_POSIX_MODES and executable != (mode == "100755"))
-                or _blob_oid(full, info, git, budget) != oid
+                or observed != oid
             ):
-                changes.append(WorktreeChange(relative, WorktreeChangeKind.MODIFIED))
+                changes.append(WorktreeChange(relative, WorktreeChangeKind.MODIFIED, observed))
     changes.extend(WorktreeChange(path, WorktreeChangeKind.DELETED) for path in tree.keys() - seen)
     return changes
 
@@ -928,10 +935,13 @@ def worktree_changes(
         return exhausted.failure
     except _Failed as failed:
         return failed.failure
-    unique = {(change.path, change.kind) for change in disk}
-    unique |= {(path, WorktreeChangeKind.INDEX) for path in index_paths}
+    unique = {(change.path, change.kind): change for change in disk}
+    for path in index_paths:
+        unique.setdefault(
+            (path, WorktreeChangeKind.INDEX), WorktreeChange(path, WorktreeChangeKind.INDEX)
+        )
     ordered = sorted(unique, key=lambda item: (item[0].encode("utf-8"), item[1].value))
-    return WorktreeChanges(tuple(WorktreeChange(path, kind) for path, kind in ordered))
+    return WorktreeChanges(tuple(unique[key] for key in ordered))
 
 
 __all__ = [

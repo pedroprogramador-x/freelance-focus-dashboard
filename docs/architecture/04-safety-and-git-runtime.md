@@ -773,6 +773,28 @@ sequenceDiagram
   Note over EM: usuário revisa o diff e decide.<br/>Commit, merge e push são humanos.
 ```
 
+#### Adendo autorizado — E8.4.4 (2026-10-12): ordem da passagem de verificação e testes
+
+> Adendo mínimo, autorizado por Pedro. O diagrama acima é **genérico** (inclui o Auditor, da E9, e
+> o `UnifiedDiff`) e mantém seu significado; a ordem **normativa** do fluxo E8 de passe único é a
+> abaixo. Em caso de divergência na E8, vale este adendo. Aditivo: §6 e §7 seguem valendo.
+
+Depois que o Run do Developer fecha `ok`, o Execution Manager faz **uma** passagem:
+
+1. **claim persistente** do Run do Test Runner (`invocation_id` `UNIQUE`, commit atômico) —
+   antes de consumir o snapshot da árvore principal;
+2. **verificação pós-Developer** (§7, adendo E8.3), uma única vez;
+3. **métricas Git** (`files_changed`, `diff_added`, `diff_removed`) pelo Git Runtime, somente
+   leitura, sem `git diff`, filtro ou shell, sobre o que foi verificado; todas ou `NULL`;
+4. **execução única da `TestPolicy`** aprovada, sem retry;
+5. **fechamento do Run** do Test Runner, com os `SafetyEvent`s.
+
+Verificação reprovada ou incompleta **impede** a execução dos testes (o processo não nasce).
+Nesta fase **não se produz `UnifiedDiff`**: o Git Runtime entrega só as métricas acima.
+
+**Limitação conhecida:** como a árvore principal é verificada antes dos testes, uma escrita fora
+da worktree feita pelos próprios testes não é detectada (risco residual de §6, até a E14).
+
 Convenções: worktree em `<data_dir>/worktrees/ff-task-<id8>`, branch `ff/task-<id8>`,
 criada a partir do **SHA congelado no planejamento** — nunca de um nome de branch.
 

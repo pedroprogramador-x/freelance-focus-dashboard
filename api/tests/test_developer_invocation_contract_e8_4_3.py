@@ -386,6 +386,7 @@ def _existing(**changes: Any) -> ExistingRunFacts:
         "model": IDENT.model,
         "transport": IDENT.transport,
         "control_linked": True,
+        "worktree_path": "/wt",  # E8.4.4: a worktree faz parte da identidade do claim
     }
     return ExistingRunFacts(**{**base, **changes})
 
@@ -420,6 +421,9 @@ def test_run_do_proprio_developer_e_um_claim_compativel() -> None:
         {"model": None},
         {"transport": "process"},
         {"control_linked": False},
+        {"worktree_path": "/outra"},
+        {"worktree_path": None},
+        {"worktree_path": ""},
     ],
 )
 def test_qualquer_divergencia_de_identidade_e_colisao(changes: dict[str, Any]) -> None:

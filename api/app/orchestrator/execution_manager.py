@@ -125,12 +125,14 @@ from app.orchestrator.errors import (
     WorkspaceNotPlannable,
 )
 from app.orchestrator.execution_contract import (
+    COMPONENT_DEVELOPER,
     E2E_OBJECT_FORMATS,
     SLOT_BUSY_CODE,
     SUPPORTED_TEST_RUNNER_IDS,
     AdmissionGuard,
     AdmissionOutcome,
     ExecutionAdmission,
+    component_invocation_id,
     unavailable_agents,
     validate_invocation_id,
     workflow_policy_supported,
@@ -159,6 +161,12 @@ from app.orchestrator.state_machine import (
     check_needs_fix_guard,
     require_transition,
     transition_fields,
+)
+from app.orchestrator.verify_and_test_contract import (
+    RunnerClosure,
+    RunnerRunSpec,
+    VerifyFacts,
+    runner_claim_compatible,
 )
 from app.orchestrator.workspace_contract import PreparationCode, PreparationFacts
 from app.safety import redact
@@ -2173,14 +2181,10 @@ def read_invocation_facts(
     )
 
 
-def _existing_claim(session: Session, task_id: str, spec: DeveloperRunSpec) -> ClaimResult | None:
-    """O Run que já tem este `invocation_id`, classificado: ``ALREADY`` só se for o claim **deste**
-    Developer (identidade completa compatível, `claim_compatible`); qualquer outra coisa é
-    ``COLLISION``, que não carrega o id nem o status do Run alheio. `None` = não existe Run."""
-    row = session.scalar(select(Run).where(Run.invocation_id == spec.invocation_id))
-    if row is None:
-        return None
-    control = session.get(Run, spec.control_run_id)
+def _existing_run_facts(session: Session, row: Run, control_run_id: str) -> ExistingRunFacts:
+    """A identidade do Run que já tem um `invocation_id`, em valores, e o vínculo dele com o Run
+    de controle conferido pelo banco (mesma task, mesma tentativa, `orchestrator`/`execution`)."""
+    control = session.get(Run, control_run_id)
     linked = (
         control is not None
         and control.task_id == row.task_id
@@ -2189,7 +2193,7 @@ def _existing_claim(session: Session, task_id: str, spec: DeveloperRunSpec) -> C
         and control.attempt_index == row.attempt_index
         and control.fix_round == row.fix_round
     )
-    facts = ExistingRunFacts(
+    return ExistingRunFacts(
         invocation_id=row.invocation_id,
         task_id=row.task_id,
         agent=row.agent.value,
@@ -2206,7 +2210,18 @@ def _existing_claim(session: Session, task_id: str, spec: DeveloperRunSpec) -> C
         model=row.model,
         transport=row.transport.value,
         control_linked=linked,
+        worktree_path=row.worktree_path,
     )
+
+
+def _existing_claim(session: Session, task_id: str, spec: DeveloperRunSpec) -> ClaimResult | None:
+    """O Run que já tem este `invocation_id`, classificado: ``ALREADY`` só se for o claim **deste**
+    Developer (identidade completa compatível, `claim_compatible`); qualquer outra coisa é
+    ``COLLISION``, que não carrega o id nem o status do Run alheio. `None` = não existe Run."""
+    row = session.scalar(select(Run).where(Run.invocation_id == spec.invocation_id))
+    if row is None:
+        return None
+    facts = _existing_run_facts(session, row, spec.control_run_id)
     if claim_compatible(facts, spec, task_id):
         return ClaimResult(ClaimOutcome.ALREADY, row.id, row.status)
     return ClaimResult(ClaimOutcome.COLLISION)
@@ -2439,6 +2454,323 @@ def record_developer_invocation_refusal(
     except BaseException:
         session.rollback()
         raise
+
+
+# ------------------------------------------------------------- verificação e testes (E8.4.4)
+
+
+def _developer_run_incoherence(
+    run: Run | None,
+    *,
+    task_id: str,
+    control_run_id: str,
+    attempt_index: int | None,
+    fix_round: int | None,
+    base_commit: str | None,
+    manifest_id: str | None,
+    worktree_path: str | None,
+) -> bool:
+    """O Run do Developer **no banco** é o desta tentativa, fechado `ok`, e só dela? (`True` =
+    incoerente). Identidade, status e vínculo vêm do banco — nunca do DTO que o chamador trouxe."""
+    return (
+        run is None
+        or run.task_id != task_id
+        or run.agent is not RunAgent.DEVELOPER
+        or run.purpose is not RunPurpose.EXECUTION
+        or run.invocation_id != component_invocation_id(control_run_id, COMPONENT_DEVELOPER)
+        or run.subject_run_id is not None
+        or run.supersedes_run_id is not None
+        or run.status is not RunStatus.OK
+        or run.finished_at is None
+        or run.attempt_index != attempt_index
+        or run.fix_round != fix_round
+        or run.base_commit != base_commit
+        or run.context_manifest_id != manifest_id
+        or run.worktree_path != worktree_path
+    )
+
+
+@command
+def read_verify_facts(
+    session: Session,
+    task_id: str,
+    *,
+    control_run_id: str,
+    developer_run_id: str,
+    developer_binding_resolver: DeveloperBindingResolver | None,
+) -> VerifyFacts:
+    """Relê a admissão e o Run do Developer para a verificação + testes (E8.4.4). Só leitura.
+
+    Reaproveita `read_preparation_facts` (task `executing`, Run de controle aberto na tentativa
+    corrente, sem cancelamento, plano/manifest/bases coerentes, fingerprint recalculado igual ao
+    aprovado) e acrescenta: o Run do Developer conferido **no banco** (identidade, `ok`, mesma
+    tentativa/base/manifest/worktree) e a `TestPolicy` aprovada, de um runner suportado. Devolve
+    a primeira incoerência em ``code`` — nunca levanta por estado.
+    """
+    base = read_preparation_facts(
+        session,
+        task_id,
+        control_run_id=control_run_id,
+        developer_binding_resolver=developer_binding_resolver,
+    )
+    if base.code is not None:
+        return VerifyFacts(
+            code=base.code,
+            task_id=task_id,
+            control_run_id=control_run_id,
+            workspace_id=base.workspace_id,
+        )
+
+    def refuse(code: PreparationCode) -> VerifyFacts:
+        return VerifyFacts(
+            code=code,
+            task_id=task_id,
+            control_run_id=control_run_id,
+            workspace_id=base.workspace_id,
+        )
+
+    task = session.get(WorkspaceTask, task_id)
+    manifest = None if task is None else latest_manifest(session, task)
+    if task is None or manifest is None:
+        return refuse(PreparationCode.PLAN_INCOHERENT)
+    developer = session.get(Run, developer_run_id)
+    if _developer_run_incoherence(
+        developer,
+        task_id=task_id,
+        control_run_id=control_run_id,
+        attempt_index=base.attempt_index,
+        fix_round=base.fix_round,
+        base_commit=base.base_commit,
+        manifest_id=manifest.id,
+        worktree_path=base.control_worktree_path,
+    ):
+        return refuse(PreparationCode.RUN_MISMATCH)
+    workspace = session.get(DevWorkspace, task.workspace_id)
+    try:
+        policy = None if workspace is None else read_test_policy(workspace)
+    except OrchestratorError:
+        return refuse(PreparationCode.FINGERPRINT_DIVERGED)
+    if policy is None or policy.runner_id not in SUPPORTED_TEST_RUNNER_IDS:
+        return refuse(PreparationCode.TEST_POLICY_MISSING)
+    return VerifyFacts(
+        code=None,
+        task_id=task.id,
+        control_run_id=control_run_id,
+        workspace_id=base.workspace_id,
+        base_commit=base.base_commit,
+        task_version=base.task_version,
+        control_worktree_path=base.control_worktree_path,
+        run_started_at=base.run_started_at,
+        attempt_index=base.attempt_index,
+        fix_round=base.fix_round,
+        run_timeout_s=base.run_timeout_s,
+        task_timeout_s=base.task_timeout_s,
+        context_manifest_id=manifest.id,
+        developer_run_id=developer_run_id,
+        test_policy=policy,
+    )
+
+
+def _existing_runner_claim(
+    session: Session, task_id: str, spec: RunnerRunSpec
+) -> ClaimResult | None:
+    """O Run que já tem este `invocation_id`, classificado: ``ALREADY`` só se for o claim **deste**
+    Test Runner (`runner_claim_compatible`); qualquer outra coisa é ``COLLISION`` sem id nem status
+    do Run alheio. `None` = não existe Run."""
+    row = session.scalar(select(Run).where(Run.invocation_id == spec.invocation_id))
+    if row is None:
+        return None
+    facts = _existing_run_facts(session, row, spec.control_run_id)
+    if runner_claim_compatible(facts, spec, task_id):
+        return ClaimResult(ClaimOutcome.ALREADY, row.id, row.status)
+    return ClaimResult(ClaimOutcome.COLLISION)
+
+
+@command
+def find_runner_claim(session: Session, task_id: str, *, spec: RunnerRunSpec) -> ClaimResult | None:
+    """Consulta de recuperação (claim de resultado incerto): o mesmo veredito de compatibilidade da
+    reivindicação. Nunca devolve id/status de um Run que não seja o claim deste Test Runner."""
+    return _existing_runner_claim(session, task_id, spec)
+
+
+@command
+def open_runner_run(session: Session, task_id: str, *, spec: RunnerRunSpec) -> ClaimResult:
+    """**Reivindica** a passagem: cria o Run do Test Runner `running`, atomicamente.
+
+    O `INSERT` é a **primeira** instrução da transação (`UNIQUE(invocation_id)`): dois
+    reivindicantes — threads ou processos — nunca vencem os dois. Só depois, sob o lock de escrita,
+    o estado é reconferido (task `executing` na versão publicada, Run de controle aberto na mesma
+    tentativa/base, sem cancelamento, worktree publicada igual **e o Run do Developer fechado `ok`
+    desta tentativa**): qualquer divergência desfaz o `INSERT`. O `COMMIT` acontece **antes** da
+    verificação (que consome o snapshot) e do processo de teste. Chave existente → ``ALREADY`` só
+    para o claim compatível; outra coisa é ``COLLISION``.
+    """
+    if spec.started_at is None:
+        raise ValueError("`started_at` é obrigatório")
+    try:
+        run = Run(
+            invocation_id=spec.invocation_id,
+            task_id=task_id,
+            context_manifest_id=spec.context_manifest_id,
+            agent=RunAgent.TEST_RUNNER,
+            purpose=RunPurpose.EXECUTION,
+            attempt_index=spec.attempt_index,
+            fix_round=spec.fix_round,
+            provider=spec.identity.provider,
+            provider_adapter=spec.identity.runner_id,
+            adapter_version=spec.identity.version,
+            model=None,
+            transport=RunTransport(spec.identity.transport),
+            tool_profile_hash=None,
+            status=RunStatus.RUNNING,
+            started_at=spec.started_at,
+            token_source=TokenSource.UNAVAILABLE,
+            files_read=None,
+            files_read_source=FilesReadSource.UNAVAILABLE,
+            files_changed=None,
+            diff_added=None,
+            diff_removed=None,
+            worktree_path=spec.worktree_path,
+            base_commit=spec.base_commit,
+        )
+        session.add(run)
+        try:
+            session.flush()
+        except IntegrityError:
+            session.rollback()
+            existing = _existing_runner_claim(session, task_id, spec)
+            if existing is None:
+                raise
+            return existing
+        run_id = run.id
+
+        control = session.get(Run, spec.control_run_id)
+        task = session.get(WorkspaceTask, task_id)
+        developer = session.get(Run, spec.developer_run_id)
+        code: PreparationCode | None = None
+        if (
+            control is None
+            or control.task_id != task_id
+            or control.agent is not RunAgent.ORCHESTRATOR
+            or control.purpose is not RunPurpose.EXECUTION
+        ):
+            code = PreparationCode.RUN_MISMATCH
+        elif task is None:
+            code = PreparationCode.TASK_MISSING
+        elif task.status is not TaskStatus.EXECUTING:
+            code = PreparationCode.TASK_NOT_EXECUTING
+        elif control.status is not RunStatus.RUNNING:
+            code = PreparationCode.RUN_NOT_OPEN
+        elif task.cancel_requested:
+            code = PreparationCode.CANCEL_REQUESTED
+        elif task.version != spec.expected_task_version:
+            code = PreparationCode.TASK_VERSION_CHANGED
+        elif (
+            control.attempt_index != spec.attempt_index
+            or control.fix_round != spec.fix_round
+            or task.attempts - 1 != control.attempt_index
+            or task.fix_rounds != control.fix_round
+        ):
+            code = PreparationCode.ATTEMPT_MISMATCH
+        elif (
+            control.base_commit != spec.base_commit or task.planning_base_commit != spec.base_commit
+        ):
+            code = PreparationCode.BASE_COMMIT_INCOHERENT
+        elif (
+            control.worktree_path != spec.worktree_path or task.worktree_path != spec.worktree_path
+        ):
+            code = PreparationCode.FINAL_CHECK_FAILED
+        elif (
+            developer is None
+            or developer.id != spec.developer_run_id
+            or _developer_run_incoherence(
+                developer,
+                task_id=task_id,
+                control_run_id=spec.control_run_id,
+                attempt_index=spec.attempt_index,
+                fix_round=spec.fix_round,
+                base_commit=spec.base_commit,
+                manifest_id=spec.context_manifest_id,
+                worktree_path=spec.worktree_path,
+            )
+        ):
+            code = PreparationCode.RUN_MISMATCH
+        if code is not None:
+            session.rollback()
+            return ClaimResult(ClaimOutcome.REFUSED, code=code)
+        session.commit()
+    except BaseException:
+        session.rollback()
+        raise
+    return ClaimResult(ClaimOutcome.CLAIMED, run_id)
+
+
+@command
+def close_runner_run(
+    session: Session, task_id: str, *, run_id: str, closure: RunnerClosure
+) -> CloseResult:
+    """Fecha o Run do Test Runner **uma vez**, com os `SafetyEvent`s da verificação, numa transação.
+
+    O `UPDATE` condicionado a `running` é a primeira instrução; um Run já final nunca é reescrito
+    (`NOT_OPEN` + o status do banco, sem escrever nada). Os eventos levam o `run_id` do Run
+    **reivindicado**. `summary`/`error_summary`/eventos passam pelo redator no ponto de escrita.
+    O `test_summary` nunca carrega saída de processo (`output_ref = None`).
+    """
+    try:
+        summary = closure.test_summary
+        if summary is not None:
+            summary = {
+                **summary,
+                "framework": redact(str(summary["framework"])),
+                "output_ref": None,
+            }
+        updated = cast(
+            "CursorResult[Any]",
+            session.execute(
+                update(Run)
+                .where(
+                    Run.id == run_id,
+                    Run.task_id == task_id,
+                    Run.agent == RunAgent.TEST_RUNNER,
+                    Run.purpose == RunPurpose.EXECUTION,
+                    Run.status == RunStatus.RUNNING,
+                )
+                .values(
+                    status=closure.status,
+                    finished_at=closure.finished_at,
+                    duration_ms=closure.duration_ms,
+                    test_summary=summary,
+                    summary=redact(closure.summary) if closure.summary else None,
+                    error_summary=redact(closure.error_summary) if closure.error_summary else None,
+                )
+            ),
+        )
+        if updated.rowcount != 1:
+            session.rollback()
+            current = session.scalar(
+                select(Run.status).where(Run.id == run_id, Run.task_id == task_id)
+            )
+            return CloseResult(CloseOutcome.NOT_OPEN, current)
+        workspace_id = session.scalar(
+            select(WorkspaceTask.workspace_id).where(WorkspaceTask.id == task_id)
+        )
+        for event in closure.events:
+            record_safety_event(
+                session,
+                kind=event.kind,
+                decision=SafetyDecisionKind.DENY,
+                rule_id=event.rule_id,
+                subject=event.subject,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                run_id=run_id,
+                detail=event.detail,
+            )
+        session.commit()
+    except BaseException:
+        session.rollback()
+        raise
+    return CloseResult(CloseOutcome.CLOSED, closure.status, len(closure.events))
 
 
 # --------------------------------------------------------------------------- recuperação

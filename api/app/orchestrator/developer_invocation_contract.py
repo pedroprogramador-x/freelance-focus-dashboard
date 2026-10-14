@@ -497,6 +497,9 @@ class ExistingRunFacts:
     transport: str
     #: O Run de controle da invocação existe, é da mesma task e da mesma tentativa.
     control_linked: bool
+    #: A worktree registrada no Run: faz parte da identidade completa dos claims do Developer e do
+    #: Test Runner (`None` nunca é compatível).
+    worktree_path: str | None = None
 
 
 def claim_compatible(existing: ExistingRunFacts, spec: DeveloperRunSpec, task_id: str) -> bool:
@@ -504,9 +507,11 @@ def claim_compatible(existing: ExistingRunFacts, spec: DeveloperRunSpec, task_id
 
     Todas as condições, sem exceção: `invocation_id` igual e derivado do Run de controle
     (`<controle>:developer`); mesma task; `agent = developer`; `purpose = execution`; mesma
-    tentativa (`attempt_index`/`fix_round`); mesma base e mesmo manifest; sem `subject_run_id`
-    nem `supersedes_run_id` (não é Run de auditoria); mesma identidade de provider; e o vínculo com
-    o Run de controle conferido pelo banco. Qualquer divergência é colisão.
+    tentativa (`attempt_index`/`fix_round`); mesma base, mesmo manifest e **mesma worktree**
+    (a publicada e aprovada, nunca ausente nem divergente — correção retroativa da E8.4.3 feita na
+    E8.4.4); sem `subject_run_id` nem `supersedes_run_id` (não é Run de auditoria); mesma
+    identidade de provider; e o vínculo com o Run de controle conferido pelo banco. Qualquer
+    divergência é colisão.
     """
     try:
         derived = component_invocation_id(spec.control_run_id, COMPONENT_DEVELOPER)
@@ -528,6 +533,7 @@ def claim_compatible(existing: ExistingRunFacts, spec: DeveloperRunSpec, task_id
         and existing.adapter_version == spec.identity.adapter_version
         and existing.model == spec.identity.model
         and existing.transport == spec.identity.transport
+        and existing.worktree_path == spec.worktree_path
         and existing.control_linked
     )
 

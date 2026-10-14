@@ -58,7 +58,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from app.git_runtime import (
@@ -69,7 +69,8 @@ from app.git_runtime import (
     main_tree_state,
     worktree_changes,
 )
-from app.git_runtime.post_execution import BudgetExhausted
+from app.git_runtime.diff_stats import DiffMeasureFailure, DiffMetrics, measure_worktree_diff
+from app.git_runtime.post_execution import BudgetExhausted, WorktreeChange
 from app.path_runtime import PathIntegrityViolation, PathOperationFailed, bind_root, inspect
 from app.safety import decide_path, prevalidate_mediated_path
 from app.safety.paths import PathIntent
@@ -124,6 +125,9 @@ class ChangedPath:
 
     path: str
     kind: WorktreeChangeKind
+    #: O oid de blob que a verificação observou no disco (`added`/`modified`). Não entra na
+    #: igualdade; é o que a medição do diff (E8.4.4) exige que o conteúdo medido seja.
+    oid: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +157,9 @@ class PostExecutionResult:
     changes: tuple[ChangedPath, ...] = ()
     findings: tuple[PathFinding, ...] = ()
     failure: VerificationFailure | None = None
+    #: `(raiz, .git comum)` da árvore principal verificada — só em `VERIFIED`; é o que a medição do
+    #: diff precisa para reconfirmar que a worktree é a vinculada. Opaco e fora da igualdade.
+    anchor: tuple[str, str] | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, PostExecutionStatus):
@@ -336,7 +343,9 @@ class PostExecutionVerifier:
             )
             return _blocked(verdict, observed.value, observed)
 
-        changes = tuple(ChangedPath(change.path, change.kind) for change in observed.changes)
+        changes = tuple(
+            ChangedPath(change.path, change.kind, change.oid) for change in observed.changes
+        )
         try:
             findings = tuple(
                 finding
@@ -357,10 +366,53 @@ class PostExecutionVerifier:
                 return PostExecutionResult(
                     status=verdict, reason=reason, changes=changes, findings=findings
                 )
-        return _verified(changes, budget)
+        return _verified(changes, budget, (state_before.toplevel, state_before.git_common_dir))
+
+    def measure_diff(
+        self,
+        result: PostExecutionResult,
+        *,
+        workspace_path: str,
+        workspace_prefix: str,
+        base_commit: str,
+        is_cancelled: Callable[[], bool],
+    ) -> DiffMetrics | DiffMeasureFailure:
+        """As métricas do diff **que esta verificação acabou de comprovar** (E8.4.4).
+
+        Só aceita um resultado `VERIFIED` produzido por `verify`; mede exatamente as mudanças e os
+        oids dele (conteúdo diferente do verificado é `CHANGED_SINCE_VERIFIED`) sob um orçamento
+        próprio. Só leitura; nunca lança por IO.
+        """
+        if (
+            not isinstance(result, PostExecutionResult)
+            or result.status is not PostExecutionStatus.VERIFIED
+            or result.anchor is None
+        ):
+            raise ValueError("só um resultado VERIFIED de `verify` pode ser medido")
+        for name, value in (
+            ("workspace_path", workspace_path),
+            ("workspace_prefix", workspace_prefix),
+            ("base_commit", base_commit),
+        ):
+            if not isinstance(value, str) or "\x00" in value:
+                raise TypeError(f"{name} precisa ser str sem NUL")
+        budget = self._budget(_require_cancel(is_cancelled))
+        return measure_worktree_diff(
+            workspace_path,
+            base_commit=base_commit,
+            expected_prefix=workspace_prefix,
+            main_toplevel=result.anchor[0],
+            main_git_common_dir=result.anchor[1],
+            changes=tuple(WorktreeChange(c.path, c.kind, c.oid) for c in result.changes),
+            budget=budget,
+        )
 
 
-def _verified(changes: tuple[ChangedPath, ...], budget: VerificationBudget) -> PostExecutionResult:
+def _verified(
+    changes: tuple[ChangedPath, ...],
+    budget: VerificationBudget,
+    anchor: tuple[str, str] | None = None,
+) -> PostExecutionResult:
     """O **único** construtor de `VERIFIED` (E8.3-FINAL-001).
 
     Revalida o orçamento imediatamente antes de liberar: um prazo que expirou ou um
@@ -374,7 +426,9 @@ def _verified(changes: tuple[ChangedPath, ...], budget: VerificationBudget) -> P
         return _blocked(
             PostExecutionStatus.UNVERIFIABLE, exhausted.failure.value, exhausted.failure
         )
-    return PostExecutionResult(status=PostExecutionStatus.VERIFIED, reason=None, changes=changes)
+    return PostExecutionResult(
+        status=PostExecutionStatus.VERIFIED, reason=None, changes=changes, anchor=anchor
+    )
 
 
 def _check_change(
