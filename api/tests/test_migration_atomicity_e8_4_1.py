@@ -191,7 +191,7 @@ def banco_em_head(tmp_path: Path) -> Iterator[tuple[str, Path, dict[str, str]]]:
     url = _url(path)
     run_migrations(url, HEAD_BEFORE)
     ids = _seed_legacy(path)
-    run_migrations(url)
+    run_migrations(url, HEAD)
     yield url, path, ids
 
 

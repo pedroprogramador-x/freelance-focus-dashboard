@@ -36,11 +36,13 @@ import time
 from collections.abc import Callable
 
 from app.process_runtime.contracts import ProcessSpec, StartFailed, describe_os_error
+from app.process_runtime.launch import StartHooks
 
 # O resto do módulo só existe fora do Windows; o mypy também o trata assim no Windows.
 assert sys.platform != "win32"
 
 _GROUP_POLL_S = 0.005
+_ABORT_CONFIRM_S = 10.0
 
 
 class ProcessTree:
@@ -108,8 +110,44 @@ class ProcessTree:
         """Nada a liberar além dos pipes, que são do supervisor."""
 
 
-def start(spec: ProcessSpec) -> ProcessTree:
-    """Cria o processo em sessão própria, ou levanta `StartFailed` sem deixar nada vivo."""
+def _start_token(pid: int) -> str:
+    """Ticks de início do `/proc/<pid>/stat` (campo 22), quando existe; senão `"unavailable"`.
+
+    Serve só de identidade complementar ao PID. No POSIX **nenhuma** sonda posterior libera um
+    lançamento (`killpg`/`ESRCH` prova apenas a ausência do grupo consultado, não a de
+    descendentes que escaparam), então a ausência do token nunca vira prova."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            raw = handle.read().decode("ascii", "replace")
+        fields = raw.rsplit(")", 1)[1].split()
+        return fields[19] if len(fields) > 19 and fields[19].isdigit() else "unavailable"
+    except OSError:
+        return "unavailable"
+
+
+def _abort(tree: ProcessTree, grace_s: float) -> bool:
+    """Desfaz um início cujo registro falhou. Devolve se o grupo foi confirmado vazio."""
+    popen = tree.popen
+    dead = False
+    try:
+        tree.kill(grace_s)
+        dead = tree.confirm_dead(_ABORT_CONFIRM_S)
+    except Exception:
+        dead = False
+    for stream in (popen.stdout, popen.stderr):
+        if stream is not None:
+            with contextlib.suppress(OSError):
+                stream.close()
+    return dead
+
+
+def start(spec: ProcessSpec, hooks: StartHooks | None = None) -> ProcessTree:
+    """Cria o processo em sessão própria, ou levanta `StartFailed` sem deixar nada vivo.
+
+    Com `hooks` (E8.4.5 / I2): `Popen → hooks.created → hooks.contained`. No POSIX o `setsid`
+    acontece antes do `exec`, então a contenção (grupo próprio) já existe quando o raiz nasce.
+    Falha de um hook mata o grupo e confirma, mas **só** `tree_confirmed_dead` fala sobre o grupo:
+    descendentes que fizerem `setsid` escapam (limite declarado da E7.3)."""
     try:
         popen = subprocess.Popen(  # noqa: S603 — argv estruturado, sem shell, executável absoluto
             list(spec.argv),
@@ -127,7 +165,18 @@ def start(spec: ProcessSpec) -> ProcessTree:
         # `subprocess`: nada sobrevive.
         detail = f"processo não pôde ser criado: {describe_os_error(exc)}"
         raise StartFailed(detail, tree_confirmed_dead=True) from exc
-    return ProcessTree(popen)
+    tree = ProcessTree(popen)
+    if hooks is not None:
+        try:
+            hooks.created(popen.pid, lambda: _start_token(popen.pid))
+            hooks.contained()
+        except BaseException as exc:
+            dead = _abort(tree, spec.kill_grace_s)
+            if isinstance(exc, Exception):
+                detail = f"falha ao registrar o lançamento: {describe_os_error(exc)}"
+                raise StartFailed(detail, tree_confirmed_dead=dead) from exc
+            raise
+    return tree
 
 
 def readable_waiter(fd: int) -> Callable[[float], bool]:

@@ -16,6 +16,9 @@ mecanismos externos à árvore. Ver [04] §0 e §6.
 
 API pública: `ProcessSpec`, `ProcessOutcome`, `ProcessResult`, `InvalidProcessSpec`,
 `run_supervised`.
+
+E8.4.5 / I2 (aditivo): `launch.py` traz o `LaunchObserver`, o `LaunchGate` e o escopo ambiente de
+um lançamento protegido. Sem escopo instalado nada muda em relação à E7.3.
 """
 
 from app.process_runtime.contracts import (

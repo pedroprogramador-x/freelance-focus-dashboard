@@ -507,6 +507,174 @@ class SafetyEvent(Base):
     __table_args__ = (sa.CheckConstraint("length(trim(rule_id)) > 0", name="rule_id_not_blank"),)
 
 
+# --------------------------------------------------------------------------- E8.4.5 / I3
+#
+# Infraestrutura de execução — **não** são entidades do domínio de [02] (por isso fora de
+# `ALL_MODELS`). Criadas pela migration `0004_execution_reservation`, que é a fonte do schema e dos
+# *triggers*; as constraints de linha única repetem as da migration para o `models.py` não
+# divergir (`tests/test_execution_reservation_schema_e8_4_5.py` confere nomes e texto). Os
+# vocabulários são literais: este módulo não importa `app.orchestrator`. O banco só enxerga
+# **linhas**; a verdade do que foi observado no SO, a posse do lock e a atualidade do histórico são
+# externas.
+
+
+class ExecutionReservation(Base):
+    """A reserva durável global (`slot_key = 1` + índice parcial `state <> 'released'`).
+
+    **Sem FK** para task, workspace e Run: a reserva liberada sobrevive à purga, como
+    `SafetyEvent`. Cada tentativa é identificada por `control_run_id`.
+    """
+
+    __tablename__ = "execution_reservation"
+
+    id: Mapped[str] = mapped_column(sa.String(36), primary_key=True, default=new_uuid)
+    slot_key: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=1)
+    task_id: Mapped[str] = mapped_column(sa.String(36), nullable=False, index=True)
+    workspace_id: Mapped[str] = mapped_column(sa.String(36), nullable=False, index=True)
+    control_run_id: Mapped[str] = mapped_column(sa.String(36), nullable=False, unique=True)
+    #: Só o nome (`ff-task-<id8>`): nunca um caminho absoluto.
+    worktree_ref: Mapped[str] = mapped_column(sa.String(128), nullable=False)
+    state: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    version: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=1)
+    owner_token: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    adopted_by_token: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    logical_key: Mapped[str] = mapped_column(sa.String(128), nullable=False)
+    physical_key: Mapped[str] = mapped_column(sa.String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+    developer_declared_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    drain_requested_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    draining_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    ever_unproven: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, default=False)
+    first_unproven_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    ack_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    ack_reason: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
+    released_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    released_by_token: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    #: Selo de auditoria: **não** é prova.
+    release_evidence_hash: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+
+    __table_args__ = (
+        sa.CheckConstraint("slot_key = 1", name="slot_key"),
+        sa.CheckConstraint(
+            "state IN ('active', 'draining', 'teardown_pending', 'unproven', 'released')",
+            name="state_vocabulary",
+        ),
+        sa.CheckConstraint("version >= 1", name="version_positive"),
+        sa.CheckConstraint("ever_unproven IN (0, 1)", name="ever_unproven_boolean"),
+        sa.CheckConstraint(
+            "adopted_by_token IS NULL OR adopted_by_token <> owner_token",
+            name="adopter_is_not_owner",
+        ),
+        sa.CheckConstraint("state <> 'unproven' OR ever_unproven = 1", name="unproven_sticky"),
+        sa.CheckConstraint(
+            "(ever_unproven = 1) = (first_unproven_at IS NOT NULL)",
+            name="first_unproven_iff_ever",
+        ),
+        sa.CheckConstraint("(ack_at IS NULL) = (ack_reason IS NULL)", name="ack_pair"),
+        sa.CheckConstraint(
+            "ever_unproven = 0 OR state <> 'released' "
+            "OR (ack_at IS NOT NULL AND ack_at >= first_unproven_at)",
+            name="ack_history",
+        ),
+        sa.CheckConstraint(
+            "adopted_by_token IS NULL OR state IN ('teardown_pending', 'unproven', 'released')",
+            name="adoption_state",
+        ),
+        sa.Index(
+            "uq_execution_reservation_unreleased",
+            "slot_key",
+            unique=True,
+            sqlite_where=sa.text("state <> 'released'"),
+        ),
+    )
+
+
+class ExecutionLaunch(Base):
+    """O ledger de lançamentos de processo (uma linha por `Popen` pretendido)."""
+
+    __tablename__ = "execution_launch"
+
+    id: Mapped[int] = mapped_column(sa.Integer, primary_key=True, autoincrement=True)
+    reservation_id: Mapped[str] = mapped_column(
+        sa.String(36),
+        sa.ForeignKey("execution_reservation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    phase_tag: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    #: Só o nome do binário: nunca `argv`, `cwd` nem ambiente.
+    exe_name: Mapped[str] = mapped_column(sa.String(255), nullable=False)
+    platform: Mapped[str] = mapped_column(sa.String(8), nullable=False)
+    containment_profile: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    phase: Mapped[str] = mapped_column(sa.String(18), nullable=False)
+    version: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=1)
+    pid: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    start_token: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    end_basis: Mapped[str | None] = mapped_column(sa.String(24), nullable=True)
+    ended_by_token: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+
+    __table_args__ = (
+        sa.CheckConstraint("version >= 1", name="version_positive"),
+        sa.CheckConstraint(
+            "(pid IS NULL) = (start_token IS NULL) AND (pid IS NULL OR pid >= 1)",
+            name="pid_with_token",
+        ),
+        sa.CheckConstraint(
+            "(phase IN ('ended_confirmed', 'ended_unconfirmed')) = (ended_by_token IS NOT NULL)",
+            name="terminal_has_writer",
+        ),
+        {"sqlite_autoincrement": True},
+    )
+
+
+class ExecutionEvidence(Base):
+    """Evidência **append-only**; `seq` é a ordem total de gravação."""
+
+    __tablename__ = "execution_evidence"
+
+    seq: Mapped[int] = mapped_column(sa.Integer, primary_key=True, autoincrement=True)
+    reservation_id: Mapped[str] = mapped_column(
+        sa.String(36),
+        sa.ForeignKey("execution_reservation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    launch_id: Mapped[int | None] = mapped_column(
+        sa.Integer,
+        sa.ForeignKey("execution_launch.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    launch_version: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    scope: Mapped[str] = mapped_column(sa.String(10), nullable=False)
+    subject: Mapped[str | None] = mapped_column(sa.String(12), nullable=True)
+    basis: Mapped[str] = mapped_column(sa.String(40), nullable=False)
+    writer_token: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    logical_key: Mapped[str | None] = mapped_column(sa.String(128), nullable=True)
+    physical_key: Mapped[str | None] = mapped_column(sa.String(128), nullable=True)
+    lock_files_match: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, default=False)
+    profile_ok: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, default=False)
+    owner_quiescence_ok: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, default=False)
+    root_probe_absent: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, default=False)
+    boot_changed: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, default=False)
+    #: A árvore foi **confirmada** morta (ou nunca existiu) pelo supervisor.
+    supervision_confirmed: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, default=False)
+    observed_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+
+    __table_args__ = (
+        sa.CheckConstraint("scope IN ('launch', 'in_process', 'binding')", name="scope_vocabulary"),
+        sa.CheckConstraint(
+            "(scope = 'binding') = (subject IS NOT NULL)", name="subject_iff_binding"
+        ),
+        sa.CheckConstraint(
+            "basis <> 'launch_start_failed_proven' OR supervision_confirmed = 1",
+            name="start_failed_needs_supervision",
+        ),
+        {"sqlite_autoincrement": True},
+    )
+
+
 #: Ordem de criação. `workspace_task` referencia `context_manifest`, que referencia
 #: `workspace_task` de volta — um ciclo. O SQLite não valida a existência da tabela pai
 #: no `CREATE TABLE`, então a referência adiante é legal; a ordem abaixo é a que a
@@ -530,3 +698,6 @@ ALL_MODELS = (
     AuditFinding,
     SafetyEvent,
 )
+
+#: Infraestrutura de execução (E8.4.5 / I3): fora das sete entidades de [02].
+EXECUTION_MODELS = (ExecutionReservation, ExecutionLaunch, ExecutionEvidence)

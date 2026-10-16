@@ -183,7 +183,7 @@ def _banco(tmp_path: Path, versao: str) -> tuple[str, Path]:
     run_migrations(url, HEAD_BEFORE)
     _seed_legacy(path)
     if versao == HEAD:
-        run_migrations(url)
+        run_migrations(url, HEAD)
     return url, path
 
 

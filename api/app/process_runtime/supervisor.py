@@ -44,6 +44,18 @@ from app.process_runtime.contracts import (
     StartFailed,
     describe_os_error,
 )
+from app.process_runtime.launch import (
+    PROFILE_POSIX_PGRP_V1,
+    PROFILE_WIN_JOB_V1,
+    REFUSAL_DETAIL_PREFIX,
+    LaunchIntent,
+    LaunchPlatform,
+    LaunchRefusal,
+    LaunchScope,
+    ProtectedLaunch,
+    current_scope,
+    exe_name_of,
+)
 
 if sys.platform == "win32":
     from app.process_runtime import _windows as _backend
@@ -170,16 +182,36 @@ def _no_process(outcome: ProcessOutcome, detail: str | None) -> ProcessResult:
     )
 
 
-def run_supervised(spec: ProcessSpec, is_cancelled: Callable[[], bool]) -> ProcessResult:
+def _refused(refusal: LaunchRefusal) -> ProcessResult:
+    """Lançamento protegido recusado **antes** de qualquer processo (E8.4.5 / I2)."""
+    outcome = (
+        ProcessOutcome.CANCELLED
+        if refusal is LaunchRefusal.STOPPED
+        else ProcessOutcome.SUPERVISION_FAILED
+    )
+    return _no_process(outcome, f"{REFUSAL_DETAIL_PREFIX}{refusal.value}")
+
+
+def run_supervised(
+    spec: ProcessSpec, is_cancelled: Callable[[], bool], *, protected: bool = False
+) -> ProcessResult:
     """Executa `spec` sob supervisão e devolve o resultado. Bloqueia até a árvore morrer.
 
     Só levanta para uso incorreto (`TypeError`); toda falha operacional vira
     `ProcessOutcome.SUPERVISION_FAILED`, com a árvore encerrada.
+
+    **Lançamento protegido (E8.4.5 / I2).** Sem `LaunchScope` instalado, o comportamento é o da
+    E7.3, byte a byte. Com um escopo instalado, **todo** lançamento do processo é protegido
+    (`launch.py`): intent antes do `Popen`, gate, `created`/`contained` do observer, recusa fechada.
+    `protected=True` declara que a chamada pertence a uma tentativa protegida: sem escopo, ela é
+    recusada (`launch_refused:scope_missing`) em vez de cair silenciosamente no `Popen` legado.
     """
     if not isinstance(spec, ProcessSpec):
         raise TypeError("spec precisa ser ProcessSpec")
     if not callable(is_cancelled):
         raise TypeError("is_cancelled precisa ser callable")
+    if type(protected) is not bool:
+        raise TypeError("protected precisa ser bool")
     try:
         if _ask(is_cancelled):
             return _no_process(ProcessOutcome.CANCELLED, None)
@@ -189,24 +221,104 @@ def run_supervised(spec: ProcessSpec, is_cancelled: Callable[[], bool]) -> Proce
             f"is_cancelled falhou antes do início: {describe_os_error(exc)}",
         )
 
+    scope = current_scope()
+    if scope is not None:
+        return _run_protected(scope, spec, is_cancelled)
+    if protected:
+        return _refused(LaunchRefusal.SCOPE_MISSING)
+
     started = time.monotonic()
     try:
         tree = _backend.start(spec)
     except StartFailed as exc:
-        return ProcessResult(
-            outcome=ProcessOutcome.SUPERVISION_FAILED,
-            exit_code=None,
-            stdout=b"",
-            stderr=b"",
-            stdout_truncated=False,
-            stderr_truncated=False,
-            output_complete=True,
-            duration_ms=int((time.monotonic() - started) * 1000),
-            tree_confirmed_dead=exc.tree_confirmed_dead,
-            orphans_killed=False,
-            detail=exc.detail,
-        )
+        return _start_failed_result(exc, started)
     return _supervise(tree, spec, is_cancelled, started)
+
+
+def _start_failed_result(
+    exc: StartFailed, started: float, *, extra: str | None = None
+) -> ProcessResult:
+    detail = exc.detail if extra is None else f"{exc.detail}; {extra}"
+    return ProcessResult(
+        outcome=ProcessOutcome.SUPERVISION_FAILED,
+        exit_code=None,
+        stdout=b"",
+        stderr=b"",
+        stdout_truncated=False,
+        stderr_truncated=False,
+        output_complete=True,
+        duration_ms=int((time.monotonic() - started) * 1000),
+        tree_confirmed_dead=exc.tree_confirmed_dead,
+        orphans_killed=False,
+        detail=detail,
+    )
+
+
+_LEDGER_END_FAILED = "launch_ledger_end_failed"
+
+
+def _ledger_end_failed(result: ProcessResult) -> ProcessResult:
+    """O processo terminou, mas a linha do ledger ficou aberta: nunca pode parecer sucesso."""
+    observed = (
+        result.outcome.value
+        if result.exit_code is None
+        else (f"{result.outcome.value}({result.exit_code})")
+    )
+    detail = f"{_LEDGER_END_FAILED}; desfecho observado: {observed}"
+    if result.detail:
+        detail = f"{result.detail}; {detail}"
+    return ProcessResult(
+        outcome=ProcessOutcome.SUPERVISION_FAILED,
+        exit_code=None,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        stdout_truncated=result.stdout_truncated,
+        stderr_truncated=result.stderr_truncated,
+        output_complete=result.output_complete,
+        duration_ms=result.duration_ms,
+        tree_confirmed_dead=result.tree_confirmed_dead,
+        orphans_killed=result.orphans_killed,
+        detail=detail,
+    )
+
+
+def _run_protected(
+    scope: LaunchScope, spec: ProcessSpec, is_cancelled: Callable[[], bool]
+) -> ProcessResult:
+    windows = sys.platform == "win32"
+    intent = LaunchIntent(
+        exe_name_of(spec.argv[0]),
+        LaunchPlatform.WIN32 if windows else LaunchPlatform.POSIX,
+        PROFILE_WIN_JOB_V1 if windows else PROFILE_POSIX_PGRP_V1,
+    )
+    launch = ProtectedLaunch(scope, intent)
+    refusal = launch.admit()
+    if refusal is not None:
+        return _refused(refusal)
+
+    started = time.monotonic()
+    failure: StartFailed | None = None
+    tree: _backend.ProcessTree | None = None
+    try:
+        try:
+            tree = _backend.start(spec, launch.hooks)
+        except StartFailed as exc:
+            failure = exc
+    finally:
+        launch.release_gate()  # a seção protegida acaba no resume; o gate não vive com o processo
+
+    if failure is not None:
+        end = launch.end_for_start_failure(failure.tree_confirmed_dead)
+        recorded = launch.record_end(end)
+        return _start_failed_result(
+            failure, started, extra=None if recorded else _LEDGER_END_FAILED
+        )
+
+    assert tree is not None
+    result = _supervise(tree, spec, is_cancelled, started)
+    if not launch.record_end(launch.end_for_result(result.tree_confirmed_dead)):
+        return _ledger_end_failed(result)
+    return result
 
 
 def _supervise(

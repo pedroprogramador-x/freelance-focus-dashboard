@@ -29,6 +29,8 @@ EXPECTED_TABLES = {
     "safety_event",
 }
 
+EXECUTION_TABLES = {"execution_reservation", "execution_launch", "execution_evidence"}
+
 #: Mapeia coluna → enum Python, para conferir que o `CHECK` do banco aceita exatamente os
 #: mesmos valores. A migration guarda os valores como literais (é registro histórico);
 #: este teste é o que impede os dois lados de divergirem em silêncio.
@@ -79,12 +81,16 @@ def _in_clause_value_sets(sql: str) -> list[frozenset[str]]:
     return sets
 
 
-def test_migration_cria_exatamente_as_sete_tabelas(engine: Engine) -> None:
+def test_migration_cria_as_sete_entidades_mais_a_infraestrutura_de_execucao(
+    engine: Engine,
+) -> None:
     tables = set(inspect(engine).get_table_names())
 
     assert tables >= EXPECTED_TABLES
     domain_tables = tables - {"alembic_version"}
-    assert domain_tables == EXPECTED_TABLES, "tabela a mais ou a menos no schema"
+    # E8.4.5 / I3: a reserva durável, o ledger e a evidência são infraestrutura de execução,
+    # não entidades de [02] — as sete continuam sendo sete.
+    assert domain_tables == EXPECTED_TABLES | EXECUTION_TABLES, "tabela a mais ou a menos"
     assert len(ALL_MODELS) == 7
 
 

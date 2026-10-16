@@ -24,6 +24,7 @@ from app.config import AppSettings
 from app.db.models import DevWorkspace
 from app.db.session import create_engine, create_session_factory
 from app.main import create_app
+from app.process_runtime.launch import _reset_scope_for_tests
 from tests import context_helpers
 
 API_ROOT = Path(__file__).resolve().parents[1]
@@ -206,3 +207,11 @@ def workspace(session: Session, repo_path: Path) -> DevWorkspace:
 @pytest.fixture
 def workspace_sem_git(session: Session, plain_path: Path) -> DevWorkspace:
     return context_helpers.make_workspace(session, plain_path, name="ws-sem-git")
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_launch_scope() -> Iterator[None]:
+    """E8.4.5 / I2: o escopo ambiente de lançamento nunca vaza de um teste para o seguinte."""
+    yield
+    leaked = _reset_scope_for_tests()
+    assert leaked is None, "LaunchScope vazado: o teste não removeu o escopo instalado"

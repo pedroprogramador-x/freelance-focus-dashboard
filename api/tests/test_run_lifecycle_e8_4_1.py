@@ -380,6 +380,8 @@ def test_schema_migrado_tem_os_indices_e_triggers_da_e8_4_1(engine: Engine) -> N
 # ============================================================ migration com dados anteriores
 
 HEAD_BEFORE = "0002_workspace_test_config"
+#: Estes testes são da migration 0003: ficam fixados nela, não no head (que avança).
+REV_0003 = "0003_execution_admission"
 
 
 def _legacy_db(tmp_path: Path) -> tuple[str, Path]:
@@ -459,7 +461,7 @@ def test_upgrade_preserva_runs_finalizados_e_dependentes(tmp_path: Path) -> None
     url, path = _legacy_db(tmp_path)
     ids = _seed_legacy(path)
 
-    run_migrations(url)
+    run_migrations(url, REV_0003)
 
     connection = sqlite3.connect(path)
     try:
@@ -501,7 +503,7 @@ def test_upgrade_preserva_runs_finalizados_e_dependentes(tmp_path: Path) -> None
 def test_runs_antigos_continuam_imutaveis_e_o_schema_novo_aceita_running(tmp_path: Path) -> None:
     url, path = _legacy_db(tmp_path)
     ids = _seed_legacy(path)
-    run_migrations(url)
+    run_migrations(url, REV_0003)
 
     connection = sqlite3.connect(path)
     try:
@@ -532,7 +534,7 @@ def test_upgrade_falha_fechado_com_run_sem_finished_at_e_nao_altera_o_banco(
     _seed_legacy(path, extra_runs=("ok",))
 
     with pytest.raises(RuntimeError, match="sem `finished_at`"):
-        run_migrations(url)
+        run_migrations(url, REV_0003)
 
     assert _versao(path) == HEAD_BEFORE
     connection = sqlite3.connect(path)
@@ -569,7 +571,7 @@ def test_upgrade_falha_fechado_com_mais_de_uma_task_executing(tmp_path: Path) ->
         connection.close()
 
     with pytest.raises(RuntimeError, match="executing"):
-        run_migrations(url)
+        run_migrations(url, REV_0003)
 
     assert _versao(path) == HEAD_BEFORE
 
@@ -577,7 +579,7 @@ def test_upgrade_falha_fechado_com_mais_de_uma_task_executing(tmp_path: Path) ->
 def test_downgrade_preserva_dados_medidos_e_restaura_o_schema_anterior(tmp_path: Path) -> None:
     url, path = _legacy_db(tmp_path)
     ids = _seed_legacy(path)
-    run_migrations(url)
+    run_migrations(url, REV_0003)
 
     downgrade_migrations(url, HEAD_BEFORE)
 
@@ -606,7 +608,7 @@ def test_downgrade_recusa_perder_a_distincao_entre_medido_e_nao_medido(
 ) -> None:
     url, path = _legacy_db(tmp_path)
     ids = _seed_legacy(path)
-    run_migrations(url)
+    run_migrations(url, REV_0003)
     connection = sqlite3.connect(path)
     try:
         if motivo == "running":

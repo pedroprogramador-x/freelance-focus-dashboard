@@ -59,6 +59,7 @@ from ctypes import wintypes
 from typing import Any
 
 from app.process_runtime.contracts import ProcessSpec, StartFailed, describe_os_error
+from app.process_runtime.launch import StartHooks
 
 # O resto do módulo só existe no Windows; o mypy também o trata assim em outras plataformas.
 assert sys.platform == "win32"
@@ -261,6 +262,15 @@ _QueryFullProcessImageNameW = _bind(
     wintypes.DWORD,
     wintypes.LPWSTR,
     wintypes.PDWORD,
+)
+_GetProcessTimes = _bind(
+    "GetProcessTimes",
+    wintypes.BOOL,
+    wintypes.HANDLE,
+    ctypes.POINTER(wintypes.FILETIME),
+    ctypes.POINTER(wintypes.FILETIME),
+    ctypes.POINTER(wintypes.FILETIME),
+    ctypes.POINTER(wintypes.FILETIME),
 )
 _GetSystemDirectoryW = _bind("GetSystemDirectoryW", wintypes.UINT, wintypes.LPWSTR, wintypes.UINT)
 _PeekNamedPipe = _bind(
@@ -485,6 +495,35 @@ def _assign(popen: subprocess.Popen[bytes], job: int) -> None:
             raise StartFailed(_win_error("IsProcessInJob"), tree_confirmed_dead=False)
         if not in_job.value:
             raise StartFailed("processo não confirmado dentro do Job", tree_confirmed_dead=False)
+    finally:
+        _CloseHandle(process)
+
+
+def _creation_token(pid: int) -> str:
+    """Token de início do processo (E8.4.5 / I2): o FILETIME de criação, em decimal.
+
+    Com o PID, identifica **aquele** processo (um PID reutilizado tem outro FILETIME). Chamado
+    com o processo ainda suspenso, então o PID não pode ter sido reaproveitado. Falha de API sobe
+    como `OSError`: sem identidade o registro de `created` não acontece e o processo é abortado.
+    """
+    process = _OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not process:
+        raise OSError(_win_error("OpenProcess"))
+    try:
+        created = wintypes.FILETIME()
+        ignored = [wintypes.FILETIME() for _ in range(3)]
+        if not _GetProcessTimes(
+            process,
+            ctypes.byref(created),
+            ctypes.byref(ignored[0]),
+            ctypes.byref(ignored[1]),
+            ctypes.byref(ignored[2]),
+        ):
+            raise OSError(_win_error("GetProcessTimes"))
+        value = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+        if value <= 0:
+            raise OSError("GetProcessTimes devolveu um FILETIME inválido")
+        return str(value)
     finally:
         _CloseHandle(process)
 
@@ -719,8 +758,14 @@ def _abort(popen: subprocess.Popen[bytes] | None, job: int) -> bool:
     return dead
 
 
-def start(spec: ProcessSpec) -> ProcessTree:
-    """Cria o processo **já contido** no Job, ou levanta `StartFailed` sem deixar nada vivo."""
+def start(spec: ProcessSpec, hooks: StartHooks | None = None) -> ProcessTree:
+    """Cria o processo **já contido** no Job, ou levanta `StartFailed` sem deixar nada vivo.
+
+    Com `hooks` (lançamento protegido, E8.4.5 / I2) a ordem é `Popen(CREATE_SUSPENDED) →
+    hooks.created → AssignProcessToJobObject + IsProcessInJob → hooks.contained → resume`. O
+    `resume` **nunca** acontece sem `contained`; uma falha em qualquer ponto aborta o processo
+    ainda suspenso (nenhuma instrução dele chegou a rodar).
+    """
     job = _create_job()
     popen: subprocess.Popen[bytes] | None = None
     try:
@@ -739,7 +784,12 @@ def start(spec: ProcessSpec) -> ProcessTree:
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             detail = f"processo não pôde ser criado: {describe_os_error(exc)}"
             raise StartFailed(detail, tree_confirmed_dead=True) from exc
+        if hooks is not None:
+            pid = popen.pid
+            hooks.created(pid, lambda: _creation_token(pid))
         _assign(popen, job)
+        if hooks is not None:
+            hooks.contained()
         _resume(popen.pid)
     except BaseException as exc:
         dead = _abort(popen, job)

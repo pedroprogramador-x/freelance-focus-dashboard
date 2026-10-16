@@ -1996,6 +1996,7 @@ _WIN32_DOCUMENTADAS = {
     "Process32FirstW",
     "Process32NextW",
     "QueryFullProcessImageNameW",
+    "GetProcessTimes",
     "GetSystemDirectoryW",
     "PeekNamedPipe",
 }
