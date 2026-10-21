@@ -162,6 +162,10 @@ class AdmissionGuard(str, Enum):
     TEST_POLICY_SUPPORTED = "test_policy_supported"
     COMPOSITION_AVAILABLE = "composition_available"
     OBJECT_FORMAT_SUPPORTED = "object_format_supported"
+    #: E8.4.5 / I4 — sem uma identidade de reserva autorizada (InstanceLock, lease) injetada pelo
+    #: composition root não existe admissão. Em produção nada a fornece ainda: a admissão
+    #: permanece bloqueada.
+    RESERVATION_IDENTITY_AVAILABLE = "reservation_identity_available"
 
 
 def unavailable_agents(agents: Sequence[str]) -> tuple[str, ...]:

@@ -40,7 +40,7 @@ from app.db.enums import (
     TokenSource,
     WorkspaceStatus,
 )
-from app.db.models import DevWorkspace, Run, SafetyEvent, WorkspaceTask
+from app.db.models import DevWorkspace, ExecutionReservation, Run, SafetyEvent, WorkspaceTask
 from app.db.session import session_scope
 from app.orchestrator import (
     ApprovalFingerprintMismatch,
@@ -75,6 +75,7 @@ from tests.admission_support_e8_4_1 import (
 )
 from tests.capability_helpers import ScriptedVerifier, declaration, expected_binding
 from tests.conftest import API_ROOT
+from tests.reservation_support_e8_4_5 import release_for_test
 
 APP_ROOT = Path(__file__).resolve().parents[1] / "app"
 KEY = "exec-key-1"
@@ -446,6 +447,7 @@ def test_task_fora_de_approved_nao_tem_aresta_para_executing(
 def test_segunda_tentativa_depois_de_needs_fix_usa_chave_nova_e_run_novo(
     session: Session,
     session_factory: sessionmaker[Session],
+    temp_settings: AppSettings,
     approved: WorkspaceTask,
     artifacts_dir: Path,
 ) -> None:
@@ -488,6 +490,15 @@ def test_segunda_tentativa_depois_de_needs_fix_usa_chave_nova_e_run_novo(
     assert repetida.outcome is AdmissionOutcome.REPLAYED
     assert repetida.run is not None and repetida.run.id == primeira.run.id
     assert _task(session_factory, approved.id).attempts == 1
+
+    # E8.4.5 / I4: a "finalização" simulada acima NÃO libera o slot — a reserva da primeira
+    # tentativa continua não liberada e ocupa o slot, inclusive para a própria task. A segunda
+    # tentativa só nasce depois da liberação (aqui, pelos triggers do I3; o release de produção
+    # é do I5).
+    ocupada = admit(session, approved.id, artifacts_dir, key="exec-key-2")
+    assert ocupada.outcome is AdmissionOutcome.SLOT_BUSY and ocupada.run is None
+    assert _task(session_factory, approved.id).attempts == 1
+    release_for_test(Path(temp_settings.sqlalchemy_url.split("///", 1)[1]), approved.id)
 
     segunda = admit(session, approved.id, artifacts_dir, key="exec-key-2")
 
@@ -1095,10 +1106,16 @@ def test_slot_ocupado_devolve_slot_busy_estruturado_e_nao_consome_nada(
 def test_slot_busy_e_repetivel_e_a_task_continua_admissivel_quando_o_slot_libera(
     session: Session,
     session_factory: sessionmaker[Session],
+    temp_settings: AppSettings,
     workspace: DevWorkspace,
     approved: WorkspaceTask,
     artifacts_dir: Path,
 ) -> None:
+    """E8.4.5 / I4 — o que mudou: o slot NÃO volta com o `cancel`. Cancelar leva a task a
+    `cancelled` (sai de `executing`), mas a reserva durável segue não liberada e é ela que ocupa o
+    slot: cancelamento não é prova de encerramento. O cenário legítimo — a segunda task é admitida
+    quando o slot volta — passa a depender de a reserva ser **liberada** (aqui, pelos triggers do
+    I3, via SQL cru de teste; o `release_reservation` de produção é do I5)."""
     segunda = approved_task(session, workspace, artifacts_dir, title="segunda")
     admit(session, approved.id, artifacts_dir, key=KEY)
 
@@ -1108,8 +1125,16 @@ def test_slot_busy_e_repetivel_e_a_task_continua_admissivel_quando_o_slot_libera
         )
     _refused(session_factory, segunda.id)
 
-    cancel(session, approved.id)  # sai de `executing`: a admissão volta a ser possível
+    cancel(session, approved.id)  # sai de `executing`, mas a reserva continua ocupando o slot
     session.commit()
+
+    for _ in range(2):
+        ainda_ocupada = admit(session, segunda.id, artifacts_dir, key="k2")
+        assert ainda_ocupada.outcome is AdmissionOutcome.SLOT_BUSY
+        assert ainda_ocupada.code == "slot_busy" and ainda_ocupada.run is None
+    _refused(session_factory, segunda.id)  # nada consumido, nenhum Run
+
+    release_for_test(Path(temp_settings.sqlalchemy_url.split("///", 1)[1]), approved.id)
 
     admitida = admit(session, segunda.id, artifacts_dir, key="k2")
     assert admitida.outcome is AdmissionOutcome.ADMITTED
@@ -1526,25 +1551,56 @@ def test_falha_no_commit_da_admissao_desfaz_tudo(
     artifacts_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def falha_no_commit(*_args: Any, **_kwargs: Any) -> None:
-        raise RuntimeError("disco cheio")
+    """A falha é ligada ao commit da TRANSAÇÃO DE ADMISSÃO (`_claim_execution`), não a uma contagem
+    de commits: o helper `admit` e as fases de leitura também commitam, e uma contagem fixa caía
+    antes do claim (P2 da auditoria do I4). Aqui o commit só falha DENTRO do claim, e o teste
+    prova (a) que o claim foi alcançado, (b) que a falha disparou nele e (c) que, nesse instante, o
+    CAS, o Run de controle e a reserva já estavam escritos na transação — então o rollback
+    desfeito abaixo é o da escrita real."""
+    original_commit = Session.commit
+    original_claim = em._claim_execution
+    estado: dict[str, Any] = {"claim": 0, "disparos": 0, "visto": None}
 
-    # o claim é o último `commit` da admissão; as leituras anteriores já commitaram
-    original = Session.commit
-    estado = {"chamadas": 0}
+    def claim_observado(*args: Any, **kwargs: Any) -> Any:
+        estado["claim"] += 1
+        estado["dentro"] = True
+        try:
+            return original_claim(*args, **kwargs)
+        finally:
+            estado["dentro"] = False
 
     def commit_que_falha_no_claim(self: Session) -> None:
-        estado["chamadas"] += 1
-        if estado["chamadas"] == 3:  # fim da leitura estática, fim da leitura de fingerprint, claim
-            falha_no_commit()
-        original(self)
+        if estado.get("dentro"):
+            estado["disparos"] += 1
+            # o que a transação já tem escrito quando o commit falha
+            estado["visto"] = (
+                self.scalar(select(func.count()).select_from(Run)),
+                self.scalar(select(func.count()).select_from(ExecutionReservation)),
+                self.scalar(select(WorkspaceTask.attempts).where(WorkspaceTask.id == approved.id)),
+                self.scalar(select(WorkspaceTask.status).where(WorkspaceTask.id == approved.id)),
+            )
+            raise RuntimeError("disco cheio")
+        original_commit(self)
 
+    monkeypatch.setattr(em, "_claim_execution", claim_observado)
     monkeypatch.setattr(Session, "commit", commit_que_falha_no_claim)
-    with pytest.raises(RuntimeError, match="disco cheio"):
-        admit(session, approved.id, artifacts_dir, key=KEY)
-    monkeypatch.undo()
+    try:
+        with pytest.raises(RuntimeError, match="disco cheio"):
+            admit(session, approved.id, artifacts_dir, key=KEY)
+    finally:
+        monkeypatch.undo()
 
+    # proteção: o teste NÃO passa se o claim nunca roda ou se a falha nunca dispara nele
+    assert estado["claim"] == 1, "a admissão não alcançou _claim_execution"
+    assert estado["disparos"] == 1, "a falha de commit não foi disparada dentro do claim"
+    assert estado["visto"] == (1, 1, 1, TaskStatus.EXECUTING), estado["visto"]
+
+    # rollback atômico: task, attempts, Run de controle e reserva voltam ao estado inicial
     _refused(session_factory, approved.id)
+    with session_factory() as fresh:
+        assert fresh.scalar(select(func.count()).select_from(ExecutionReservation)) == 0
+    # e a task continua admissível depois que a causa some
+    assert admit(session, approved.id, artifacts_dir, key=KEY).outcome is AdmissionOutcome.ADMITTED
 
 
 # ======================================================== separação de Runs e fronteira

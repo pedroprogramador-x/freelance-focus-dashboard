@@ -97,6 +97,7 @@ from app.workspace.policy import resolve_effective_policy
 from tests import context_helpers
 from tests.admission_support_e8_4_1 import RESOLVER, VALID_TEST_CONFIG, admit, approved_task
 from tests.conftest import API_ROOT
+from tests.reservation_support_e8_4_5 import release_for_test
 
 _GIT = shutil.which("git")
 
@@ -316,7 +317,12 @@ class Harness:
         return self.settings.resolved_worktrees_dir.resolve() / f"ff-task-{task_id[:8]}"
 
     def next_attempt(self, task_id: str, previous_run_id: str, key: str) -> ExecutionAdmission:
-        """Simula o fim de uma tentativa (o finalizador é da E8.4.5) e admite a seguinte."""
+        """Simula o fim de uma tentativa (o finalizador é da E8.4.5) e admite a seguinte.
+
+        E8.4.5 / I4: a "finalização" simulada não basta — a reserva da tentativa anterior segue
+        não liberada e ocupa o slot. A liberação é feita pelos triggers do I3 (`release_for_test`,
+        SQL cru de teste; o release de produção é do I5), só depois de o Run de controle fechar.
+        """
         with self.factory() as fresh:
             fresh.execute(
                 update(Run)
@@ -329,6 +335,7 @@ class Harness:
                 .values(status=TaskStatus.APPROVED, phase=None, version=WorkspaceTask.version + 1)
             )
             fresh.commit()
+        release_for_test(Path(self.settings.sqlalchemy_url.split("///", 1)[1]), task_id)
         self.session.expire_all()
         admission = self.admit(task_id, key=key)
         assert admission.outcome is AdmissionOutcome.ADMITTED

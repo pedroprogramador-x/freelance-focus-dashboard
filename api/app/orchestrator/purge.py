@@ -25,6 +25,7 @@ construção em vez de improvável por sorte.
 from __future__ import annotations
 
 from sqlalchemy import Select, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.enums import FindingPurpose, RunPurpose, TaskStatus
@@ -35,6 +36,10 @@ from app.orchestrator.errors import (
     TaskPurgeBlocked,
 )
 from app.orchestrator.execution_manager import command, get_task
+from app.orchestrator.reservation_ledger import (
+    is_reservation_purge_conflict,
+    unreleased_reservation_of,
+)
 from app.workspace.purge import PurgeCounts
 from app.workspace.purge_tokens import PurgeTokenStore, task_subject
 
@@ -142,6 +147,11 @@ def execute_purge(
             "purgadas ([02] §11 regra 1)"
         )
 
+    # E8.4.5 / I4 — a reserva durável é independente do estado terminal da task: `cancelled`,
+    # `failed` ou `done` com a reserva ainda não liberada NÃO é purgável (o encerramento dos
+    # recursos não foi comprovado). Camada 1 de 3: o serviço, com erro de domínio claro.
+    _refuse_unreleased_reservation(session, task)
+
     counts = _count_purgeable(session, task)
 
     if counts.benchmark_protected:
@@ -150,11 +160,35 @@ def execute_purge(
             "recusada ([02] §11 regra 6)"
         )
 
+    # Camada 2: revalidação imediatamente antes da escrita destrutiva (depois das contagens e da
+    # proteção de benchmark, na mesma transação). Reserva `released` não bloqueia, e a linha dela
+    # sobrevive à purga (sem FK): é histórico.
+    _refuse_unreleased_reservation(session, task)
+
     # FK `ON DELETE CASCADE` remove manifests, runs e findings. `safety_event` não tem FK e
     # sobrevive (regra 4). O repositório do usuário não é tocado (regra 7).
     session.delete(task)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        # Camada 3: o *trigger* da 0004 é o árbitro final de uma corrida entre a revalidação e o
+        # DELETE. SÓ o conflito de reserva reconhecido vira erro de domínio; o resto sobe como é.
+        if not is_reservation_purge_conflict(exc):
+            raise
+        session.rollback()
+        raise TaskPurgeBlocked(
+            "a task tem reserva de execução não liberada; o encerramento dos recursos não foi "
+            "comprovado e a purga foi recusada pelo banco"
+        ) from exc
     return counts
+
+
+def _refuse_unreleased_reservation(session: Session, task: WorkspaceTask) -> None:
+    if unreleased_reservation_of(session, task_id=task.id) is not None:
+        raise TaskPurgeBlocked(
+            "a task tem reserva de execução não liberada (o encerramento dos recursos não foi "
+            "comprovado); purga recusada, independente do estado terminal da task"
+        )
 
 
 __all__ = ["execute_purge", "purge_preview"]

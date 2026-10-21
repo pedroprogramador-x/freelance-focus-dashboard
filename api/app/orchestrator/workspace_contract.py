@@ -64,6 +64,12 @@ class PreparationCode(str, Enum):
     ATTEMPT_MISMATCH = "attempt_mismatch"
     TASK_VERSION_CHANGED = "task_version_changed"
     CANCEL_REQUESTED = "cancel_requested"
+    #: E8.4.5 / I4 — a reserva durável da tentativa não autoriza mais efeitos. São fatos do banco,
+    #: lidos na fronteira transacional do claim; nenhum deles é prova de encerramento.
+    RESERVATION_MISSING = "reservation_missing"
+    RESERVATION_NOT_ACTIVE = "reservation_not_active"
+    DRAIN_REQUESTED = "drain_requested"
+    DEVELOPER_NOT_DECLARED = "developer_not_declared"
     DEADLINE_EXCEEDED = "deadline_exceeded"
     WORKSPACE_INACTIVE = "workspace_inactive"
     PLAN_INCOHERENT = "plan_incoherent"

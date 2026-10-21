@@ -39,6 +39,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from sqlalchemy import Select, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.enums import FindingPurpose, RunPurpose, TaskStatus, WorkspaceStatus
@@ -46,6 +47,7 @@ from app.db.models import (
     AuditFinding,
     ContextManifest,
     DevWorkspace,
+    ExecutionReservation,
     Run,
     WorkspaceTask,
 )
@@ -195,6 +197,10 @@ def execute_purge(
     if _has_non_terminal_task(session, workspace_id):
         raise WorkspacePurgeBlocked("workspace tem task não-terminal; purga recusada")
 
+    # E8.4.5 / I4 — a reserva durável é independente do estado das tasks: um workspace arquivado
+    # só com tasks terminais ainda não é purgável enquanto existir reserva NÃO liberada dele.
+    _refuse_unreleased_reservation(session, workspace_id)
+
     counts = _count_purgeable(session, workspace_id)
 
     if counts.benchmark_protected:
@@ -203,13 +209,46 @@ def execute_purge(
             "workspace pertence a um grupo de benchmark com avaliação registrada; purga recusada"
         )
 
+    # Revalidação imediatamente antes da escrita destrutiva; o *trigger* da 0004 é o árbitro final.
+    _refuse_unreleased_reservation(session, workspace_id)
+
     # FK `ON DELETE CASCADE` (com `PRAGMA foreign_keys=ON`, ver `app.db.session`) remove
     # context entries, tasks, manifests, runs e findings. `safety_event` não tem FK e
     # sobrevive ([02] §11 regra 4). O repositório do usuário não é tocado (regra 7). Nenhum
-    # arquivo de disco é removido — `counts.artifacts` é 0 (E3-AUD-006).
+    # arquivo de disco é removido — `counts.artifacts` é 0 (E3-AUD-006). A reserva `released`
+    # (sem FK) sobrevive como histórico.
     session.delete(workspace)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        if _PURGE_BLOCKED_MARKER not in str(getattr(exc, "orig", None) or exc):
+            raise
+        session.rollback()
+        raise WorkspacePurgeBlocked(
+            "workspace tem reserva de execução não liberada; purga recusada pelo banco"
+        ) from exc
     return counts
+
+
+#: Prefixo da mensagem dos *triggers* da migration 0004 (`purge_blocked:unreleased_reservation_*`).
+#: Duplicado de propósito: `workspace/` não importa `orchestrator/` (direção de [01] §2).
+_PURGE_BLOCKED_MARKER = "purge_blocked:unreleased_reservation"
+
+
+def _refuse_unreleased_reservation(session: Session, workspace_id: str) -> None:
+    found = session.scalar(
+        select(ExecutionReservation.id)
+        .where(
+            ExecutionReservation.workspace_id == workspace_id,
+            ExecutionReservation.state != "released",
+        )
+        .limit(1)
+    )
+    if found is not None:
+        raise WorkspacePurgeBlocked(
+            "workspace tem reserva de execução não liberada (o encerramento dos recursos não foi "
+            "comprovado); purga recusada"
+        )
 
 
 def workspace_exists(session: Session, workspace_id: str) -> bool:

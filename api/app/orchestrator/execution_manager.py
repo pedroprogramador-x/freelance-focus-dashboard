@@ -67,6 +67,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import wraps
 from inspect import signature
@@ -98,7 +99,7 @@ from app.db.enums import (
     WorkspaceStatus,
 )
 from app.db.models import ContextManifest, DevWorkspace, Run, SafetyEvent, WorkspaceTask
-from app.git_runtime import preflight, repository_object_format
+from app.git_runtime import preflight, repository_object_format, task_worktree_names
 from app.orchestrator.analyzer import AnalyzerEnrichmentPort
 from app.orchestrator.developer_binding import DeveloperBindingResolver
 from app.orchestrator.developer_invocation_contract import (
@@ -113,6 +114,7 @@ from app.orchestrator.developer_invocation_contract import (
     RunClosure,
     claim_compatible,
 )
+from app.orchestrator.drain import DrainCoordinator, DrainResult, DrainStatus
 from app.orchestrator.errors import (
     ApprovalFingerprintMismatch,
     ConcurrentTaskUpdate,
@@ -150,6 +152,20 @@ from app.orchestrator.planner import (
     reverify_context,
     stale_manifest_entry_ids,
     workspace_planning_blocker,
+)
+from app.orchestrator.reservation_ledger import (
+    STATE_ACTIVE,
+    EffectsGate,
+    ReservationIdentity,
+    ReservationIdentityProvider,
+    any_unreleased_reservation,
+    declare_developer,
+    effects_gate,
+    insert_reservation,
+    is_slot_conflict,
+    mark_drain_requested,
+    resolve_identity,
+    unreleased_reservation_of,
 )
 from app.orchestrator.state_machine import (
     CapabilityProver,
@@ -1049,6 +1065,18 @@ def reject(session: Session, task_id: str, *, note: str | None = None) -> Worksp
     return get_task(session, task_id)
 
 
+@dataclass(frozen=True, slots=True)
+class CancelOutcome:
+    """O cancelamento e o que se sabe sobre a drenagem da reserva (E8.4.5 / I4).
+
+    `drain` descreve o **pedido** e, no máximo, o `active → draining` commitado pelo gate. Nunca
+    significa que algo terminou: cancelar não prova encerramento e nada aqui libera a reserva.
+    """
+
+    task: WorkspaceTask
+    drain: DrainResult
+
+
 @command
 def cancel(session: Session, task_id: str, *, note: str | None = None) -> WorkspaceTask:
     """`qualquer não-terminal → cancelled` ([02] §4).
@@ -1056,12 +1084,56 @@ def cancel(session: Session, task_id: str, *, note: str | None = None) -> Worksp
     `failure_reason` fica `NULL` — [ADR-0008] correção 1B.1 (AUD-011): desistir é decisão
     humana, não falha do sistema, e classificá-la como falha envenenaria a taxa de sucesso
     do benchmark. `transition_fields` impõe isso por construção.
+
+    ## Reserva durável (E8.4.5 / I4)
+
+    Sem reserva não liberada para a task, o comportamento é o de sempre (sem `commit`). **Com**
+    reserva `active`, a tx1 grava o cancelamento **e** `drain_requested_at`, e é commitada aqui.
+    Este caminho **não tem coordinator**: não fala com nenhum `LaunchGate`, não linearizou nada e
+    **não comprova o fechamento do gate**. Um `intent` já persistido e um lançador dentro da seção
+    protegida não são alcançados por ele; o único efeito é o marcador durável que faz os claims e o
+    *trigger* recusarem trabalho novo. A reserva segue `active` e não é liberada. É um caminho
+    explicitamente **não operacional**: a linearização é `cancel_and_drain`.
     """
+    return _cancel(session, task_id, note=note, coordinator=None).task
+
+
+@command
+def cancel_and_drain(
+    session: Session, task_id: str, *, note: str | None = None, drain: DrainCoordinator
+) -> CancelOutcome:
+    """`cancel` + a linearização do fechamento pelo `LaunchGate` **da tentativa certa**.
+
+    Ordem (a ordem é o contrato):
+
+    1. `request_stop` no gate da tentativa (sem lock), **antes** de qualquer transição;
+    2. **tx1** — CAS da task para `cancelled` e `drain_requested_at` na reserva, commitada;
+    3. **tx2** — dentro de `close_and_linearize`: `active → draining`, com CAS de versão.
+
+    `GATE_TIMEOUT` e `COMMIT_FAILED` nunca são tratados como linearização: o cancelamento da task
+    e o pedido de drenagem (tx1) permanecem, a reserva segue `active`, e `DrainResult` diz
+    `GATE_TIMEOUT` ou `COMMIT_UNCERTAIN`. Nada é liberado e nenhuma evidência é gravada.
+    """
+    if not isinstance(drain, DrainCoordinator):
+        raise TypeError("drain: esperado DrainCoordinator")
+    return _cancel(session, task_id, note=note, coordinator=drain)
+
+
+def _cancel(
+    session: Session, task_id: str, *, note: str | None, coordinator: DrainCoordinator | None
+) -> CancelOutcome:
     task = get_task(session, task_id)
     require_transition(task.status, TaskStatus.CANCELLED)
 
     summary = redact(note.strip()) if note and note.strip() else None
 
+    # Leitura que PRECEDE o `request_stop`: só para saber qual tentativa (gate) é a desta task. A
+    # leitura autoritativa é a de dentro da tx1, depois do CAS.
+    probe = unreleased_reservation_of(session, task_id=task.id)
+    if coordinator is not None and probe is not None:
+        coordinator.request_stop(probe.control_run_id)
+
+    task_workspace_id = task.workspace_id
     _compare_and_set(
         session,
         task,
@@ -1081,12 +1153,55 @@ def cancel(session: Session, task_id: str, *, note: str | None = None) -> Worksp
         kind=SafetyEventKind.CANCELLED,
         decision=SafetyDecisionKind.ALLOW,
         rule_id="orchestrator.task_cancelled",
-        subject=f"task:{task.id}",
-        workspace_id=task.workspace_id,
-        task_id=task.id,
+        subject=f"task:{task_id}",
+        workspace_id=task_workspace_id,
+        task_id=task_id,
     )
 
-    return get_task(session, task_id)
+    # Com o lock de escrita já tomado pelo CAS, esta leitura é a verdade da tx1.
+    reservation = unreleased_reservation_of(session, task_id=task_id)
+    if (reservation is None) != (probe is None) or (
+        reservation is not None
+        and probe is not None
+        and reservation.control_run_id != probe.control_run_id
+    ):
+        session.rollback()
+        raise ConcurrentTaskUpdate(
+            f"a reserva da task '{task_id}' mudou durante o cancelamento; virou no-op ([02] §4)"
+        )
+    if reservation is None:
+        return CancelOutcome(get_task(session, task_id), DrainResult(DrainStatus.NOT_REQUIRED))
+
+    control_run_id = reservation.control_run_id
+    version = reservation.version
+    if reservation.state != STATE_ACTIVE:
+        session.commit()
+        return CancelOutcome(
+            get_task(session, task_id),
+            DrainResult(DrainStatus.ALREADY_PAST, control_run_id, version),
+        )
+    if reservation.drain_requested_at is None:
+        if not mark_drain_requested(
+            session, reservation_id=reservation.id, expected_version=version, now=_utcnow()
+        ):
+            session.rollback()
+            raise ConcurrentTaskUpdate(
+                f"a reserva da task '{task_id}' perdeu uma corrida de escrita; o cancelamento "
+                "virou no-op ([02] §4)"
+            )
+        version += 1
+    # tx1 durável ANTES de qualquer gate: nenhuma transação pode estar aberta ao tomá-lo.
+    session.commit()
+
+    if coordinator is None:
+        return CancelOutcome(
+            get_task(session, task_id),
+            DrainResult(DrainStatus.REQUESTED_NO_GATE, control_run_id, version),
+        )
+    drain = coordinator.linearize(
+        session=session, control_run_id=control_run_id, expected_version=version, now=_utcnow()
+    )
+    return CancelOutcome(get_task(session, task_id), drain)
 
 
 @command
@@ -1244,6 +1359,10 @@ _ENTRY_GUARD_EVENT_KINDS: dict[str, SafetyEventKind] = {
     "capability_profile_matches_approved": SafetyEventKind.CAPABILITY_DENIED,
     "attempts_below_max": SafetyEventKind.RETRY_LIMIT,
     AdmissionGuard.NOT_CANCELLED.value: SafetyEventKind.CANCELLED,
+    # E8.4.5 / I4: não há identidade de reserva autorizada, então o ambiente não consegue impor a
+    # exclusividade da execução. O `rule_id` (`orchestrator.entry_guard.<guard>`) carrega o sentido
+    # exato; o vocabulário do evento é fechado por CHECK e a migration 0004 é congelada.
+    AdmissionGuard.RESERVATION_IDENTITY_AVAILABLE.value: SafetyEventKind.CAPABILITY_UNENFORCEABLE,
 }
 
 
@@ -1344,7 +1463,13 @@ def _invalidate_approval_on_entry(
 
 
 def _slot_available(session: Session, *, exclude_task_id: str) -> bool:
-    """`max_parallel_agents = 1` ([04] §7): existe alguma **outra** task executando?"""
+    """`max_parallel_agents = 1` ([04] §7): o slot está livre?
+
+    Livre ⇔ nenhuma **outra** task `executing` **e** nenhuma reserva durável não liberada em lugar
+    nenhum (E8.4.5 / I4). A reserva é independente do estado terminal da task: uma task
+    `cancelled` com a reserva ainda `active`/`draining`/`teardown_pending`/`unproven` continua
+    ocupando o slot, inclusive para a própria task.
+    """
     statement = (
         select(WorkspaceTask.id)
         .where(
@@ -1353,7 +1478,7 @@ def _slot_available(session: Session, *, exclude_task_id: str) -> bool:
         )
         .limit(1)
     )
-    return session.scalar(statement) is None
+    return session.scalar(statement) is None and not any_unreleased_reservation(session)
 
 
 # --------------------------------------------------------------------------- admissão (E8.4.1)
@@ -1578,6 +1703,10 @@ def _resolve_lost_claim(
         ) from original
     require_transition(task.status, TaskStatus.EXECUTING)
     if not _slot_available(session, exclude_task_id=task.id):
+        # Só o conflito de SLOT (índice da task ou da reserva) vira `slot_busy`; qualquer outro
+        # `IntegrityError` é defeito e sobe como está (E8.4.5: nunca mascarado como "ocupado").
+        if isinstance(original, IntegrityError) and not is_slot_conflict(original):
+            raise original
         return _slot_busy(task)
     raise original
 
@@ -1588,6 +1717,7 @@ def _claim_execution(
     *,
     key: str,
     manifest: ContextManifest,
+    identity: ReservationIdentity,
     now: datetime,
 ) -> Run:
     """A transação de admissão: **uma** transação, `COMMIT` antes de qualquer efeito externo.
@@ -1597,16 +1727,21 @@ def _claim_execution(
     2. confirma versão/status por CAS;
     3. `approved → executing`, `phase = implementing`, `attempts + 1` (exatamente uma vez);
     4. cria o Run de controle `running`, com os vínculos de recuperação (manifest, base
-       commit, posição no ciclo).
+       commit, posição no ciclo);
+    5. (E8.4.5 / I4) cria a **reserva durável** `active` com `control_run_id` = id do Run de
+       controle. O slot global da reserva (`uq_execution_reservation_unreleased`) é independente do
+       estado terminal da task: só uma reserva não liberada existe no banco inteiro.
 
     O `UPDATE` do CAS é a **primeira** instrução da transação: uma transação SQLite que começa
     por escrita pega o lock de escrita com a visão mais recente, sem o `SQLITE_BUSY_SNAPSHOT` de
     uma leitura anterior. Nada aqui chama HTTP, provider, git ou toca o filesystem.
 
-    Qualquer falha — inclusive a do meio — desfaz tudo: a task segue `approved`, sem Run e com
-    `attempts` intacto.
+    Qualquer falha — inclusive a do meio, inclusive o INSERT da reserva — desfaz tudo: a task segue
+    `approved`, sem Run, sem reserva e com `attempts` intacto.
     """
     task_id = task.id
+    workspace_id = task.workspace_id
+    worktree_ref = task_worktree_names(task_id).directory_name
     attempt_index = task.attempts
     fix_round = task.fix_rounds
     expected_version = task.version
@@ -1650,6 +1785,15 @@ def _claim_execution(
         )
         session.add(run)
         session.flush()
+        insert_reservation(
+            session,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            control_run_id=run.id,
+            worktree_ref=worktree_ref,
+            identity=identity,
+            now=now,
+        )
         session.commit()
     except BaseException:
         session.rollback()
@@ -1664,6 +1808,7 @@ def admit_execution(
     *,
     invocation_id: str,
     artifacts_dir: Path,
+    reservation_identity: ReservationIdentityProvider | None,
     prover: CapabilityProver | None = None,
     expected_capability_binding: CapabilityBinding | None = None,
     developer_binding_resolver: DeveloperBindingResolver | None = None,
@@ -1680,7 +1825,16 @@ def admit_execution(
 
     * `ADMITTED` — admissão nova;
     * `REPLAYED` — mesma chave + mesma task: o Run de controle existente, sem escrita alguma;
-    * `SLOT_BUSY` — outra task ocupa o slot: a task segue `approved`, nada é consumido nem criado.
+    * `SLOT_BUSY` — outra task ocupa o slot **ou existe reserva durável não liberada** (mesmo de
+      uma task já `cancelled`): a task segue `approved`, nada é consumido nem criado.
+
+    ## Identidade da reserva (E8.4.5 / I4)
+
+    `reservation_identity` é **obrigatório e sem padrão**: a porta que fornece `owner_token` e as
+    chaves lógica/física do InstanceLock. Não existe implementação em `app/` — InstanceLock e lease
+    são do I5+ —, então em produção a admissão permanece **bloqueada** (`TransitionGuardFailed`
+    `reservation_identity_available`, `SafetyEvent` durável, sem Run e sem tentativa consumida).
+    A repetição (`REPLAYED`) não exige a porta: não escreve nada.
 
     Chave de outra task ou de Run que não é de controle → `InvocationIdConflict`; chave nova
     com a task já `executing` → `TaskAlreadyExecuting`; qualquer pré-condição não satisfeita →
@@ -1762,7 +1916,28 @@ def admit_execution(
             # A chave pode ter sido tomada enquanto isto rodava (outra admissão concorrente): a
             # resposta determinística é a da chave — repetição ou conflito —, não "ocupado".
             taken = _existing_admission(session, task_id, key)
-            return taken if taken is not None else _slot_busy(task)
+            if taken is not None:
+                return taken
+            # A reserva durável também conta como slot ocupado — inclusive a desta MESMA task
+            # (outra chave a admitiu entre a leitura e aqui): isso continua sendo
+            # `TaskAlreadyExecuting`, não `slot_busy`. A leitura é por coluna (sem identity map).
+            if session.scalar(select(WorkspaceTask.status).where(WorkspaceTask.id == task_id)) is (
+                TaskStatus.EXECUTING
+            ):
+                raise TaskAlreadyExecuting(
+                    f"a task '{task_id}' já está em execução sob outra chave idempotente"
+                )
+            return _slot_busy(task)
+        # E8.4.5 / I4: sem identidade de reserva autorizada não há admissão. A porta é chamada
+        # AQUI: fora de qualquer transação, depois da repetição e do slot ocupado (que não a
+        # exigem) e antes da prova de capability. Recusa durável, sem Run, sem tentativa.
+        identity = resolve_identity(reservation_identity)
+        if identity is None:
+            raise TransitionGuardFailed(
+                "não há identidade de reserva autorizada (InstanceLock/lease): a admissão de "
+                "execução permanece bloqueada neste ambiente",
+                guard=AdmissionGuard.RESERVATION_IDENTITY_AVAILABLE.value,
+            )
         binding_refusal = _developer_binding_refusal(current_parts, expected_capability_binding)
         if binding_refusal is not None:
             raise TransitionGuardFailed(
@@ -1784,7 +1959,9 @@ def admit_execution(
         raise
 
     try:
-        run = _claim_execution(session, task, key=key, manifest=manifest, now=_utcnow())
+        run = _claim_execution(
+            session, task, key=key, manifest=manifest, identity=identity, now=_utcnow()
+        )
     except (ConcurrentTaskUpdate, IntegrityError) as lost:
         # `_claim_execution` já fez rollback. IntegrityError aqui é, esperadamente, o índice
         # único do slot ou a chave do Run; `_resolve_lost_claim` confirma relendo o banco.
@@ -1800,6 +1977,31 @@ def admit_execution(
 # curtas e separadas, e nenhuma transação fica aberta durante Git, filesystem, captura da árvore
 # principal ou registro do binding. Nenhuma transiciona a task: falha depois da admissão deixa a
 # task `executing` e o Run de controle `running` para a finalização agregada da E8.4.5.
+
+_EFFECTS_REFUSAL_CODES: dict[EffectsGate, PreparationCode] = {
+    EffectsGate.MISSING: PreparationCode.RESERVATION_MISSING,
+    EffectsGate.NOT_ACTIVE: PreparationCode.RESERVATION_NOT_ACTIVE,
+    EffectsGate.ADOPTED: PreparationCode.RESERVATION_NOT_ACTIVE,
+    EffectsGate.DRAIN_REQUESTED: PreparationCode.DRAIN_REQUESTED,
+    EffectsGate.DEVELOPER_NOT_DECLARED: PreparationCode.DEVELOPER_NOT_DECLARED,
+}
+
+
+def _effects_refusal(
+    session: Session, *, task_id: str, control_run_id: str, require_developer: bool = False
+) -> PreparationCode | None:
+    """A reserva da tentativa autoriza **novos efeitos**? `None` = sim; senão, o código da recusa.
+
+    Fail closed: uma task `executing` **sem** reserva (estado que só existe em fixtures legadas ou
+    em banco inconsistente) também é recusada — nenhum claim protegido nasce sem reserva. Nos
+    claims esta leitura roda DEPOIS de uma escrita da mesma transação, sob o lock de escrita do
+    SQLite: é a fronteira de autorização, não uma leitura anterior possivelmente obsoleta.
+    """
+    gate = effects_gate(
+        session, task_id=task_id, control_run_id=control_run_id, require_developer=require_developer
+    )
+    return None if gate is EffectsGate.OK else _EFFECTS_REFUSAL_CODES[gate]
+
 
 _SHA1_HEX = frozenset("0123456789abcdef")
 
@@ -1898,6 +2100,10 @@ def read_preparation_facts(
         return refuse(PreparationCode.RUN_NOT_OPEN)
     if task.cancel_requested:
         return refuse(PreparationCode.CANCEL_REQUESTED)
+    # Leitura de RELEITURA (consultiva): a autorização de verdade é a do claim, na transação dele.
+    reservation_refusal = _effects_refusal(session, task_id=task.id, control_run_id=run.id)
+    if reservation_refusal is not None:
+        return refuse(reservation_refusal)
     if run.attempt_index != task.attempts - 1 or run.fix_round != task.fix_rounds:
         return refuse(PreparationCode.ATTEMPT_MISMATCH)
 
@@ -2002,6 +2208,13 @@ def publish_prepared_workspace(
             raise ConcurrentTaskUpdate(
                 f"o Run de controle da task '{task_id}' não está mais aberto e sem worktree "
                 "publicada; a publicação virou no-op ([02] §4)"
+            )
+        # E8.4.5 / I4: com o lock de escrita tomado, a reserva desta tentativa ainda autoriza
+        # efeitos? (`active`, sem `drain_requested_at`, sem adoção.) Senão nada é publicado.
+        if _effects_refusal(session, task_id=task_id, control_run_id=control_run_id) is not None:
+            raise ConcurrentTaskUpdate(
+                f"a reserva da task '{task_id}' não autoriza mais efeitos (drenagem pedida, "
+                "ausente ou fora de `active`); a publicação virou no-op ([02] §4)"
             )
         session.commit()
     except BaseException:
@@ -2327,6 +2540,18 @@ def open_developer_run(session: Session, task_id: str, *, spec: DeveloperRunSpec
             control.worktree_path != spec.worktree_path or task.worktree_path != spec.worktree_path
         ):
             code = PreparationCode.FINAL_CHECK_FAILED
+        else:
+            # E8.4.5 / I4 — fronteira de autorização: com o INSERT já feito (lock de escrita), a
+            # reserva desta tentativa existe, está `active`, sem drenagem pedida nem adoção?
+            code = _effects_refusal(session, task_id=task_id, control_run_id=spec.control_run_id)
+        if code is None and not declare_developer(
+            session, task_id=task_id, control_run_id=spec.control_run_id, now=_utcnow()
+        ):
+            # Os predicados do UPDATE são a mesma fronteira: se não casou, nada foi declarado.
+            code = (
+                _effects_refusal(session, task_id=task_id, control_run_id=spec.control_run_id)
+                or PreparationCode.RESERVATION_NOT_ACTIVE
+            )
         if code is not None:
             session.rollback()
             return ClaimResult(ClaimOutcome.REFUSED, code=code)
@@ -2695,6 +2920,15 @@ def open_runner_run(session: Session, task_id: str, *, spec: RunnerRunSpec) -> C
             )
         ):
             code = PreparationCode.RUN_MISMATCH
+        else:
+            # E8.4.5 / I4 — reserva `active`, sem drenagem pedida, sem adoção E com o Developer
+            # já declarado (o Test Runner só nasce depois dele), lida sob o lock de escrita.
+            code = _effects_refusal(
+                session,
+                task_id=task_id,
+                control_run_id=spec.control_run_id,
+                require_developer=True,
+            )
         if code is not None:
             session.rollback()
             return ClaimResult(ClaimOutcome.REFUSED, code=code)
@@ -2848,10 +3082,12 @@ __all__ = [
     "PLAN_STANDING_FINAL",
     "PLAN_STANDING_HISTORICAL",
     "PLAN_STANDING_NONE",
+    "CancelOutcome",
     "admit_execution",
     "approval_state",
     "approve",
     "cancel",
+    "cancel_and_drain",
     "create_task",
     "get_task",
     "latest_manifest",

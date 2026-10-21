@@ -30,6 +30,7 @@ from tests.capability_helpers import (
     declaration,
     expected_binding,
 )
+from tests.reservation_support_e8_4_5 import DEFAULT_IDENTITY
 
 VALID_TEST_CONFIG: dict[str, Any] = {
     "runner_id": "generic-subprocess-v1",
@@ -101,8 +102,12 @@ def admit(
     with_resolver: bool = True,
     prover: Any = "default",
     expected: Any = "default",
+    identity: Any = "default",
 ) -> ExecutionAdmission:
     """`admit_execution` como o composition root a chamaria, com prover positivo de teste.
+
+    E8.4.5 / I4: a identidade da reserva é uma porta **falsa de teste** (`DEFAULT_IDENTITY`); em
+    produção não existe implementação. `identity=None` exercita a recusa por ausência de identidade.
 
     Em produção cada chamada nasce de uma sessão **nova**. Aqui a sessão do teste é reaproveitada,
     então ela encerra a transação de leitura (o *snapshot* do WAL) e descarta o identity map antes
@@ -117,6 +122,7 @@ def admit(
         task_id,
         invocation_id=key,
         artifacts_dir=artifacts_dir,
+        reservation_identity=DEFAULT_IDENTITY if identity == "default" else identity,
         prover=chosen_prover,
         expected_capability_binding=chosen_expected,
         developer_binding_resolver=RESOLVER if with_resolver else None,

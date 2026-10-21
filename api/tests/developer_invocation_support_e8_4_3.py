@@ -66,6 +66,7 @@ from tests.capability_helpers import (
     declaration,
     expected_binding,
 )
+from tests.reservation_support_e8_4_5 import DEFAULT_IDENTITY
 from tests.test_anthropic_messages_developer_adapter_e8_2 import FakeTransport, _opener
 from tests.test_execution_workspace_e8_4_2 import Harness, Signal
 
@@ -354,6 +355,7 @@ def build_real(h: Harness, fake: FakeTransport) -> Rig:
         task.id,
         invocation_id="exec-1",
         artifacts_dir=h.artifacts,
+        reservation_identity=DEFAULT_IDENTITY,
         prover=security.prover,
         expected_capability_binding=security.expected_binding,
         developer_binding_resolver=resolver,
