@@ -1,103 +1,38 @@
 # CLAUDE.md
 
-Repositório híbrido: **frontend** React 18 + TS + Vite em `src/` · **backend**
-Python/FastAPI em `api/` (o "AI Dev Workspace", infra interna).
+@AGENTS.md
 
-## Antes de qualquer tarefa
+Camada específica do Claude Code. As regras comuns (arquitetura congelada,
+segredos, persistências, execução operacional, comandos, Git) estão em
+`AGENTS.md`, importado acima; não as duplique aqui.
 
-1. Leia `AGENT_LOG.md` na raiz. Registre uma entrada ao terminar (formato no
-   topo do arquivo).
-2. Todo prompt de agente deve declarar modelo e effort level.
+## Skills e subagente do projeto
 
-## Regras que não podem ser inferidas do código
+Em `.claude/`. As skills são de invocação manual (`disable-model-invocation`):
 
-- **`docs/` é arquitetura CONGELADA** (Architecture Freeze, commit `67d4df4`).
-  ADRs 0001–0010 em `docs/adr/`. Não altere nada em `docs/` sem autorização
-  explícita do Pedro nesta conversa.
-- **`api/` — o Developer provider não recebe shell cru.**
-  `execute_commands = disabled` é decisão arquitetural (ver
-  `docs/adr/0009` e `docs/architecture/04`). Efeitos de arquivo são
-  mediados e tipados; `source_ref` aceita só caminho literal relativo (glob
-  é fail-closed até E4).
-- **`.env*` é segredo por padrão** na safety policy — inclui `.env.example`.
-- **Persistências disjuntas**: `localStorage` = domínio comercial (frontend);
-  SQLite = AI Dev Workspace (backend). O backend não importa nada do domínio
-  comercial.
-- **Roadmap por fase** (E1, E2, E3…) em
-  `docs/architecture/07-roadmap-v1.md`. Trabalho incremental: quality gates →
-  self-review → auditoria independente quando fizer sentido → commit só
-  depois de aprovado. Um commit por fase.
+- `/tino-plan <incremento>` — planeja um incremento sem implementar: escopo,
+  estado atual, riscos, interfaces, contraprovas, critérios de aceite, modelo
+  e esforço, pacote de auditoria para o Codex.
+- `/tino-validate [dry-run]` — prepara e, com sua autorização, executa gates
+  direcionados e gera relatório. Nunca declara GREEN; o veredito é do Codex.
+- `test-investigator` (subagente) — investiga falhas de teste e devolve causa
+  provável, evidências, contraprova e confiança. Sem Edit/Write; o Bash dele
+  depende da confirmação de cada comando, não é isolamento garantido.
 
-## Comandos
+## Como trabalhar
 
-### Frontend (`src/`) — Node 22, rodar da raiz do repo
+- Antes de alteração complexa ou que cruze módulos, planeje primeiro
+  (`/tino-plan` ou modo Plan) e aguarde aprovação do Pedro.
+- Escolha modelo e esforço de forma consciente e declare-os (ver
+  `AGENTS.md`). Padrão: Sonnet com esforço alto; Opus só com justificativa
+  concreta de complexidade (concorrência, recovery, mudança de contrato).
+- Prefira `Explore`/`Plan` nativos para busca e planejamento amplos. Peça uma
+  leitura parcial do `AGENT_LOG.md`, nunca a integral.
 
-```bash
-npm run lint          # eslint --max-warnings 0
-npm test              # vitest run
-npm run build         # tsc -b && vite build
-npm run dev
-```
+## Permissões e confirmações
 
-### AI Dev Workspace — fluxo de dev local (até a E11)
-
-O frontend do AI Dev Workspace só funciona autenticado quando **a FastAPI serve o
-SPA compilado** (ela injeta o `LocalSessionToken` no HTML). O fluxo suportado é:
-
-```bash
-VITE_APP_MODE=local_dev_workspace npm run build   # base '/', assets em /assets/
-"$PY" -m uvicorn app.main:app                      # da pasta api/; serve dist/ + /api
-```
-
-`npm run dev` **isolado não é suportado** até a E11: sem o launcher de hot-reload
-(FastAPI + Vite com token compartilhado em memória), o Vite dev server não tem token
-para injetar e toda chamada à API responde 401. O launcher está adiado para a E11
-(ver "Decisões adiadas" em `docs/architecture/07-roadmap-v1.md`) porque entre E4 e
-E10 o roadmap é quase todo backend. O `server.proxy` em `vite.config.ts` já deixa o
-caminho pronto para esse launcher.
-
-### Backend (`api/`) — venv Python FICA FORA DO REPO
-
-O repo está no OneDrive; o venv vive em
-`C:\Users\pedro\AppData\Local\FreelanceFocus\venvs\api\`.
-
-```bash
-# rodar da pasta api/, usando o Python do venv:
-PY="/c/Users/pedro/AppData/Local/FreelanceFocus/venvs/api/Scripts/python.exe"
-
-"$PY" -m pytest
-"$PY" -m ruff check .
-"$PY" -m ruff format --check .
-"$PY" -m mypy
-"$PY" -m alembic upgrade head   # aplica o schema
-"$PY" -m alembic downgrade base
-```
-
-- **Nunca** crie venv, `.db` ou `data_dir` dentro do repo. `data_dir` de
-  runtime é `%LOCALAPPDATA%\FreelanceFocus\` (fora do OneDrive).
-- `.github/workflows/api-ci.yml` roda os gates do backend no CI; não mexa
-  em `deploy.yml` (frontend/Pages).
-
-## Git
-
-- Conventional Commits, minúsculas, sem escopo: `feat:`, `fix:`, `docs:`.
-- Não commite/pushe sem autorização explícita do Pedro.
-
-## CodeGraph
-
-Este repo é indexado pelo CodeGraph (existe `.codegraph/` na raiz — índice
-local, ignorado pelo git). Quando precisar entender ou localizar código,
-use o CodeGraph ANTES de grep/find ou de abrir arquivos:
-
-- **Tool MCP** (quando disponível): `codegraph_explore` responde a maioria
-  das perguntas de código numa chamada — source verbatim dos símbolos
-  relevantes + os call paths entre eles, incluindo saltos de dispatch
-  dinâmico que o grep não segue. Cite um arquivo ou símbolo na query para
-  ler o source atual com números de linha. Se a tool estiver listada mas
-  deferida, carregue-a pelo nome via tool search.
-- **Shell** (sempre funciona): `codegraph explore "<símbolos ou pergunta>"`
-  imprime a mesma saída. Também: `codegraph context`, `codegraph query`.
-
-Configuração de ambiente (fora do repo): MCP server em `~/.claude.json` e
-hook `UserPromptSubmit` em `~/.claude/settings.json`. Ver entrada de
-2026-09-01 no `AGENT_LOG.md`.
+- Comandos de shell passam pela confirmação normal de permissão; não
+  contorne com `bypassPermissions` nem amplie permissões por conta própria.
+- Escritas que o Pedro não pediu (commit, push, PR, merge, edição de `docs/`,
+  de `.claude/settings*` ou de configurações globais) exigem autorização
+  explícita.

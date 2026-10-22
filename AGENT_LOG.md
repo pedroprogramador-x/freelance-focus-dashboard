@@ -1,8 +1,9 @@
 # Agent Log
 
-Registro de sessões de agentes de IA neste projeto. Todo agente deve
-ler este arquivo antes de iniciar uma tarefa e adicionar uma entrada
-ao final ao terminar.
+Registro de sessões de agentes de IA neste projeto. O arquivo é longo:
+**não o leia por inteiro**. Antes de uma tarefa, consulte de forma seletiva —
+este cabeçalho, os títulos (`^## `) e só as entradas recentes ou do
+incremento em questão. Ao terminar, adicione uma entrada ao final.
 
 Formato de cada entrada:
 ## [DATA] — [AGENTE] — [TAREFA]
@@ -9172,3 +9173,74 @@ antecipadas; documentação aprovada preservada.
   arquitetura) + 1 falha esperada no dado do teste da E8.4.3, corrigida; `ruff`, `format`, `mypy`
   (+linux), `pip check`, `git diff --check` limpos. **Suíte completa NÃO repetida**, conforme pedido,
   até a reauditoria.
+
+---
+
+## 2026-10-22 — Claude Sonnet 5.5 (effort: não declarado no prompt; padrão da sessão) — Entrada retrospectiva consolidada: E8.4.5 I1–I4
+
+Registro **retrospectivo**, escrito em 2026-10-22 (Fase 2A) a partir de `git show` dos
+dois commits e de relatos do Pedro. Não houve entrada contemporânea de I1–I4. Nada foi
+executado para escrevê-la (nenhum teste rodado) e nenhuma data histórica além das dos
+commits foi inferida.
+
+- Fatos comprovados pelos commits (branch `e8/04-5-resource-handling-recovery`):
+  - `0374caeb11ba65358ace07119474ba4cbc0934d4`, 2026-10-16 —
+    `feat(e8.4.5): checkpoint I1-I3 durable execution foundations`; 22 arquivos,
+    +10679/−29. Contém: modelo e migration `0004_execution_reservation`
+    (`api/app/db/models.py`, `api/migrations/versions/`), `orchestrator/teardown_contract.py`,
+    `process_runtime/launch.py` e ajustes em `_posix.py`, `_windows.py`, `supervisor.py`,
+    e os testes `*_e8_4_5.py` de reserva, schema, observer de launch e contrato de teardown.
+    A mensagem do commit não separa I1, I2 e I3; o mapeamento arquivo→incremento não
+    está registrado.
+  - `c5c69c40243e888840dc2f0abcd80bc834cea72b`, 2026-10-21 —
+    `feat(e8.4.5): checkpoint I4 admission, cancellation and purge`; 17 arquivos,
+    +2904/−32. Contém: `orchestrator/drain.py` e `reservation_ledger.py` (novos),
+    mudanças em `execution_manager.py` (admissão com reserva, `cancel`/`cancel_and_drain`),
+    `orchestrator/purge.py` e `workspace/purge.py` (purga recusada com reserva não
+    liberada), pequenos acréscimos em `execution_contract.py`/`workspace_contract.py`, e
+    testes novos e ajustados.
+  - Ambos os commits têm o trailer `Co-Authored-By: Claude Sonnet 5.5`. O effort usado em
+    cada implementação não está registrado.
+
+- Resultados de testes e auditorias **relatados** (não comprovados pelos commits; origem:
+  prompts do Pedro nas sessões de implementação, transcrições locais não versionadas):
+  - I1: GREEN em auditoria independente (Codex). I3: GREEN em auditoria independente.
+  - I2: validado no Windows e no Linux Ubuntu 24.04.4 — 37 passed, 7 skipped, com os
+    quatro testes POSIX aprovados.
+  - I4: auditoria independente do Codex com veredito CONDITIONAL, sem P0/P1. O único P2
+    (cobertura de falha de commit em `api/tests/test_execution_admission_e8_4_1.py`) foi
+    corrigido e reportado como RESOLVED. A condição restante era as regressões Linux
+    pendentes (checkpoint feito para validação pelo Google Jules).
+  - Teste do P2 corrigido isolado: 1 passed; vizinhos de admissão
+    (`test_execution_admission_e8_4_1.py` + `test_reservation_admission_e8_4_5.py`): 86 passed.
+  - Naquele momento (relato original), o resultado da regressão Linux/Jules do I4 e da
+    suíte completa ainda não estava registrado; o CONDITIONAL acima permanece como parte
+    do histórico. Ver "Desfecho posterior" abaixo.
+
+- Desfecho posterior do I4 (relatado pelo Pedro em 2026-10-22; **nenhum item abaixo foi
+  reproduzido nesta sessão nem é comprovado por commit**; as datas desses eventos não
+  foram informadas e não são registradas aqui):
+  - O P2 do teste de falha de commit foi resolvido e confirmado pelo Codex.
+  - O I4 foi validado em testes Linux direcionados executados pelo Jules: 356 testes
+    aprovados.
+  - Foram observadas 11 falhas adicionais da E8.3, relacionadas a `path.cross_volume`.
+    Uma contraprova representativa reproduziu a falha tanto no commit `0374cae` quanto no
+    `c5c69c4`, sob condições equivalentes. Os outros dez casos **não foram comparados
+    individualmente** entre os commits.
+  - O I4 foi posteriormente aceito como GREEN **exclusivamente no escopo não operacional**.
+  - A pendência de compatibilidade E8.3/Linux (`path.cross_volume`) permanece separada do
+    I4.
+  - As garantias operacionais I5–I8 continuam pendentes.
+
+- Limitações ainda pendentes:
+  - Segundo `docs/architecture/02-data-model.md` (obrigação vinculante da E8.4.5), nenhuma
+    execução operacional é habilitada antes de reserva durável, encerramento
+    comprovado dos recursos e recuperação idempotente após crash. I1–I4 não cumprem
+    (2) e (3), nem a finalização que aplica `classify_execution`; a reserva não é liberada
+    por nenhum caminho do I4.
+  - `cancel` sem coordinator marca `drain_requested_at` mas não linearizado; sem
+    reconciliação de `GATE_TIMEOUT`/`COMMIT_UNCERTAIN` até o I5+.
+  - Sem trigger específico para `developer_declared_at` após `drain_requested_at`; o
+    serviço impede a escrita (limitação temporária aceita, migration 0004 preservada).
+  - Observer SQLite e associação completa LaunchScope↔threads↔reservas ficaram para o I5.
+  - Esta entrada não substitui a auditoria do Codex nem declara estado GREEN.
