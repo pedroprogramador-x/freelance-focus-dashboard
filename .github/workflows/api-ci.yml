@@ -77,6 +77,9 @@ jobs:
               "run",
               "audit_finding",
               "safety_event",
+              "execution_reservation",
+              "execution_launch",
+              "execution_evidence",
           }
           assert tables == expected, f"schema inesperado: {sorted(tables)}"
           print("schema ok:", len(tables), "tabelas")
