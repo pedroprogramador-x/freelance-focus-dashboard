@@ -90,25 +90,93 @@ def test_nenhum_escopo_de_lancamento_operacional_e_instalado() -> None:
             assert forbidden not in names, f"{_rel(path)} usa {forbidden}"
 
 
-def test_nada_em_app_escreve_o_ledger_nem_a_evidencia() -> None:
+#: Entrega A: o ledger e a evidência têm **um** escritor cada, e é um módulo nomeado. Qualquer
+#: outro módulo de `app/` que construa essas linhas, ou escreva SQL nelas, falha aqui.
+LEDGER_WRITER = "orchestrator/launch_ledger.py"
+EVIDENCE_WRITER = "orchestrator/evidence_ledger.py"
+
+
+def test_so_os_dois_escritores_nomeados_escrevem_o_ledger_e_a_evidencia() -> None:
+    constructors = {"ExecutionLaunch": LEDGER_WRITER, "ExecutionEvidence": EVIDENCE_WRITER}
     for path in ALL_FILES:
         text = path.read_text(encoding="utf-8").lower()
         names = _call_names(_tree(path))
-        assert "ExecutionLaunch" not in names and "ExecutionEvidence" not in names, _rel(path)
+        for model, owner in constructors.items():
+            if model in names:
+                assert _rel(path) == owner, f"{_rel(path)} constrói {model} (dono: {owner})"
         for fragment in (
             "insert into execution_launch",
             "insert into execution_evidence",
             "update execution_launch",
+            "delete from execution_launch",
+            "delete from execution_evidence",
         ):
             assert fragment not in text, f"{_rel(path)}: {fragment}"
-    imports = {
-        i
-        for path in (APP_ROOT / "orchestrator").rglob("*.py")
+    importers = {
+        (_rel(path), name)
+        for path in ALL_FILES
         for n in ast.walk(_tree(path))
         if isinstance(n, ast.ImportFrom)
-        for i in (a.name for a in n.names)
+        for name in (a.name for a in n.names)
+        if name in constructors and not _rel(path).startswith("db/")
     }
-    assert "ExecutionLaunch" not in imports and "ExecutionEvidence" not in imports
+    assert importers == {(LEDGER_WRITER, "ExecutionLaunch"), (EVIDENCE_WRITER, "ExecutionEvidence")}
+    # o ledger nunca apaga: os dois módulos não têm `delete`
+    for owner in (LEDGER_WRITER, EVIDENCE_WRITER):
+        assert "delete" not in _call_names(_tree(APP_ROOT / owner)), owner
+
+
+def test_nenhum_modulo_de_producao_instala_o_observer_o_escritor_ou_o_executor() -> None:
+    """A é o componente, não a composição: nada em `app/` instancia o observer, o escritor de
+    evidência nem o executor, e nada declara um contexto de lançamento. A integração é a C."""
+    own = {
+        "SqliteLaunchObserver": LEDGER_WRITER,
+        "EvidenceWriter": EVIDENCE_WRITER,
+        "InProcessExecutor": "orchestrator/executor_drain.py",
+        "bind_launch_context": "process_runtime/launch.py",
+    }
+    for path in ALL_FILES:
+        names = _call_names(_tree(path))
+        for name in own:
+            if name in names:
+                # só dentro do próprio módulo que o define (ex.: `drain_with_evidence` valida tipos)
+                assert _rel(path) == own[name], f"{_rel(path)} usa {name}"
+
+
+def test_nenhum_modulo_de_producao_produz_o_tag_other_nem_o_deixa_por_omissao() -> None:
+    from app.process_runtime.launch import LaunchPhaseTag
+
+    assert {t.value for t in LaunchPhaseTag} == {"preparation", "developer", "test_runner"}
+    for rel in (LEDGER_WRITER, EVIDENCE_WRITER, "process_runtime/launch.py"):
+        text = (APP_ROOT / rel).read_text(encoding="utf-8")
+        assert "PhaseTag.OTHER" not in text and '"other"' not in text, rel
+
+
+def test_o_executor_exige_a_conferencia_de_ordem_sem_valor_padrao() -> None:
+    from app.orchestrator.executor_drain import InProcessExecutor
+
+    [init] = [
+        n
+        for n in ast.walk(_tree(APP_ROOT / "orchestrator" / "executor_drain.py"))
+        if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+    ]
+    kwonly = {a.arg: d for a, d in zip(init.args.kwonlyargs, init.args.kw_defaults, strict=True)}
+    assert kwonly == {"rank": None}
+    with pytest.raises(TypeError):
+        InProcessExecutor()  # type: ignore[call-arg]
+
+
+def test_os_escritores_da_a_nao_importam_o_runtime_de_processo_nem_dao_release() -> None:
+    for rel in (LEDGER_WRITER, EVIDENCE_WRITER, "orchestrator/executor_drain.py"):
+        tree = _tree(APP_ROOT / rel)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                assert not (node.module or "").startswith("app.process_runtime"), rel
+            elif isinstance(node, ast.Import):
+                assert not any(a.name.startswith("app.process_runtime") for a in node.names), rel
+        for call in (n for n in ast.walk(tree) if isinstance(n, ast.Call)):
+            for kw in call.keywords:
+                assert kw.arg not in {"released_at", "released_by_token", "release_evidence_hash"}
 
 
 def test_nenhum_codigo_de_producao_libera_reserva_nem_produz_proven_current() -> None:

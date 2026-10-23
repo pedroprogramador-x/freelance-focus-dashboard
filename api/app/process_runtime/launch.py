@@ -36,6 +36,16 @@ do banco, no futuro). Ponto de linearização **L** = o retorno do `commit` com 
 Nenhum lançamento cruza a fronteira depois de L; os que cruzaram antes terminaram a seção antes de
 L começar. Prazo esgotado ⇒ `GATE_TIMEOUT`: L **não** ocorreu e ninguém pode declarar o fechamento.
 
+## Escopo ligado à reserva e ao contexto (Entrega A)
+
+Um `LaunchScope` com `reservation_id` é um escopo **de uma reserva**. Ele só admite lançamentos
+feitos num contexto declarado por `bind_launch_context(reservation_id, phase_tag)`: o contexto
+carrega a reserva **e** a fase (`preparation`, `developer` ou `test_runner`; não existe `other`).
+Lançamento fora de contexto, ou num contexto de outra reserva, é recusado antes do gate, sem
+`intent` e sem processo (`scope_mismatch`). O vínculo é **da thread** (`threading.local`): outra
+thread não o herda — quem lança de outra thread precisa abrir o próprio contexto. Escopo sem
+`reservation_id` mantém o comportamento ambiente do I2.
+
 ## Ordem de locks (verificável)
 
 `executor (10) < gate (20) < transação SQLite (30)`: só se adquire um rank estritamente maior que
@@ -85,6 +95,15 @@ class LaunchEnd(str, Enum):
     LEDGER_WRITE_FAILED = "ledger_write_failed"
 
 
+class LaunchPhaseTag(str, Enum):
+    """A fase declarada do lançamento. **Não há `other`**: omitir a fase é recusar, não classificar.
+    Os valores são um subconjunto dos de `PhaseTag` do contrato do I1 (um teste os cruza)."""
+
+    PREPARATION = "preparation"
+    DEVELOPER = "developer"
+    TEST_RUNNER = "test_runner"
+
+
 class LaunchRefusal(str, Enum):
     """Por que um lançamento protegido foi recusado **sem criar processo**."""
 
@@ -93,6 +112,8 @@ class LaunchRefusal(str, Enum):
     INTENT_FAILED = "intent_failed"
     SCOPE_MISSING = "scope_missing"
     LOCK_ORDER = "lock_order"
+    #: O escopo é de uma reserva e o contexto do lançamento não é (ausente ou de outra reserva).
+    SCOPE_MISMATCH = "scope_mismatch"
 
 
 REFUSAL_DETAIL_PREFIX = "launch_refused:"
@@ -100,11 +121,18 @@ REFUSAL_DETAIL_PREFIX = "launch_refused:"
 
 @dataclass(frozen=True, slots=True)
 class LaunchIntent:
-    """O que o observer recebe em `intent`: nunca `argv`, `cwd` nem ambiente (podem ter segredo)."""
+    """O que o observer recebe em `intent`: nunca `argv`, `cwd` nem ambiente (podem ter segredo).
+
+    `phase_tag` e `reservation_id` vêm do contexto declarado (`bind_launch_context`); são `None`
+    quando o lançamento não está num contexto declarado (escopo ambiente do I2). Um observer que
+    precisa deles recusa o `intent` na ausência — nunca assume um valor.
+    """
 
     exe_name: str
     platform: LaunchPlatform
     profile: str
+    phase_tag: LaunchPhaseTag | None = None
+    reservation_id: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.exe_name) is not str or not self.exe_name:
@@ -113,6 +141,14 @@ class LaunchIntent:
             raise TypeError("platform: esperado LaunchPlatform")
         if self.profile not in (PROFILE_WIN_JOB_V1, PROFILE_POSIX_PGRP_V1):
             raise ValueError("perfil de contenção desconhecido")
+        if self.phase_tag is not None and type(self.phase_tag) is not LaunchPhaseTag:
+            raise TypeError("phase_tag: esperado LaunchPhaseTag ou None")
+        _optional_id("reservation_id", self.reservation_id)
+
+
+def _optional_id(name: str, value: object) -> None:
+    if value is not None and (type(value) is not str or not value.strip()):
+        raise TypeError(f"{name}: esperado str não vazio ou None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,11 +361,17 @@ class LaunchGate:
 
 @dataclass(frozen=True, slots=True)
 class LaunchScope:
-    """Observer + gate de **uma** tentativa protegida."""
+    """Observer + gate de **uma** tentativa protegida.
+
+    Com `reservation_id`, o escopo pertence a essa reserva: só lançamentos num contexto declarado
+    para ela (`bind_launch_context`) são admitidos. Sem `reservation_id` (escopo ambiente do I2),
+    qualquer thread do processo lança sob o escopo.
+    """
 
     observer: LaunchObserver
     gate: LaunchGate
     enter_timeout_s: float = DEFAULT_GATE_TIMEOUT_S
+    reservation_id: str | None = None
 
     def __post_init__(self) -> None:
         for method in ("intent", "created", "contained", "ended"):
@@ -338,6 +380,53 @@ class LaunchScope:
         if type(self.gate) is not LaunchGate:
             raise TypeError("gate: esperado LaunchGate")
         _valid_timeout(self.enter_timeout_s)
+        _optional_id("reservation_id", self.reservation_id)
+
+
+@dataclass(frozen=True, slots=True)
+class LaunchBinding:
+    """O contexto declarado de um lançamento: a reserva e a fase. Nada é inferido."""
+
+    reservation_id: str
+    phase_tag: LaunchPhaseTag
+
+    def __post_init__(self) -> None:
+        if type(self.reservation_id) is not str or not self.reservation_id.strip():
+            raise TypeError("reservation_id: esperado str não vazio")
+        if type(self.phase_tag) is not LaunchPhaseTag:
+            raise TypeError("phase_tag: esperado LaunchPhaseTag")
+
+
+class BindingConflict(RuntimeError):
+    """Um contexto já ligado a uma reserva tentou ligar-se a outra."""
+
+
+_bound = threading.local()
+
+
+def current_binding() -> LaunchBinding | None:
+    """O contexto declarado **desta thread**, ou `None`."""
+    binding: LaunchBinding | None = getattr(_bound, "binding", None)
+    return binding
+
+
+@contextlib.contextmanager
+def bind_launch_context(reservation_id: str, phase_tag: LaunchPhaseTag) -> Iterator[LaunchBinding]:
+    """Declara que o código dentro do bloco lança para `reservation_id` na fase `phase_tag`.
+
+    Pode ser aninhado para **mudar de fase** dentro da mesma reserva; ligar-se a outra reserva
+    dentro de um contexto já ligado levanta `BindingConflict` (isolamento entre reservas). O
+    contexto anterior é restaurado ao sair, inclusive por exceção. Vale só para a thread corrente.
+    """
+    binding = LaunchBinding(reservation_id, phase_tag)
+    outer = current_binding()
+    if outer is not None and outer.reservation_id != binding.reservation_id:
+        raise BindingConflict("o contexto já está ligado a outra reserva")
+    _bound.binding = binding
+    try:
+        yield binding
+    finally:
+        _bound.binding = outer
 
 
 class ScopeAlreadyInstalled(RuntimeError):
@@ -541,10 +630,13 @@ __all__ = [
     "PROFILE_POSIX_PGRP_V1",
     "PROFILE_WIN_JOB_V1",
     "REFUSAL_DETAIL_PREFIX",
+    "BindingConflict",
+    "LaunchBinding",
     "LaunchEnd",
     "LaunchGate",
     "LaunchIntent",
     "LaunchObserver",
+    "LaunchPhaseTag",
     "LaunchPlatform",
     "LaunchRefusal",
     "LaunchScope",
@@ -556,6 +648,8 @@ __all__ = [
     "ProtectedLaunch",
     "ScopeAlreadyInstalled",
     "StartHooks",
+    "bind_launch_context",
+    "current_binding",
     "current_scope",
     "exe_name_of",
     "held_ranks",

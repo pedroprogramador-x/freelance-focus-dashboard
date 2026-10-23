@@ -809,8 +809,11 @@ def test_intent_e_identidade_validam_o_que_recebem() -> None:
             ProcessIdentity(bad, "t")  # type: ignore[arg-type]
     with pytest.raises(TypeError):
         ProcessIdentity(1, "")
-    # o intent nunca carrega argv, cwd nem ambiente
-    assert set(LaunchIntent.__dataclass_fields__) == {"exe_name", "platform", "profile"}
+    # o intent nunca carrega argv, cwd nem ambiente. Entrega A: a fase declarada e a reserva do
+    # contexto (`bind_launch_context`) são os únicos acréscimos, ambos opcionais.
+    fields = set(LaunchIntent.__dataclass_fields__)
+    assert fields == {"exe_name", "platform", "profile", "phase_tag", "reservation_id"}
+    assert not fields & {"argv", "cwd", "env", "environ", "environment"}
     assert launch_module.exe_name_of("C:\\a\\b\\python.exe") == "python.exe"
     assert launch_module.exe_name_of("/usr/bin/python3") == "python3"
 

@@ -9244,3 +9244,29 @@ commits foi inferida.
     serviço impede a escrita (limitação temporária aceita, migration 0004 preservada).
   - Observer SQLite e associação completa LaunchScope↔threads↔reservas ficaram para o I5.
   - Esta entrada não substitui a auditoria do Codex nem declara estado GREEN.
+
+---
+
+## 2026-10-23 — Claude Sonnet 5.5 (effort: não declarado no prompt; padrão da sessão) — E8.4.5 Entrega A (controle de lançamentos) — candidate
+
+- Arquivos alterados:
+  - `api/app/process_runtime/launch.py`, `supervisor.py` — `LaunchPhaseTag` (sem `other`), `phase_tag` e
+    `reservation_id` opcionais em `LaunchIntent`, `LaunchScope.reservation_id`, `bind_launch_context`
+    (contexto por thread). Com contexto ativo, `run_supervised` exige o escopo da mesma reserva
+    (`scope_missing`/`scope_mismatch`) antes de qualquer `_backend.start` ou `intent`.
+  - `api/app/orchestrator/launch_ledger.py` (observer SQLite), `evidence_ledger.py` (evidência R3/R4 do
+    dono), `executor_drain.py` (drenagem do executor) — novos.
+  - `api/tests/test_launch_control_e8_4_5.py` (novo); ajustes em `test_reservation_architecture_e8_4_5.py`
+    (travas reescritas: um escritor nomeado por tabela, nada instancia observer/escritor/executor em
+    `app/`) e em `test_launch_observer_e8_4_5.py` (campos de `LaunchIntent`).
+- Decisões tomadas: sem migration; sem integração operacional (Entrega C); contexto declarado é da thread
+  (`threading.local`, o runtime é só stdlib); `not_bound`/`refused` do binding não grava evidência.
+- Auditoria (relatada pelo Pedro, não reproduzida aqui): Codex → BLOCKED com um P1 (binding ativo sem escopo
+  da mesma reserva chegava a `_backend.start`); corrigido; reauditoria: P1 RESOLVED, sem regressão, aprovado
+  na parte verificável no Windows. Pendente: validação Linux/POSIX.
+- Validação local (Windows 11, Python 3.11.9): ruff, format e mypy (inclusive `--platform linux`) limpos;
+  regressão direcionada passou (E8.4.5 completo, `test_architecture`, supervisor E7.3, admissão e purga).
+  Suíte completa não executada.
+- Pendências: Linux/POSIX; `launch_start_failed_proven` não implementado; fluxos do Developer/Test Runner não
+  chamam escritor nem executor (C); Entrega B (InstanceLock, lease, C7.7, release, adoção, recovery). Este
+  registro não declara GREEN.

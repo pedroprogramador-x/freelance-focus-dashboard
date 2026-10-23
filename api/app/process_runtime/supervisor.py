@@ -53,6 +53,7 @@ from app.process_runtime.launch import (
     LaunchRefusal,
     LaunchScope,
     ProtectedLaunch,
+    current_binding,
     current_scope,
     exe_name_of,
 )
@@ -222,6 +223,14 @@ def run_supervised(
         )
 
     scope = current_scope()
+    binding = current_binding()
+    if binding is not None:
+        # Um contexto declarado exige o escopo DA MESMA reserva: nunca o caminho legado, e nada é
+        # criado nem registrado quando falta ou diverge (`protected` não muda isso).
+        if scope is None:
+            return _refused(LaunchRefusal.SCOPE_MISSING)
+        if scope.reservation_id != binding.reservation_id:
+            return _refused(LaunchRefusal.SCOPE_MISMATCH)
     if scope is not None:
         return _run_protected(scope, spec, is_cancelled)
     if protected:
@@ -286,10 +295,18 @@ def _run_protected(
     scope: LaunchScope, spec: ProcessSpec, is_cancelled: Callable[[], bool]
 ) -> ProcessResult:
     windows = sys.platform == "win32"
+    binding = current_binding()
+    if scope.reservation_id is not None and (
+        binding is None or binding.reservation_id != scope.reservation_id
+    ):
+        # Escopo de uma reserva, lançamento fora do contexto dela: nada é registrado nem criado.
+        return _refused(LaunchRefusal.SCOPE_MISMATCH)
     intent = LaunchIntent(
         exe_name_of(spec.argv[0]),
         LaunchPlatform.WIN32 if windows else LaunchPlatform.POSIX,
         PROFILE_WIN_JOB_V1 if windows else PROFILE_POSIX_PGRP_V1,
+        phase_tag=None if binding is None else binding.phase_tag,
+        reservation_id=None if binding is None else binding.reservation_id,
     )
     launch = ProtectedLaunch(scope, intent)
     refusal = launch.admit()
